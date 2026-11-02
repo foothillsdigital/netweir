@@ -1,0 +1,22 @@
+<!doctype html><title>fp</title><script>
+addEventListener('load', async () => {
+  await new Promise(r => setTimeout(r, 1500));
+  const n = navigator, o = {};
+  for (const k of ['webdriver','userAgent','language','languages','platform','hardwareConcurrency','maxTouchPoints','cookieEnabled','doNotTrack','pdfViewerEnabled','globalPrivacyControl','buildID','oscpu','vendor','product','productSub','appVersion']) { try { o['n.'+k] = n[k]; } catch(e) { o['n.'+k] = 'ERR'; } }
+  o.plugins = n.plugins.length; o.mimeTypes = n.mimeTypes.length;
+  Object.assign(o, {sw: screen.width, sh: screen.height, aw: screen.availWidth, ah: screen.availHeight, cd: screen.colorDepth, dpr: devicePixelRatio, iw: innerWidth, ih: innerHeight, ow: outerWidth, oh: outerHeight, sx: screenX, sy: screenY});
+  o.vis = document.visibilityState; o.focus = document.hasFocus(); o.hidden = document.hidden;
+  o.tz = Intl.DateTimeFormat().resolvedOptions().timeZone; o.locale = Intl.DateTimeFormat().resolvedOptions().locale;
+  o.historyLen = history.length; o.opener = !!window.opener; o.frameElem = window.frameElement === null;
+  o.notif = typeof Notification !== 'undefined' ? Notification.permission : 'none';
+  try { o.perm = (await n.permissions.query({name: 'notifications'})).state; } catch (e) { o.perm = 'ERR'; }
+  o.storageEst = !!n.storage; o.serviceWorker = !!n.serviceWorker; o.webgl = (() => { const g = document.createElement('canvas').getContext('webgl'); if (!g) return 'none'; const d = g.getExtension('WEBGL_debug_renderer_info'); return d ? g.getParameter(d.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER); })();
+  o.wdDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')?.get?.toString();
+  o.navKeys = Object.keys(Object.getOwnPropertyDescriptors(Navigator.prototype)).length;
+  o.winKeys = Object.getOwnPropertyNames(window).length;
+  o.popupBlocked = (() => { const w = window.open('about:blank'); const b = !w; if (w) w.close(); return b; })();
+  o.mql = matchMedia('(prefers-color-scheme: dark)').matches; o.reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  o.fonts = await (async () => { const fs = ['Arial','Helvetica Neue','Menlo','Monaco','Courier New','Times New Roman','Comic Sans MS']; return fs.filter(f => document.fonts.check('12px "'+f+'"')).length; })();
+  fetch('/report?who=' + location.hash.slice(1), {method: 'POST', body: JSON.stringify(o)});
+});
+</script>

@@ -1,0 +1,55 @@
+name: firefox-dynamic-probe
+
+on:
+  push:
+    branches: [probe/firefox-dynamic]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.14"
+      - name: Get a stock Firefox release and add the autoconfig files
+        run: |
+          P=.github/probe/firefox
+          case "$RUNNER_OS" in
+            Linux)
+              curl -sSfL -o ff.tar.xz "https://download.mozilla.org/?product=firefox-latest-ssl&os=linux64&lang=en-US"
+              tar -xf ff.tar.xz
+              DIR=$PWD/firefox; BIN=$DIR/firefox ;;
+            macOS)
+              curl -sSfL -o ff.dmg "https://download.mozilla.org/?product=firefox-latest-ssl&os=osx&lang=en-US"
+              hdiutil attach -quiet -nobrowse -mountpoint /tmp/ffdmg ff.dmg
+              cp -R /tmp/ffdmg/Firefox.app .
+              hdiutil detach -quiet /tmp/ffdmg
+              DIR=$PWD/Firefox.app/Contents/Resources; BIN=$PWD/Firefox.app/Contents/MacOS/firefox ;;
+            Windows)
+              cp -R "/c/Program Files/Mozilla Firefox" ff
+              DIR=$PWD/ff; BIN=$PWD/ff/firefox.exe ;;
+          esac
+          mkdir -p "$DIR/defaults/pref"
+          cp $P/autoconfig.js "$DIR/defaults/pref/autoconfig.js"
+          cp $P/mozilla.cfg "$DIR/mozilla.cfg"
+          "$BIN" --version || true
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+      - name: Probe
+        run: uv run --no-project --with websockets python .github/probe/firefox/probe.py "$BIN" out
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: firefox-dynamic-${{ matrix.os }}
+          path: out
