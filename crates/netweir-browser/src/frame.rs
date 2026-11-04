@@ -14,7 +14,7 @@ use crate::{Error, Result};
 
 /// netweir's helpers, installed in each document's isolated world. The
 /// page can't see them: the world shares the DOM, not the globals.
-const HELPERS: &str = include_str!("helpers.js");
+pub(crate) const HELPERS: &str = include_str!("helpers.js");
 
 /// How many isolated worlds a page keeps track of. Past that (a page that
 /// has had hundreds of frames), the record starts again, and worlds are
@@ -146,6 +146,23 @@ impl Frame {
         }
     }
 
+    /// A Firefox frame's context Firefox no longer has is a frame gone
+    /// from the page.
+    fn gone_if_lost(&self, e: Error) -> Error {
+        match e {
+            Error::Protocol { message, .. }
+                if message.contains("Browsing Context with id")
+                    && message.contains("not found") =>
+            {
+                Error::Gone(format!(
+                    "the frame at {} isn't in the page any more",
+                    self.url
+                ))
+            }
+            e => e,
+        }
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let session = self.session().await?;
         self.page.call_on(&session, method, params).await
@@ -208,6 +225,11 @@ impl Frame {
 
     /// Runs `expression` in netweir's isolated world, awaiting a promise.
     pub(crate) async fn helper(&self, expression: &str) -> Result<Value> {
+        if self.page.is_firefox() {
+            return crate::page::bidi::helper(&self.page, &self.id, expression)
+                .await
+                .map_err(|e| self.gone_if_lost(e));
+        }
         let id = self.world(false).await?;
         match self.run(Some(id), expression, true).await {
             // The document changed under it, or the frame moved to another
@@ -256,7 +278,10 @@ impl Frame {
         let body =
             format!("const v = ({js}\n); return typeof v === 'function' ? await v() : await v;");
         if self.page.is_firefox() {
-            return crate::page::firefox_call(&self.page, &body, false).await;
+            let r = crate::page::bidi::remote(&self.page, &self.id, &body, false, false)
+                .await
+                .map_err(|e| self.gone_if_lost(e))?;
+            return crate::page::bidi::to_json(&r);
         }
         if self.is_main() {
             // No timeout of its own, as documented: the caller's script may
@@ -319,19 +344,16 @@ impl Frame {
     /// The document as Chrome now has it, doctype included.
     pub async fn content(&self) -> Result<String> {
         if self.page.is_firefox() {
-            let html = crate::page::firefox_call(&self.page, CONTENT, true).await?;
-            return Ok(html.as_str().unwrap_or_default().to_string());
+            let html = crate::page::bidi::remote(&self.page, &self.id, CONTENT, true, true)
+                .await
+                .map_err(|e| self.gone_if_lost(e))?;
+            return Ok(str_of(&html, "value"));
         }
         let html = self.helper("__netweir.content()").await?;
         Ok(html.as_str().unwrap_or_default().to_string())
     }
 
     pub async fn title(&self) -> Result<String> {
-        if self.page.is_firefox() {
-            let title =
-                crate::page::firefox_call(&self.page, "return document.title;", true).await?;
-            return Ok(title.as_str().unwrap_or_default().to_string());
-        }
         Ok(self
             .helper("document.title")
             .await?
@@ -377,6 +399,26 @@ impl Frame {
         hit: bool,
     ) -> Result<Option<(f64, f64)>> {
         for (child, parent) in chain {
+            if parent.page.is_firefox() {
+                let Some(at) = crate::page::bidi::holder(&parent.page, &parent.id, child).await?
+                else {
+                    return Err(Error::Gone(format!(
+                        "the frame at {} isn't in the page any more",
+                        parent.url
+                    )));
+                };
+                let r = parent
+                    .helper(&format!(
+                        "__netweir.offset(document.querySelectorAll('iframe, frame')[{at}], {x}, {y}, {hit})"
+                    ))
+                    .await?;
+                if r.get("failed").is_some() {
+                    return Ok(None);
+                }
+                x = r["x"].as_f64().unwrap_or(0.0);
+                y = r["y"].as_f64().unwrap_or(0.0);
+                continue;
+            }
             let owner = parent.owner(child).await?;
             let r = parent
                 .call(
@@ -822,7 +864,6 @@ impl Frame {
         state: &str,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.page.chrome_only("Frame.wait_for")?;
         if !["attached", "visible", "hidden", "detached"].contains(&state) {
             return Err(Error::Invalid(format!(
                 "state must be \"attached\", \"visible\", \"hidden\" or \"detached\", not {state:?}"
@@ -865,7 +906,6 @@ impl Frame {
         pick: &Pick,
         timeout: Option<Duration>,
     ) -> Result<Vec<String>> {
-        self.page.chrome_only("Frame.select_option")?;
         let (by, wanted) = match pick {
             Pick::Values(v) => ("value", json!(v)),
             Pick::Labels(v) => ("label", json!(v)),

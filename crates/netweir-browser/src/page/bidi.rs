@@ -671,31 +671,44 @@ pub(super) async fn to_front(page: &Page) -> Result<()> {
     Ok(())
 }
 
-/// Runs `body` as an async function in the page's main frame; see
-/// [`super::firefox_call`].
+/// Runs `body` (a function body; `await` allowed) as an async function in
+/// the page's main frame: in the page's own world, or with `sandboxed`,
+/// in netweir's, where page script can't see it.
 pub(super) async fn call(page: &Page, body: &str, sandboxed: bool) -> Result<Value> {
+    let r = remote(page, &page.inner.target, body, sandboxed, false).await?;
+    to_json(&r)
+}
+
+/// Runs `body` as an async function in the frame `context`, in its own
+/// world or netweir's sandbox, and gives what it returns as BiDi has it.
+/// `bounded` holds it to the browser's timeout, as netweir's own calls
+/// are; the caller's own script may take as long as it likes.
+pub(crate) async fn remote(
+    page: &Page,
+    context: &str,
+    body: &str,
+    sandboxed: bool,
+    bounded: bool,
+) -> Result<Value> {
     if page.inner.closed.load(Ordering::Relaxed) {
         return Err(Error::PageClosed);
     }
-    let mut target = json!({"context": page.inner.target});
+    let mut target = json!({"context": context});
     if sandboxed {
         target["sandbox"] = Value::from(SANDBOX);
     }
-    let r = page
-        .inner
-        .browser
-        .conn
-        .call(
-            "",
-            "script.callFunction",
-            json!({
-                "functionDeclaration": format!("async () => {{ {body}\n}}"),
-                "awaitPromise": true,
-                "target": target,
-                "resultOwnership": "none",
-            }),
-        )
-        .await?;
+    let params = json!({
+        "functionDeclaration": format!("async () => {{ {body}\n}}"),
+        "awaitPromise": true,
+        "target": target,
+        "resultOwnership": "none",
+    });
+    let browser = &page.inner.browser;
+    let r = if bounded {
+        browser.call("", "script.callFunction", params).await?
+    } else {
+        browser.conn.call("", "script.callFunction", params).await?
+    };
     if r["type"] == "exception" {
         let details = &r["exceptionDetails"];
         let message = details["text"]
@@ -704,7 +717,93 @@ pub(super) async fn call(page: &Page, body: &str, sandboxed: bool) -> Result<Val
             .unwrap_or("script error");
         return Err(Error::Script(message.to_string()));
     }
-    to_json(&r["result"])
+    Ok(r["result"].clone())
+}
+
+/// Runs `expression` in netweir's sandbox of the frame `context`, with
+/// its helpers, which go into a document's sandbox the first time they're
+/// needed there, and awaits it. A document that went while it ran, which
+/// takes its sandbox with it, has it run once more in the one after.
+pub(crate) async fn helper(page: &Page, context: &str, expression: &str) -> Result<Value> {
+    let body = format!("return await ({expression}\n);");
+    let (mut loaded, mut again) = (false, false);
+    loop {
+        match remote(page, context, &body, true, true).await {
+            Err(Error::Script(m)) if m.contains("__netweir is not defined") && !loaded => {
+                remote(page, context, crate::frame::HELPERS, true, true).await?;
+                loaded = true;
+            }
+            Err(Error::Protocol { message, .. }) if gone_under(&message) && !again => {
+                again = true;
+                loaded = false;
+            }
+            r => return to_json(&r?),
+        }
+    }
+}
+
+/// Whether Firefox said a script's realm went while it ran: its document
+/// was replaced.
+fn gone_under(message: &str) -> bool {
+    ["realm", "has been discarded", "got discarded"]
+        .iter()
+        .any(|m| message.contains(m))
+}
+
+/// The page's frames, its own first, each as the frame tree had it. A
+/// frame's name is its window's, which the tree doesn't carry; a frame
+/// gone before its name was read is left out.
+pub(super) async fn frames(page: &Page) -> Result<Vec<crate::Frame>> {
+    let tree = page
+        .call(
+            "browsingContext.getTree",
+            json!({"root": page.inner.target}),
+        )
+        .await?;
+    let mut frames = Vec::new();
+    let mut walk: Vec<(&Value, Option<String>)> = vec![(&tree["contexts"][0], None)];
+    while let Some((node, parent)) = walk.pop() {
+        let id = str_of(node, "context");
+        let name = match &parent {
+            None => String::new(),
+            Some(_) => match helper(page, &id, "window.name").await {
+                Ok(name) => name.as_str().unwrap_or_default().to_string(),
+                Err(Error::Protocol { .. }) => continue,
+                Err(e) => return Err(e),
+            },
+        };
+        if let Some(children) = node["children"].as_array() {
+            walk.extend(children.iter().rev().map(|c| (c, Some(id.clone()))));
+        }
+        frames.push(crate::Frame::new(
+            page.clone(),
+            page.inner.session.clone(),
+            id,
+            parent,
+            name,
+            str_of(node, "url"),
+        ));
+    }
+    Ok(frames)
+}
+
+/// Which of the `<iframe>`s and `<frame>`s in the frame `parent` holds
+/// the frame `child`, by its place among them, found by its window, which
+/// BiDi names by its context: from another site too.
+pub(crate) async fn holder(page: &Page, parent: &str, child: &str) -> Result<Option<usize>> {
+    let windows = remote(
+        page,
+        parent,
+        "return [...document.querySelectorAll('iframe, frame')].map(f => f.contentWindow);",
+        true,
+        true,
+    )
+    .await?;
+    Ok(windows["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .position(|w| w["value"]["context"] == child))
 }
 
 pub(super) async fn close(page: &Page) -> Result<()> {

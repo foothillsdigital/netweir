@@ -683,3 +683,72 @@ async fn wait_for_navigation_sees_a_script_redirect() {
     assert_eq!(next.url, format!("{}/next", server.url));
     assert_eq!(next.status, 200);
 }
+
+#[tokio::test]
+async fn firefox_helper_survives_its_document_going() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![
+        (
+            "/",
+            common::html("<script>setTimeout(() => location = '/next', 200)</script>"),
+        ),
+        (
+            "/next",
+            common::html(
+                "<script>setTimeout(() => document.body.innerHTML = '<p id=late>x</p>', 200)</script>",
+            ),
+        ),
+    ]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    // The wait began in the first document, and its element is in the
+    // second.
+    page.wait_for("#late", "visible", Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(page.url(), format!("{}/next", server.url));
+}
+
+#[tokio::test]
+async fn a_firefox_frame_has_its_name_and_its_own_document() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let other = common::serve(vec![(
+        "/inner",
+        common::html("<title>inner</title><p id=in>in</p>"),
+    )]);
+    let page_html = format!("<iframe name=box src='{}/inner'></iframe>", other.url);
+    let server = common::serve(vec![(
+        "/",
+        common::html(Box::leak(page_html.into_boxed_str())),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let frames = page.frames().await.unwrap();
+    assert_eq!(frames.len(), 2);
+    let inner = &frames[1];
+    assert_eq!(inner.name(), "box");
+    assert_eq!(inner.parent_id(), Some(frames[0].id()));
+    assert_eq!(inner.title().await.unwrap(), "inner");
+    assert_eq!(
+        inner
+            .evaluate("document.getElementById('in').textContent")
+            .await
+            .unwrap(),
+        "in"
+    );
+    page.evaluate("document.querySelector('iframe').remove()")
+        .await
+        .unwrap();
+    assert!(
+        matches!(inner.title().await, Err(Error::Gone(_))),
+        "removed"
+    );
+}

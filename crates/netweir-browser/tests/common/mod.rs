@@ -375,6 +375,38 @@ pub fn engine() -> netweir_browser::Engine {
 /// with what they're waiting for.
 pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
+        "a_frame_drags_within_itself_wherever_it_sits_in_the_page",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_frame_is_followed_when_it_moves_to_another_site_and_back",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "frames_from_this_site_and_others_can_be_read_and_acted_on",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "scrolling_stops_after_as_many_times_as_asked",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "scrolling_to_the_bottom_loads_an_endless_list_until_it_ends",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_dialog_from_a_frame_on_another_site_is_heard_and_answered",
+        "dialogs (phase 3, task 6)",
+    ),
+    (
+        "a_download_from_a_frame_on_another_site_is_its_pages",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_popup_from_a_frame_on_another_site_is_its_pages",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
         "a_blank_popup_a_script_writes_into_is_read",
         "the mouse and keyboard (phase 3, task 4)",
     ),
@@ -383,20 +415,12 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "the mouse and keyboard (phase 3, task 4)",
     ),
     (
-        "a_dialog_from_a_frame_on_another_site_is_heard_and_answered",
-        "frames (phase 3, task 3)",
-    ),
-    (
         "a_dialog_nobody_answers_is_dismissed_as_a_person_would",
         "dialogs (phase 3, task 6)",
     ),
     (
         "a_download_a_service_worker_answers_is_its_pages",
         "the mouse and keyboard (phase 3, task 4)",
-    ),
-    (
-        "a_download_from_a_frame_on_another_site_is_its_pages",
-        "frames (phase 3, task 3)",
     ),
     (
         "a_download_is_saved_in_its_contexts_own_folder",
@@ -409,14 +433,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "a_failing_step_continues_stops_or_fails_as_it_says",
         "steps (phase 3, task 8)",
-    ),
-    (
-        "a_frame_drags_within_itself_wherever_it_sits_in_the_page",
-        "frames (phase 3, task 3)",
-    ),
-    (
-        "a_frame_is_followed_when_it_moves_to_another_site_and_back",
-        "frames (phase 3, task 3)",
     ),
     (
         "a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched",
@@ -437,10 +453,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "a_page_that_asks_before_it_unloads_is_left_and_closed",
         "the mouse and keyboard (phase 3, task 4)",
-    ),
-    (
-        "a_popup_from_a_frame_on_another_site_is_its_pages",
-        "frames (phase 3, task 3)",
     ),
     (
         "a_popup_from_a_link_is_read_and_carries_its_openers_rules",
@@ -523,10 +535,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "the mouse and keyboard (phase 3, task 4)",
     ),
     (
-        "frames_from_this_site_and_others_can_be_read_and_acted_on",
-        "frames (phase 3, task 3)",
-    ),
-    (
         "hover_brings_the_mouse_over_the_element",
         "the mouse and keyboard (phase 3, task 4)",
     ),
@@ -567,10 +575,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "the mouse and keyboard (phase 3, task 4)",
     ),
     (
-        "scrolling_stops_after_as_many_times_as_asked",
-        "frames (phase 3, task 3)",
-    ),
-    (
         "scrolling_to_the_bottom_gets_past_a_box_in_the_middle_of_the_page",
         "the mouse and keyboard (phase 3, task 4)",
     ),
@@ -581,10 +585,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "scrolling_to_the_bottom_gets_past_a_tall_frame_that_scrolls_itself",
         "the mouse and keyboard (phase 3, task 4)",
-    ),
-    (
-        "scrolling_to_the_bottom_loads_an_endless_list_until_it_ends",
-        "frames (phase 3, task 3)",
     ),
     (
         "scrolling_to_the_bottom_turns_whole_notches_as_a_mouse_wheel_does",
@@ -649,10 +649,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "undo_and_redo_take_back_typing_on_each_system",
         "environments (phase 4)",
-    ),
-    (
-        "wait_for_follows_the_element_through_its_states",
-        "frames (phase 3, task 3)",
     ),
     (
         "waiting_on_an_opener_behind_its_popup_brings_it_back_first",

@@ -21,7 +21,7 @@ use crate::network::{
 };
 use crate::{Engine, Error, Result};
 
-mod bidi;
+pub(crate) mod bidi;
 
 /// The lifecycle event a navigation waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,13 +230,6 @@ pub(crate) struct PageInner {
     offline_workers: Mutex<Vec<String>>,
     /// Where its steps' held uploads were copied, removed when it closes.
     pub(crate) uploads: crate::uploads::UploadDirs,
-}
-
-/// Runs `body` (a function body; `await` allowed) in a Firefox page's main
-/// frame: in the page's own world, or with `sandboxed`, in netweir's,
-/// where page script can't see it.
-pub(crate) async fn firefox_call(page: &Page, body: &str, sandboxed: bool) -> Result<Value> {
-    bidi::call(page, body, sandboxed).await
 }
 
 /// A page's environment, and the user agent override every session of it
@@ -1741,7 +1734,6 @@ impl Page {
         pick: &crate::Pick,
         timeout: Option<Duration>,
     ) -> Result<Vec<String>> {
-        self.chrome_only("Page.select_option")?;
         self.main_frame()
             .select_option(selector, pick, timeout)
             .await
@@ -1779,7 +1771,6 @@ impl Page {
         state: &str,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.chrome_only("Page.wait_for")?;
         self.main_frame().wait_for(selector, state, timeout).await
     }
 
@@ -2387,7 +2378,9 @@ impl Page {
     /// those Chrome runs in processes of their own, with the frames inside
     /// them.
     pub async fn frames(&self) -> Result<Vec<Frame>> {
-        self.chrome_only("Page.frames")?;
+        if self.is_firefox() {
+            return bidi::frames(self).await;
+        }
         let mut sessions = vec![self.inner.session.clone()];
         sessions.extend(self.state().children.iter().map(|(s, _)| s.clone()));
         let mut frames: Vec<Frame> = Vec::new();
