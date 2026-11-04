@@ -373,6 +373,9 @@ pub(crate) struct State {
     /// The kind of the next navigation a Firefox page starts, when
     /// netweir asked for it (back, forward): Firefox doesn't say.
     next_kind: Option<&'static str>,
+    /// The frame a Firefox page's last action was on, when not its own,
+    /// with where its viewport is in the page's: (context, x, y).
+    pub(crate) input_frame: Option<(String, f64, f64)>,
     /// Frames Chrome runs in processes of their own (from other sites),
     /// each with a session: (session, frame id), in the order they came.
     pub(crate) children: Vec<(String, String)>,
@@ -1337,8 +1340,11 @@ impl Page {
             url: url.to_string(),
             error: error.to_string(),
             // Chrome doesn't say why it gave up on a navigation; its
-            // stderr sometimes does.
-            said: self.inner.browser.said.as_ref().and_then(|s| s.recent()),
+            // stderr sometimes does. Firefox's says nothing of it.
+            said: match self.is_firefox() {
+                true => None,
+                false => self.inner.browser.said.as_ref().and_then(|s| s.recent()),
+            },
         }
     }
 
@@ -1667,20 +1673,17 @@ impl Page {
     /// Clicks the element's centre with the mouse, once it's visible,
     /// still, enabled and not covered.
     pub async fn click(&self, selector: &str, timeout: Option<Duration>) -> Result<()> {
-        self.chrome_only("Page.click")?;
         self.main_frame().click(selector, timeout).await
     }
 
     /// See [`Frame::dblclick`].
     pub async fn dblclick(&self, selector: &str, timeout: Option<Duration>) -> Result<()> {
-        self.chrome_only("Page.dblclick")?;
         self.main_frame().dblclick(selector, timeout).await
     }
 
     /// Replaces the element's contents with `text` in one go, as pasting
     /// would.
     pub async fn fill(&self, selector: &str, text: &str, timeout: Option<Duration>) -> Result<()> {
-        self.chrome_only("Page.fill")?;
         self.main_frame().fill(selector, text, timeout).await
     }
 
@@ -1692,7 +1695,6 @@ impl Page {
         delay: (Duration, Duration),
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.chrome_only("Page.type_text")?;
         self.main_frame()
             .type_text(selector, text, delay, timeout)
             .await
@@ -1701,13 +1703,11 @@ impl Page {
     /// Moves the mouse to the element's centre, once it's visible, still
     /// and not covered.
     pub async fn hover(&self, selector: &str, timeout: Option<Duration>) -> Result<()> {
-        self.chrome_only("Page.hover")?;
         self.main_frame().hover(selector, timeout).await
     }
 
     /// See [`Frame::drag`].
     pub async fn drag(&self, source: &str, target: &str, timeout: Option<Duration>) -> Result<()> {
-        self.chrome_only("Page.drag")?;
         self.main_frame().drag(source, target, timeout).await
     }
 
@@ -1721,7 +1721,6 @@ impl Page {
         idle: Duration,
         timeout: Option<Duration>,
     ) -> Result<u32> {
-        self.chrome_only("Page.scroll")?;
         self.main_frame()
             .scroll(selector, x, y, times, idle, timeout)
             .await
@@ -1746,7 +1745,6 @@ impl Page {
         on: bool,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.chrome_only("Page.set_checked")?;
         self.main_frame().set_checked(selector, on, timeout).await
     }
 
@@ -1757,7 +1755,6 @@ impl Page {
         files: &[std::path::PathBuf],
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.chrome_only("Page.set_input_files")?;
         self.main_frame()
             .set_input_files(selector, files, timeout)
             .await
@@ -1785,7 +1782,6 @@ impl Page {
     /// pressed and let go. "+" alone is the plus key, as is the last "+"
     /// of "Shift++".
     pub async fn press(&self, keys: &str) -> Result<()> {
-        self.chrome_only("Page.press")?;
         let (mut names, name) = split_keys(keys);
         // A modifier on its own is pressed with the others, and no key.
         let alone = modifier(name, false).is_some();
@@ -1837,12 +1833,10 @@ impl Page {
                 // keyCode 229, there's no keypress, and the text comes as
                 // input.
                 let unknown = |kind: &str| json!({"type": kind, "key": "Unidentified", "code": "", "windowsVirtualKeyCode": 229});
-                self.call("Input.dispatchKeyEvent", unknown("rawKeyDown"))
-                    .await?;
-                self.call("Input.insertText", json!({"text": text})).await?;
+                self.key_event(unknown("rawKeyDown")).await?;
+                self.insert_text(text).await?;
                 tokio::time::sleep(crate::events::key_hold()).await;
-                self.call("Input.dispatchKeyEvent", unknown("keyUp"))
-                    .await?;
+                self.key_event(unknown("keyUp")).await?;
                 return Ok(());
             }
             if k.code.is_empty()
@@ -1851,7 +1845,7 @@ impl Page {
                 // Not on the keyboard (an é on a US layout): it comes the
                 // way an OS's character picker sends it, as text with no
                 // key.
-                self.call("Input.insertText", json!({"text": text})).await?;
+                self.insert_text(text).await?;
                 return Ok(());
             }
         }
@@ -1887,9 +1881,7 @@ impl Page {
             let mut modifiers = 0;
             for m in &held {
                 modifiers |= m.3;
-                self.call(
-                    "Input.dispatchKeyEvent",
-                    modifier_event(m, "rawKeyDown", modifiers),
+                self.key_event(modifier_event(m, "rawKeyDown", modifiers),
                 )
                 .await?;
                 down += 1;
@@ -1917,12 +1909,10 @@ impl Page {
             if let Some(command) = edit_command(mac, modifiers, &k.key) {
                 key_down["commands"] = json!([command]);
             }
-            self.call("Input.dispatchKeyEvent", key_down).await?;
+            self.key_event(key_down).await?;
             // Held as a person holds a key, not let go in the same instant.
             tokio::time::sleep(crate::events::key_hold()).await;
-            self.call(
-                "Input.dispatchKeyEvent",
-                json!({"type": "keyUp", "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.key_code, "modifiers": modifiers}),
+            self.key_event(json!({"type": "keyUp", "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.key_code, "modifiers": modifiers}),
             )
             .await?;
             Ok(())
@@ -1934,13 +1924,37 @@ impl Page {
             tokio::time::sleep(crate::events::pause(SHIFT_LEAD)).await;
             let modifiers = held[..i].iter().fold(0, |flags, m| flags | m.3);
             let _ = self
-                .call(
-                    "Input.dispatchKeyEvent",
-                    modifier_event(&held[i], "keyUp", modifiers),
-                )
+                .key_event(modifier_event(&held[i], "keyUp", modifiers))
                 .await;
         }
         pressed
+    }
+
+    /// Sends a key event, given as Chrome's `Input.dispatchKeyEvent`
+    /// takes it; to Firefox, as the same key going down or up.
+    async fn key_event(&self, event: Value) -> Result<Value> {
+        if self.is_firefox() {
+            return bidi::key_event(self, &event).await;
+        }
+        self.call("Input.dispatchKeyEvent", event).await
+    }
+
+    /// Sends a mouse event, given as Chrome's `Input.dispatchMouseEvent`
+    /// takes it; to Firefox, as the same move, press or wheel.
+    async fn mouse_event(&self, event: Value) -> Result<Value> {
+        if self.is_firefox() {
+            return bidi::mouse_event(self, &event).await;
+        }
+        self.call("Input.dispatchMouseEvent", event).await
+    }
+
+    /// Puts `text` in where the caret is, with no key: as an OS's
+    /// character picker, or a paste, does.
+    pub(crate) async fn insert_text(&self, text: &str) -> Result<Value> {
+        if self.is_firefox() {
+            return bidi::insert_text(self, text).await;
+        }
+        self.call("Input.insertText", json!({"text": text})).await
     }
 
     /// Whether the page says it's on a Mac (or an iPhone), where Command
@@ -1961,11 +1975,8 @@ impl Page {
 
     /// Moves the mouse to (x, y) in the viewport.
     pub(crate) async fn mouse_move(&self, x: f64, y: f64) -> Result<()> {
-        self.call(
-            "Input.dispatchMouseEvent",
-            json!({"type": "mouseMoved", "x": x, "y": y}),
-        )
-        .await?;
+        self.mouse_event(json!({"type": "mouseMoved", "x": x, "y": y}))
+            .await?;
         Ok(())
     }
 
@@ -1979,6 +1990,9 @@ impl Page {
     /// (dragend) as it would. The page sees no mouseup then, as with a
     /// real drag.
     pub(crate) async fn mouse_drag(&self, from: (f64, f64), to: (f64, f64)) -> Result<()> {
+        if self.is_firefox() {
+            return bidi::mouse_drag(self, from, to).await;
+        }
         self.call("Input.setInterceptDrags", json!({"enabled": true}))
             .await?;
         self.state().dragging = None;
@@ -2112,9 +2126,7 @@ impl Page {
                 // A button is held a moment, as a key is.
                 tokio::time::sleep(crate::events::pause(BUTTON_HOLD)).await;
             }
-            self.call(
-                "Input.dispatchMouseEvent",
-                json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": if kind == "mousePressed" { 1 } else { 0 }, "clickCount": count}),
+            self.mouse_event(json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": if kind == "mousePressed" { 1 } else { 0 }, "clickCount": count}),
             )
             .await?;
         }
@@ -2132,9 +2144,7 @@ impl Page {
         self.mouse_move(x, y).await?;
         let notches = (dx.abs().max(dy.abs()) / NOTCH).ceil().max(1.0);
         for _ in 0..notches as u64 {
-            self.call(
-                "Input.dispatchMouseEvent",
-                json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx / notches, "deltaY": dy / notches}),
+            self.mouse_event(json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx / notches, "deltaY": dy / notches}),
             )
             .await?;
         }

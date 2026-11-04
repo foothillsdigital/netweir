@@ -178,6 +178,10 @@ user_pref("app.update.disabledForTesting", true);
 // Downloads stay in the profile, never in the person's own folder.
 user_pref("browser.download.folderList", 2);
 user_pref("browser.download.useDownloadDir", true);
+// Lets a file Netweir is given for an upload be read where the page runs,
+// as choosing it in the file picker would. Only Firefox's own code can
+// make a file from a path, never a page's.
+user_pref("dom.file.createInChild", true);
 "#;
 
 /// `user.js` for the profile at `profile`. Public only for the stealth

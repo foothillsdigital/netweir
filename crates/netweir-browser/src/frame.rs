@@ -498,9 +498,13 @@ impl Frame {
                     r["y"].as_f64().unwrap_or(0.0),
                 );
                 match Frame::to_page(&chain, x, y, hit).await? {
-                    Some((x, y)) => {
-                        r["x"] = Value::from(x);
-                        r["y"] = Value::from(y);
+                    Some((px, py)) => {
+                        if self.page.is_firefox() {
+                            self.page.state().input_frame =
+                                (!chain.is_empty()).then(|| (self.id.clone(), px - x, py - y));
+                        }
+                        r["x"] = Value::from(px);
+                        r["y"] = Value::from(py);
                     }
                     None => failed = Some("receives events".into()),
                 }
@@ -549,7 +553,6 @@ impl Frame {
     /// Clicks the element's centre with the mouse, once it's visible,
     /// still, enabled and not covered.
     pub async fn click(&self, selector: &str, timeout: Option<Duration>) -> Result<()> {
-        self.page.chrome_only("Frame.click")?;
         self.click_as("click", selector, timeout).await
     }
 
@@ -586,14 +589,12 @@ impl Frame {
     /// Double-clicks the element's centre (taps it twice on a phone), once
     /// it's visible, still, enabled and not covered.
     pub async fn dblclick(&self, selector: &str, timeout: Option<Duration>) -> Result<()> {
-        self.page.chrome_only("Frame.dblclick")?;
         self.click_as("double_click", selector, timeout).await
     }
 
     /// Moves the mouse to the element's centre, once it's visible, still
     /// and not covered, so the page sees it come over the element.
     pub async fn hover(&self, selector: &str, timeout: Option<Duration>) -> Result<()> {
-        self.page.chrome_only("Frame.hover")?;
         if self.page.touches() {
             return Err(Error::Invalid(format!(
                 "hover {selector}: the page is a phone's, which has no mouse to hover with; a \
@@ -617,7 +618,6 @@ impl Frame {
     /// sortable list's row) and, from a draggable element, makes an
     /// HTML5 drag and drop, dataTransfer and all.
     pub async fn drag(&self, source: &str, target: &str, timeout: Option<Duration>) -> Result<()> {
-        self.page.chrome_only("Frame.drag")?;
         if self.page.touches() {
             return Err(Error::Invalid(format!(
                 "drag {source}: the page is a phone's, which has no mouse to drag with"
@@ -625,6 +625,9 @@ impl Frame {
         }
         let deadline = self.page.deadline(timeout);
         self.page.to_front().await?;
+        if self.page.is_firefox() {
+            self.html5_drag_refused(source, deadline).await?;
+        }
         // Nothing need be under the mouse at the target but the target.
         let landing = ["attached", "visible", "stable"];
         self.actionable("drag", target, &landing, true, left(deadline))
@@ -650,6 +653,30 @@ impl Frame {
             )));
         }
         self.page.mouse_drag(from, to).await
+    }
+
+    /// Firefox doesn't begin an HTML5 drag from the mouse WebDriver moves,
+    /// so a drag from what the page could drag that way (a draggable
+    /// element, a link, an image) is refused before anything is pressed,
+    /// rather than doing something else.
+    async fn html5_drag_refused(&self, source: &str, deadline: Instant) -> Result<()> {
+        let sel = Value::from(source);
+        let call = format!(
+            "(() => {{ const el = __netweir.find({sel}); if (!el) return {{failed: 'attached'}}; \
+             const d = el.closest('[draggable]'); \
+             const html5 = d ? d.getAttribute('draggable') === 'true' \
+               : !!el.closest('a[href], img'); return {{html5}}; }})()"
+        );
+        let r = self
+            .attempt("drag", source, &call, None, left(deadline))
+            .await?;
+        if r["html5"] == true {
+            return Err(Error::Unsupported {
+                engine: "Firefox",
+                feature: format!("drag {source}: an HTML5 drag and drop"),
+            });
+        }
+        Ok(())
     }
 
     /// Moves the mouse to the element's centre once it passes `checks`,
@@ -728,18 +755,11 @@ impl Frame {
 
     /// Replaces the element's contents with `text`, as typing would.
     pub async fn fill(&self, selector: &str, text: &str, timeout: Option<Duration>) -> Result<()> {
-        self.page.chrome_only("Frame.fill")?;
         self.focus_field("fill", selector, timeout).await?;
         if text.is_empty() {
             self.page.press("Delete").await
         } else {
-            self.page
-                .call_on(
-                    &self.page.inner.session,
-                    "Input.insertText",
-                    json!({"text": text}),
-                )
-                .await?;
+            self.page.insert_text(text).await?;
             Ok(())
         }
     }
@@ -765,7 +785,6 @@ impl Frame {
         delay: (Duration, Duration),
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.page.chrome_only("Frame.type_text")?;
         let deadline = self.page.deadline(timeout);
         let sel = Value::from(selector);
         let checks = ["attached", "visible", "enabled", "editable"];
@@ -937,7 +956,6 @@ impl Frame {
         on: bool,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.page.chrome_only("Frame.set_checked")?;
         let action = if on { "check" } else { "uncheck" };
         let deadline = Instant::now() + self.page.timeout(timeout);
         let call = format!("__netweir.checked({}, {on})", Value::from(selector));
@@ -983,7 +1001,6 @@ impl Frame {
         files: &[PathBuf],
         timeout: Option<Duration>,
     ) -> Result<()> {
-        self.page.chrome_only("Frame.set_input_files")?;
         // Chrome wants whole paths, and says nothing of a missing file
         // until the page reads it.
         let mut paths = Vec::new();
@@ -1025,6 +1042,11 @@ impl Frame {
                 .await?;
             return Ok(());
         }
+        if self.page.is_firefox() {
+            return crate::page::bidi::set_files(&self.page, &self.id, selector, &paths)
+                .await
+                .map_err(|e| self.gone_if_lost(e));
+        }
         let id = self.world(false).await?;
         let r = self
             .call(
@@ -1064,7 +1086,6 @@ impl Frame {
         idle: Duration,
         timeout: Option<Duration>,
     ) -> Result<u32> {
-        self.page.chrome_only("Frame.scroll")?;
         let deadline = Instant::now() + self.page.timeout(timeout);
         self.page.to_front().await?;
         let (dx, dy) = (x, y.unwrap_or(0.0));

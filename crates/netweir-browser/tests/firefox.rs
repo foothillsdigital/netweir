@@ -752,3 +752,58 @@ async fn a_firefox_frame_has_its_name_and_its_own_document() {
         "removed"
     );
 }
+
+#[tokio::test]
+async fn an_html5_drag_is_unsupported_and_presses_nothing() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html(
+            "<div id=item draggable=true style='width:60px;height:30px'>item</div>\
+             <div id=handle style='width:60px;height:30px'>handle</div>\
+             <div id=bin style='width:200px;height:80px'>bin</div>\
+             <script>window.downs = 0; addEventListener('mousedown', () => downs++)</script>",
+        ),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let r = page.drag("#item", "#bin", None).await;
+    assert!(
+        matches!(&r, Err(Error::Unsupported { feature, .. }) if feature.contains("HTML5")),
+        "{r:?}"
+    );
+    assert_eq!(page.evaluate("downs").await.unwrap(), 0);
+    // What only follows the mouse is dragged as on Chrome.
+    page.drag("#handle", "#bin", None).await.unwrap();
+    assert_eq!(page.evaluate("downs").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn firefox_typed_text_is_trusted() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html(
+            "<input id=t><script>window.seen = []; \
+             t.addEventListener('input', e => seen.push([e.data, e.isTrusted]))</script>",
+        ),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    page.type_text("#t", "aé", (Duration::ZERO, Duration::from_millis(1)), None)
+        .await
+        .unwrap();
+    assert_eq!(page.evaluate("t.value").await.unwrap(), "aé");
+    assert_eq!(
+        page.evaluate("seen").await.unwrap(),
+        serde_json::json!([["a", true], ["é", true]])
+    );
+}

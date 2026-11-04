@@ -448,6 +448,7 @@ pub(crate) fn chrome_error(firefox: &str) -> String {
         ("NS_ERROR_MALFORMED_URI", "ERR_INVALID_URL"),
         ("NS_ERROR_UNKNOWN_PROTOCOL", "ERR_UNKNOWN_URL_SCHEME"),
         ("NS_ERROR_FILE_NOT_FOUND", "ERR_FILE_NOT_FOUND"),
+        ("NS_ERROR_DOCUMENT_NOT_CACHED", "ERR_CACHE_MISS"),
         ("NS_BINDING_ABORTED", "ERR_ABORTED"),
         ("NS_ERROR_ABORT", "ERR_ABORTED"),
         ("NS_ERROR_CORRUPTED_CONTENT", "ERR_INVALID_RESPONSE"),
@@ -538,15 +539,28 @@ pub(super) async fn go_by(
         s.next_kind = Some("historyDifferentDocument");
         (s.navigations, s.started)
     };
-    let traversed = page
-        .call(
-            "browsingContext.traverseHistory",
-            json!({"context": page.inner.target, "delta": by}),
+    let what = || {
+        format!(
+            "going {by} through the page's history (Firefox may not have committed a \
+             navigation: the page asked before being left, or the answer was a 204 or a download)"
         )
-        .await;
+    };
+    let traverse = page.call(
+        "browsingContext.traverseHistory",
+        json!({"context": page.inner.target, "delta": by}),
+    );
+    let traversed = match tokio::time::timeout_at(deadline, traverse).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Timeout(what())),
+    };
     if let Err(e) = traversed {
         page.state().next_kind = None;
         return match e {
+            // Firefox gives up on a step that doesn't commit after a
+            // second of its own.
+            Error::Protocol { message, .. } if message.starts_with("History was not updated") => {
+                Err(Error::Timeout(what()))
+            }
             // "no such history entry", which Firefox says as this.
             Error::Protocol { message, .. }
                 if message.starts_with("History entry with delta")
@@ -557,7 +571,6 @@ pub(super) async fn go_by(
             e => Err(e),
         };
     }
-    let what = || format!("going {by} through the page's history");
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let ours = |s: &State| s.starts.iter().find(|st| st.number > started).cloned();
     // Another document, which starts a navigation, or the same one at
@@ -725,6 +738,12 @@ pub(crate) async fn remote(
 /// needed there, and awaits it. A document that went while it ran, which
 /// takes its sandbox with it, has it run once more in the one after.
 pub(crate) async fn helper(page: &Page, context: &str, expression: &str) -> Result<Value> {
+    to_json(&helper_remote(page, context, expression).await?)
+}
+
+/// [`helper`], giving what it returns as BiDi has it: a node as one BiDi
+/// can name in other commands.
+pub(crate) async fn helper_remote(page: &Page, context: &str, expression: &str) -> Result<Value> {
     let body = format!("return await ({expression}\n);");
     let (mut loaded, mut again) = (false, false);
     loop {
@@ -737,9 +756,36 @@ pub(crate) async fn helper(page: &Page, context: &str, expression: &str) -> Resu
                 again = true;
                 loaded = false;
             }
-            r => return to_json(&r?),
+            r => return r,
         }
     }
+}
+
+/// Gives the `<input type=file>` `selector` finds in the frame `context`
+/// these files, as choosing them would.
+pub(crate) async fn set_files(
+    page: &Page,
+    context: &str,
+    selector: &str,
+    files: &[String],
+) -> Result<()> {
+    let input = helper_remote(
+        page,
+        context,
+        &format!("__netweir.find({})", Value::from(selector)),
+    )
+    .await?;
+    let Some(shared) = input["sharedId"].as_str() else {
+        return Err(Error::Script(format!(
+            "set_input_files {selector}: it went away"
+        )));
+    };
+    page.call(
+        "input.setFiles",
+        json!({"context": context, "element": {"sharedId": shared}, "files": files}),
+    )
+    .await
+    .map(drop)
 }
 
 /// Whether Firefox said a script's realm went while it ran: its document
@@ -804,6 +850,192 @@ pub(crate) async fn holder(page: &Page, parent: &str, child: &str) -> Result<Opt
         .into_iter()
         .flatten()
         .position(|w| w["value"]["context"] == child))
+}
+
+/// Sends `sources`, BiDi's input sources each with its actions, to the
+/// page. Firefox keeps each source's state between calls: a key or button
+/// that went down stays down until it comes up.
+async fn perform(page: &Page, context: &str, sources: Value) -> Result<Value> {
+    page.call(
+        "input.performActions",
+        json!({"context": context, "actions": sources}),
+    )
+    .await
+}
+
+/// The key Chrome's `event` names, going down or up, as one keyboard
+/// action. Firefox makes the key's code from it and does what the key
+/// does in a field (Control-A selects all) itself, so Chrome's edit
+/// commands aren't needed.
+pub(super) async fn key_event(page: &Page, event: &Value) -> Result<Value> {
+    let kind = match event["type"].as_str() {
+        Some("keyUp") => "keyUp",
+        _ => "keyDown",
+    };
+    let value = key_value(
+        event["key"].as_str().unwrap_or_default(),
+        event["code"].as_str().unwrap_or_default(),
+    );
+    // Keys go to the frame that has the focus: Firefox sends those for
+    // one from another site no further than its own frame.
+    let context = focused(page).await?;
+    perform(
+        page,
+        &context,
+        json!([{"type": "key", "id": "keyboard", "actions": [{"type": kind, "value": value}]}]),
+    )
+    .await
+}
+
+/// WebDriver's value for a key: the character it types, or for a key that
+/// types none, its code point in WebDriver's table.
+fn key_value(key: &str, code: &str) -> String {
+    let right = code.ends_with("Right");
+    let point = match key {
+        "Unidentified" => '\u{E000}',
+        "Cancel" => '\u{E001}',
+        "Help" => '\u{E002}',
+        "Backspace" => '\u{E003}',
+        "Tab" => '\u{E004}',
+        "Clear" => '\u{E005}',
+        "Enter" if code == "NumpadEnter" => '\u{E007}',
+        "Enter" => '\u{E006}',
+        "Shift" if right => '\u{E050}',
+        "Shift" => '\u{E008}',
+        "Control" if right => '\u{E051}',
+        "Control" => '\u{E009}',
+        "Alt" if right => '\u{E052}',
+        "Alt" => '\u{E00A}',
+        "Meta" if right => '\u{E053}',
+        "Meta" => '\u{E03D}',
+        "Pause" => '\u{E00B}',
+        "Escape" => '\u{E00C}',
+        "PageUp" => '\u{E00E}',
+        "PageDown" => '\u{E00F}',
+        "End" => '\u{E010}',
+        "Home" => '\u{E011}',
+        "ArrowLeft" => '\u{E012}',
+        "ArrowUp" => '\u{E013}',
+        "ArrowRight" => '\u{E014}',
+        "ArrowDown" => '\u{E015}',
+        "Insert" => '\u{E016}',
+        "Delete" => '\u{E017}',
+        f if f.len() > 1
+            && f.starts_with('F')
+            && f[1..].parse::<u32>().is_ok_and(|n| (1..=12).contains(&n)) =>
+        {
+            char::from_u32(0xE031 + f[1..].parse::<u32>().unwrap_or(1) - 1).unwrap_or('\u{E000}')
+        }
+        // A character: the key that types it.
+        other => return other.to_string(),
+    };
+    point.to_string()
+}
+
+/// Chrome's mouse `event` as the mouse's own action: a move, a button
+/// going down or up where the mouse is, or a turn of the wheel.
+pub(super) async fn mouse_event(page: &Page, event: &Value) -> Result<Value> {
+    // The point is in the page's viewport. Firefox sends what reaches a
+    // frame from another site only from that frame's own context, at its
+    // point there, so the mouse of an action on a frame goes that way.
+    let (context, dx, dy) = page
+        .state()
+        .input_frame
+        .clone()
+        .unwrap_or_else(|| (page.inner.target.clone(), 0.0, 0.0));
+    let x = event["x"].as_f64().unwrap_or(0.0) - dx;
+    let y = event["y"].as_f64().unwrap_or(0.0) - dy;
+    let button = match event["button"].as_str() {
+        Some("middle") => 1,
+        Some("right") => 2,
+        _ => 0,
+    };
+    let mouse = |action: Value| json!([{"type": "pointer", "id": "mouse", "parameters": {"pointerType": "mouse"}, "actions": [action]}]);
+    let sources = match event["type"].as_str().unwrap_or_default() {
+        "mouseMoved" => mouse(json!({"type": "pointerMove", "x": x, "y": y, "duration": 0})),
+        "mousePressed" => mouse(json!({"type": "pointerDown", "button": button})),
+        "mouseReleased" => mouse(json!({"type": "pointerUp", "button": button})),
+        // The wheel's place and turn are whole pixels to WebDriver.
+        "mouseWheel" => json!([{"type": "wheel", "id": "wheel", "actions": [{
+            "type": "scroll",
+            "x": x.round() as i64,
+            "y": y.round() as i64,
+            "deltaX": event["deltaX"].as_f64().unwrap_or(0.0).round() as i64,
+            "deltaY": event["deltaY"].as_f64().unwrap_or(0.0).round() as i64,
+            "duration": 0,
+        }]}]),
+        other => {
+            return Err(Error::Invalid(format!("no mouse event {other:?}")));
+        }
+    };
+    perform(page, &context, sources).await
+}
+
+/// Puts `text` in at the caret of the frame with the focus, as an OS's
+/// character picker does: no key, and an input event the page sees as
+/// trusted, as with Chrome's insertText.
+pub(super) async fn insert_text(page: &Page, text: &str) -> Result<Value> {
+    let context = focused(page).await?;
+    let insert = format!(
+        "document.execCommand('insertText', false, {})",
+        Value::from(text)
+    );
+    helper(page, &context, &insert).await?;
+    Ok(Value::Null)
+}
+
+/// The context of the frame with the focus: the one whose document has it
+/// and whose focused element isn't a frame within it. The frame last acted
+/// on is asked first, as it usually is the one; the page's own when none
+/// has it.
+async fn focused(page: &Page) -> Result<String> {
+    const HERE: &str =
+        "document.hasFocus() && !['IFRAME', 'FRAME'].includes(document.activeElement?.tagName)";
+    let has = |context: String| async move {
+        (helper(page, &context, HERE).await.ok() == Some(Value::Bool(true))).then_some(context)
+    };
+    let last = page.state().input_frame.clone().map(|(c, _, _)| c);
+    let first = last.unwrap_or_else(|| page.inner.target.clone());
+    if let Some(context) = has(first).await {
+        return Ok(context);
+    }
+    for frame in frames(page).await?.iter().rev() {
+        if let Some(context) = has(frame.id().to_string()).await {
+            return Ok(context);
+        }
+    }
+    Ok(page.inner.target.clone())
+}
+
+/// Drags with the left button from `from`, where the mouse already is, to
+/// `to`, as [`Page::mouse_drag`] does. An HTML5 drag the page begins on
+/// the way is Firefox's own to carry on, as with a person's mouse.
+pub(super) async fn mouse_drag(page: &Page, from: (f64, f64), to: (f64, f64)) -> Result<()> {
+    let at =
+        |(x, y): (f64, f64), kind: &str| json!({"type": kind, "x": x, "y": y, "button": "left"});
+    page.mouse_event(at(from, "mousePressed")).await?;
+    let mut now = from;
+    let dragged = async {
+        tokio::time::sleep(crate::events::pause(super::BUTTON_HOLD)).await;
+        // As Chrome's: a step about every 20 pixels, eased at both ends.
+        let distance = (to.0 - from.0).hypot(to.1 - from.1);
+        let steps = (distance / 20.0).ceil().clamp(5.0, 40.0) as u32;
+        for i in 1..=steps {
+            let t = f64::from(i) / f64::from(steps);
+            let t = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
+            now = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            page.mouse_event(at(now, "mouseMoved")).await?;
+            tokio::time::sleep(Duration::from_millis(16)).await;
+        }
+        tokio::time::sleep(crate::events::pause(super::BUTTON_HOLD)).await;
+        Ok::<_, Error>(())
+    }
+    .await;
+    // Let go wherever the mouse got to, even after a failure: a button
+    // left down would change every click after.
+    let released = page.mouse_event(at(now, "mouseReleased")).await;
+    dragged?;
+    released.map(drop)
 }
 
 pub(super) async fn close(page: &Page) -> Result<()> {
