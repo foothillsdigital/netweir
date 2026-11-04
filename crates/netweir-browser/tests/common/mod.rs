@@ -459,10 +459,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "network control (phase 4)",
     ),
     (
-        "a_refused_connection_is_a_navigation_error",
-        "navigation (phase 3, task 2)",
-    ),
-    (
         "a_timeout_on_the_first_trip_down_says_so",
         "the mouse and keyboard (phase 3, task 4)",
     ),
@@ -479,28 +475,8 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "the mouse and keyboard (phase 3, task 4)",
     ),
     (
-        "back_and_forward_return_each_documents_response_and_none_at_the_ends",
-        "navigation (phase 3, task 2)",
-    ),
-    (
-        "back_over_a_pushed_entry_stays_in_the_document",
-        "navigation (phase 3, task 2)",
-    ),
-    (
-        "back_to_a_page_chrome_kept_whole_returns_without_loading_it",
-        "navigation (phase 3, task 2)",
-    ),
-    (
-        "back_to_a_page_that_cant_be_reached_is_a_navigation_error",
-        "navigation (phase 3, task 2)",
-    ),
-    (
         "back_to_a_posted_form_chrome_wont_send_again_is_a_navigation_error",
         "the mouse and keyboard (phase 3, task 4)",
-    ),
-    (
-        "back_waits_for_its_own_navigation_not_one_the_page_made_meanwhile",
-        "navigation (phase 3, task 2)",
     ),
     (
         "check_and_uncheck_click_only_when_the_state_differs",
@@ -517,10 +493,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "click_waits_until_the_element_can_be_clicked",
         "the mouse and keyboard (phase 3, task 4)",
-    ),
-    (
-        "closing_a_page_ends_a_navigation_waiting_on_it",
-        "navigation (phase 3, task 2)",
     ),
     (
         "control_or_meta_a_selects_the_field_on_each_system_and_backspace_empties_it",
@@ -585,10 +557,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "pages_keep_their_cookies_to_their_own_context",
         "network control (phase 4)",
-    ),
-    (
-        "reload_loads_the_document_again_and_returns_its_response",
-        "navigation (phase 3, task 2)",
     ),
     (
         "screenshots_are_png",
@@ -685,10 +653,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "wait_for_follows_the_element_through_its_states",
         "frames (phase 3, task 3)",
-    ),
-    (
-        "wait_for_navigation_follows_a_script_that_moves_the_page_on",
-        "navigation (phase 3, task 2)",
     ),
     (
         "waiting_on_an_opener_behind_its_popup_brings_it_back_first",
