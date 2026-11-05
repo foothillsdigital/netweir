@@ -553,32 +553,41 @@ pub(super) async fn go_by(
         Ok(r) => r,
         Err(_) => Err(Error::Timeout(what())),
     };
-    if let Err(e) = traversed {
-        page.state().next_kind = None;
-        return match e {
-            // Firefox gives up on a step that doesn't commit after a
-            // second of its own.
-            Error::Protocol { message, .. } if message.starts_with("History was not updated") => {
-                Err(Error::Timeout(what()))
-            }
-            // "no such history entry", which Firefox says as this.
-            Error::Protocol { message, .. }
-                if message.starts_with("History entry with delta")
-                    || message.contains("no such history entry") =>
-            {
-                Ok(None)
-            }
-            e => Err(e),
-        };
+    match traversed {
+        // Firefox stops waiting for the step after a second of its own,
+        // though its navigation may still be on its way (a refused
+        // connection takes longer than that on Windows): the wait below
+        // is for that, to the caller's own deadline.
+        Err(Error::Protocol { message, .. }) if message.starts_with("History was not updated") => {}
+        Err(e) => {
+            page.state().next_kind = None;
+            return match e {
+                // "no such history entry", which Firefox says as this.
+                Error::Protocol { message, .. }
+                    if message.starts_with("History entry with delta")
+                        || message.contains("no such history entry") =>
+                {
+                    Ok(None)
+                }
+                e => Err(e),
+            };
+        }
+        Ok(_) => {}
     }
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let ours = |s: &State| s.starts.iter().find(|st| st.number > started).cloned();
     // Another document, which starts a navigation, or the same one at
     // another entry, which only moves within it.
-    page.until(what, left(), |s| {
-        ours(s).is_some() || s.navigations > navigations
-    })
-    .await?;
+    let moved = page
+        .until(what, left(), |s| {
+            ours(s).is_some() || s.navigations > navigations
+        })
+        .await;
+    if moved.is_err() {
+        // Not left to name a navigation the page starts itself later.
+        page.state().next_kind = None;
+    }
+    moved?;
     let Some(start) = ours(&page.state()) else {
         let mut s = page.state();
         s.next_kind = None;
