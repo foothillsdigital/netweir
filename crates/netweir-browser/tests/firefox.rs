@@ -623,10 +623,12 @@ async fn back_forward_and_reload_on_firefox() {
         .unwrap();
     assert_eq!(part.url, b, "the document's own response");
     assert_eq!(page.url(), format!("{b}#part"));
-    let fetched = server.paths().len();
+    // Firefox asks for the site's icon now and then too.
+    let fetches = || server.paths().iter().filter(|p| *p == "/b").count();
+    let fetched = fetches();
     let reloaded = page.reload(load, None).await.unwrap();
     assert_eq!(reloaded.status, 200);
-    assert_eq!(server.paths().len(), fetched + 1, "{:?}", server.paths());
+    assert_eq!(fetches(), fetched + 1, "{:?}", server.paths());
     assert!(page.go_forward(load, None).await.unwrap().is_none());
     let within = page.go_back(load, None).await.unwrap().unwrap();
     assert_eq!((within.url.as_str(), within.status), (b.as_str(), 0));

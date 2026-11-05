@@ -538,26 +538,41 @@ pub(super) async fn go_by(
         s.next_kind = Some("historyDifferentDocument");
         (s.navigations, s.started)
     };
-    let traversed = page
-        .call(
-            "browsingContext.traverseHistory",
-            json!({"context": page.inner.target, "delta": by}),
+    let what = || {
+        format!(
+            "going {by} through the page's history (Firefox may not have committed a \
+             navigation: the page asked before being left, or the answer was a 204 or a download)"
         )
-        .await;
-    if let Err(e) = traversed {
-        page.state().next_kind = None;
-        return match e {
-            // "no such history entry", which Firefox says as this.
-            Error::Protocol { message, .. }
-                if message.starts_with("History entry with delta")
-                    || message.contains("no such history entry") =>
-            {
-                Ok(None)
-            }
-            e => Err(e),
-        };
+    };
+    let traverse = page.call(
+        "browsingContext.traverseHistory",
+        json!({"context": page.inner.target, "delta": by}),
+    );
+    let traversed = match tokio::time::timeout_at(deadline, traverse).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::Timeout(what())),
+    };
+    match traversed {
+        // Firefox stops waiting for the step after a second of its own,
+        // though its navigation may still be on its way (a refused
+        // connection takes longer than that on Windows): the wait below
+        // is for that, to the caller's own deadline.
+        Err(Error::Protocol { message, .. }) if message.starts_with("History was not updated") => {}
+        Err(e) => {
+            page.state().next_kind = None;
+            return match e {
+                // "no such history entry", which Firefox says as this.
+                Error::Protocol { message, .. }
+                    if message.starts_with("History entry with delta")
+                        || message.contains("no such history entry") =>
+                {
+                    Ok(None)
+                }
+                e => Err(e),
+            };
+        }
+        Ok(_) => {}
     }
-    let what = || format!("going {by} through the page's history");
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let ours = |s: &State| s.starts.iter().find(|st| st.number > started).cloned();
     // Another document, which starts a navigation, or the same one at
