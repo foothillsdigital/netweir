@@ -143,6 +143,8 @@ struct Parser<'a> {
     /// matching both recurse, so a limit keeps a pathological selector
     /// from overflowing the stack.
     depth: u32,
+    /// Inside `:has()`, where Selectors 4 doesn't allow another `:has()`.
+    in_has: bool,
 }
 
 /// Nesting deeper than any real selector, and shallow enough for a
@@ -181,20 +183,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whitespace and comments; true if there was whitespace. A comment
+    /// alone separates nothing, so `a/**/.b` is the compound `a.b`.
     fn skip_space(&mut self) -> bool {
-        let start = self.pos;
-        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r' | '\x0C')) {
-            self.pos += 1;
-        }
-        // Comments count as whitespace.
-        if self.s[self.pos..].starts_with("/*") {
-            match self.s[self.pos + 2..].find("*/") {
-                Some(end) => self.pos += end + 4,
-                None => self.pos = self.s.len(),
+        let mut space = false;
+        loop {
+            if matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r' | '\x0C')) {
+                self.pos += 1;
+                space = true;
+            } else if !self.skip_comment() {
+                return space;
             }
-            self.skip_space();
         }
-        self.pos != start
+    }
+
+    /// One comment, if one starts here. An unclosed one runs to the end.
+    fn skip_comment(&mut self) -> bool {
+        if !self.s[self.pos..].starts_with("/*") {
+            return false;
+        }
+        match self.s[self.pos + 2..].find("*/") {
+            Some(end) => self.pos += end + 4,
+            None => self.pos = self.s.len(),
+        }
+        true
     }
 
     fn at_end(&self) -> bool {
@@ -389,9 +401,11 @@ impl<'a> Parser<'a> {
 
     fn compound(&mut self) -> Result<Compound, SelectorError> {
         let mut simple = Vec::new();
+        let mut universal = false;
         // A type selector or universal, with an optional namespace prefix.
         if self.peek() == Some('*') || self.starts_name() || self.peek() == Some('|') {
             let star = self.eat('*');
+            universal = star;
             let name = if star || self.peek() == Some('|') {
                 String::new()
             } else {
@@ -419,14 +433,15 @@ impl<'a> Parser<'a> {
             }
         }
         loop {
+            while self.skip_comment() {}
             match self.peek() {
                 Some('#') => {
                     self.pos += 1;
-                    let id = self.name()?;
-                    if id.is_empty() {
-                        return error("an empty #id");
+                    // An ID is an identifier, so `#1a` isn't one.
+                    if !self.starts_name() {
+                        return error(format!("#{} isn't an identifier", self.name()?));
                     }
-                    simple.push(Simple::Id(id));
+                    simple.push(Simple::Id(self.name()?));
                 }
                 Some('.') => {
                     self.pos += 1;
@@ -446,7 +461,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        if simple.is_empty() && !self.s[..self.pos].ends_with('*') {
+        if simple.is_empty() && !universal {
             return error(match self.peek() {
                 Some(c) => format!("unexpected {c:?}"),
                 None => "a selector ends early".to_string(),
@@ -583,15 +598,13 @@ impl<'a> Parser<'a> {
             "not" => Pseudo::Not(self.selector_list(false)?),
             "is" | "where" | "matches" => Pseudo::Is(self.selector_list(true)?),
             "has" => {
-                let mut out = Vec::new();
-                loop {
-                    out.push(self.complex(true)?);
-                    self.skip_space();
-                    if !self.eat(',') {
-                        break;
-                    }
+                if self.in_has {
+                    return error(":has() can't go inside :has()");
                 }
-                Pseudo::Has(SelectorList(out))
+                self.in_has = true;
+                let list = self.has_list();
+                self.in_has = false;
+                Pseudo::Has(list?)
             }
             "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
                 let of_type = name.ends_with("of-type");
@@ -605,7 +618,7 @@ impl<'a> Parser<'a> {
                 };
                 let (a, b) = an_plus_b(anb)?;
                 let of = rest
-                    .map(|rest| SelectorList::parse_at(rest, self.depth))
+                    .map(|rest| SelectorList::parse_at(rest, self.depth, self.in_has))
                     .transpose()?;
                 self.pos = close;
                 Pseudo::Nth {
@@ -618,6 +631,17 @@ impl<'a> Parser<'a> {
             }
             _ => return error(format!(":{name}() isn't supported")),
         })
+    }
+
+    fn has_list(&mut self) -> Result<SelectorList, SelectorError> {
+        let mut out = Vec::new();
+        loop {
+            out.push(self.complex(true)?);
+            self.skip_space();
+            if !self.eat(',') {
+                return Ok(SelectorList(out));
+            }
+        }
     }
 
     /// Where the `)` closing the current parenthesis is, past nested
@@ -677,16 +701,18 @@ fn an_plus_b(text: &str) -> Result<(i32, i32), SelectorError> {
         "" => return Err(bad()),
         _ => {}
     }
-    let compact: String = text.split_whitespace().collect();
-    let Some(i) = compact.find('n') else {
-        return compact.parse::<i32>().map(|b| (0, b)).map_err(|_| bad());
+    // Whitespace can only go around the sign before B, as in `2n + 1`:
+    // `2 n` and `+ 5` are two tokens where An+B wants one.
+    let Some(i) = text.find('n') else {
+        return text.parse::<i32>().map(|b| (0, b)).map_err(|_| bad());
     };
-    let a = match &compact[..i] {
+    let compact: String = text[i + 1..].split_whitespace().collect();
+    let a = match &text[..i] {
         "" | "+" => 1,
         "-" => -1,
         s => s.parse::<i32>().map_err(|_| bad())?,
     };
-    let rest = &compact[i + 1..];
+    let rest = compact.as_str();
     let b = if rest.is_empty() {
         0
     } else if rest.len() > 1
@@ -721,14 +747,15 @@ fn nth(a: i32, b: i32, last: bool, of_type: bool) -> Pseudo {
 
 impl SelectorList {
     pub fn parse(selector: &str) -> Result<SelectorList, SelectorError> {
-        SelectorList::parse_at(selector, 0)
+        SelectorList::parse_at(selector, 0, false)
     }
 
-    fn parse_at(selector: &str, depth: u32) -> Result<SelectorList, SelectorError> {
+    fn parse_at(selector: &str, depth: u32, in_has: bool) -> Result<SelectorList, SelectorError> {
         let mut p = Parser {
             s: selector,
             pos: 0,
             depth,
+            in_has,
         };
         let list = p.selector_list(false)?;
         p.skip_space();

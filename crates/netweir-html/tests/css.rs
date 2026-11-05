@@ -236,3 +236,52 @@ fn deeply_nested_selectors_are_errors_not_crashes() {
     let ok = format!("{}a{}", ":not(".repeat(20), ")".repeat(20));
     assert!(SelectorList::parse(&ok).is_ok());
 }
+
+/// Places the parser was looser than CSS (parsec-html/parsec#37). Lexbor
+/// reads comments the same way, and rejects `+ 5`, but accepts `2 n`,
+/// `#1a` and `:has()` inside `:has()`.
+#[test]
+fn selectors_read_as_css_reads_them() {
+    // A comment is no whitespace: `li/**/.sold` is one compound.
+    assert_eq!(page("li/**/.sold"), ["li#27"]);
+    assert_eq!(page("li /**/.price"), ["span"]);
+    assert_eq!(page("ul/**/>/**/li").len(), 4);
+    assert!(SelectorList::parse("*/**/").is_ok());
+
+    // An+B has no whitespace inside a term, only around the sign before B.
+    for bad in [
+        ":nth-child(2 n)",
+        ":nth-child(+ 5)",
+        ":nth-child(- n+1)",
+        ":nth-child(2n 1)",
+    ] {
+        assert!(SelectorList::parse(bad).is_err(), "{bad:?} parsed");
+    }
+    for good in [
+        ":nth-child(2n + 1)",
+        ":nth-child( 2n- 1 )",
+        ":nth-child(-n +3)",
+        ":nth-child(+5)",
+    ] {
+        assert!(SelectorList::parse(good).is_ok(), "{good:?} didn't parse");
+    }
+
+    // An ID is an identifier: no leading digit, unless it's escaped.
+    for bad in ["#1a", "#-1", "#"] {
+        assert!(SelectorList::parse(bad).is_err(), "{bad:?} parsed");
+    }
+    assert!(SelectorList::parse(r"#\31 a").is_ok());
+    assert!(SelectorList::parse("#--x").is_ok());
+
+    // :has() doesn't nest, however deep the inner one is.
+    for bad in [
+        ":has(:has(a))",
+        ":has(a, :has(b))",
+        ":has(:nth-child(1 of :has(a)))",
+        ":has(:not(:has(a)))",
+    ] {
+        assert!(SelectorList::parse(bad).is_err(), "{bad:?} parsed");
+    }
+    assert!(SelectorList::parse(":has(a):has(b)").is_ok());
+    assert!(SelectorList::parse(":is(:has(a))").is_ok());
+}
