@@ -792,12 +792,20 @@ pub(crate) fn spawn(
     // meanwhile keeps the writing end and Said waits on it after the
     // browser has gone.
     let (stderr, browser_says) = pipe().map_err(failed)?;
+    // Firefox's stdout goes there too, where it's read. On Windows, a
+    // Firefox whose stdout was the null device now and then lost the ids
+    // of all its windows, its first one's included, and opened no page
+    // after (#247); with it read, 18 runs in CI in a row never did.
+    let stdout = match browser {
+        "Firefox" => Stdio::from(browser_says.try_clone().map_err(failed)?),
+        _ => Stdio::null(),
+    };
     let mut command = Command::new(executable);
     command
         .args(args)
         .envs(envs.iter().copied())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::from(browser_says));
     // In a group of its own, which its helpers join: what the watcher
     // ends (see tie).
