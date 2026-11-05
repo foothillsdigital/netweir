@@ -439,7 +439,13 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     // An ID is an identifier, so `#1a` isn't one.
                     if !self.starts_name() {
-                        return error(format!("#{} isn't an identifier", self.name()?));
+                        return error(match self.peek() {
+                            Some(c) if c.is_ascii_digit() => "an ID can't start with a digit",
+                            Some('-') if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) => {
+                                "an ID can't start with a hyphen and a digit"
+                            }
+                            _ => "a # with no ID after it",
+                        });
                     }
                     simple.push(Simple::Id(self.name()?));
                 }

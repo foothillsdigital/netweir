@@ -245,6 +245,8 @@ fn selectors_read_as_css_reads_them() {
     // A comment is no whitespace: `li/**/.sold` is one compound.
     assert_eq!(page("li/**/.sold"), ["li#27"]);
     assert_eq!(page("li /**/.price"), ["span"]);
+    assert_eq!(page("li /**/ .price"), ["span"]);
+    assert_eq!(page("li/**/ .price"), ["span"]);
     assert_eq!(page("ul/**/>/**/li").len(), 4);
     assert!(SelectorList::parse("*/**/").is_ok());
 
@@ -267,8 +269,14 @@ fn selectors_read_as_css_reads_them() {
     }
 
     // An ID is an identifier: no leading digit, unless it's escaped.
-    for bad in ["#1a", "#-1", "#"] {
-        assert!(SelectorList::parse(bad).is_err(), "{bad:?} parsed");
+    for (bad, why) in [
+        ("#1a", "an ID can't start with a digit"),
+        ("#-1", "an ID can't start with a hyphen and a digit"),
+        ("#", "a # with no ID after it"),
+        ("p#", "a # with no ID after it"),
+    ] {
+        let e = SelectorList::parse(bad).expect_err(bad);
+        assert!(e.to_string().contains(why), "{bad:?}: {e}");
     }
     assert!(SelectorList::parse(r"#\31 a").is_ok());
     assert!(SelectorList::parse("#--x").is_ok());
