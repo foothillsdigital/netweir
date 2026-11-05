@@ -423,28 +423,12 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "popups, told of by the page's events (phase 4)",
     ),
     (
-        "a_page_that_asks_before_it_unloads_is_left_and_closed",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
-        "a_dialog_from_a_frame_on_another_site_is_heard_and_answered",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
-        "a_dialog_nobody_answers_is_dismissed_as_a_person_would",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
         "a_failing_step_continues_stops_or_fails_as_it_says",
         "steps (phase 3, task 8)",
     ),
     (
         "a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched",
         "network control (phase 4)",
-    ),
-    (
-        "a_listener_answers_a_dialog_and_reads_what_it_says",
-        "dialogs (phase 3, task 6)",
     ),
     (
         "a_page_saves_as_a_pdf_of_the_size_and_pages_asked_for",

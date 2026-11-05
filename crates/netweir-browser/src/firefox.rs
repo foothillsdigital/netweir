@@ -182,6 +182,10 @@ user_pref("browser.download.useDownloadDir", true);
 // as choosing it in the file picker would. Only Firefox's own code can
 // make a file from a path, never a page's.
 user_pref("dom.file.createInChild", true);
+// A dialog that opens within three seconds of the last gets a box for
+// stopping the page's dialogs, which BiDi doesn't tell of: it would wait
+// unanswered. The box is Firefox's own, out of the page's sight.
+user_pref("dom.successive_dialog_time_limit", 0);
 "#;
 
 /// `user.js` for the profile at `profile`. Public only for the stealth

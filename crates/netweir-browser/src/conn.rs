@@ -229,6 +229,9 @@ struct State {
     handlers: HashMap<String, Handler>,
     /// Every method sent, for the test that nothing forbidden was.
     sent: BTreeSet<String>,
+    /// Each BiDi frame's parent context, as Firefox told of it, so an
+    /// event in a frame reaches the handler of the page it's in.
+    parents: HashMap<String, String>,
 }
 
 impl Connection {
@@ -457,7 +460,11 @@ impl Shared {
                             ),
                         }));
                     }
-                    let handler = self.lock().handlers.remove(route);
+                    let handler = {
+                        let mut state = self.lock();
+                        state.parents.remove(route);
+                        state.handlers.remove(route)
+                    };
                     if let Some(handler) = handler {
                         handler(GONE, &Value::Null);
                     }
@@ -467,7 +474,29 @@ impl Shared {
                     method,
                     params,
                 } => {
-                    let handler = self.lock().handlers.get(route).cloned();
+                    let handler = {
+                        let mut state = self.lock();
+                        if method == "browsingContext.contextCreated"
+                            && let Some(parent) = params.get("parent").and_then(Value::as_str)
+                        {
+                            state.parents.insert(route.to_string(), parent.to_string());
+                        }
+                        // A frame without a handler of its own is its
+                        // page's, however deep it is.
+                        let (mut at, mut hops) = (route, 0);
+                        let mut handler = state.handlers.get(at).cloned();
+                        // A frame tree is never this deep; a loop in it,
+                        // which Firefox would never send, would never end.
+                        while handler.is_none()
+                            && hops < 64
+                            && let Some(parent) = state.parents.get(at)
+                        {
+                            at = parent;
+                            hops += 1;
+                            handler = state.handlers.get(at).cloned();
+                        }
+                        handler
+                    };
                     if let Some(handler) = handler {
                         handler(method, params);
                     }
@@ -817,6 +846,47 @@ mod tests {
             "{err}"
         );
         assert_eq!(heard.lock().unwrap().as_slice(), [GONE]);
+    }
+
+    #[tokio::test]
+    async fn bidi_events_in_a_frame_reach_its_page() {
+        let (conn, mut far) = firefox().await;
+        let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+        conn.on("top", {
+            let heard = heard.clone();
+            Arc::new(move |_: &str, p: &Value| {
+                let context = p["context"].as_str().unwrap_or_default().to_string();
+                heard.lock().unwrap().push(context)
+            })
+        });
+        for event in [
+            json!({"type": "event", "method": "browsingContext.contextCreated",
+                "params": {"context": "frame", "parent": "top"}}),
+            json!({"type": "event", "method": "browsingContext.contextCreated",
+                "params": {"context": "inner", "parent": "frame"}}),
+            json!({"type": "event", "method": "browsingContext.userPromptOpened",
+                "params": {"context": "inner"}}),
+            json!({"type": "event", "method": "browsingContext.contextDestroyed",
+                "params": {"context": "inner", "children": []}}),
+            // Gone, it's no one's any more, its going included.
+            json!({"type": "event", "method": "browsingContext.load",
+                "params": {"context": "inner"}}),
+            json!({"type": "event", "method": "browsingContext.load",
+                "params": {"context": "frame"}}),
+        ] {
+            far.send(Message::text(event.to_string())).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while heard.lock().unwrap().len() < 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            heard.lock().unwrap().as_slice(),
+            ["frame", "inner", "inner", "frame"]
+        );
     }
 
     #[tokio::test]

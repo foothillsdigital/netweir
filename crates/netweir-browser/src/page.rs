@@ -376,6 +376,11 @@ pub(crate) struct State {
     /// The frame a Firefox page's last action was on, when not its own,
     /// with where its viewport is in the page's: (context, x, y).
     pub(crate) input_frame: Option<(String, f64, f64)>,
+    /// Where each of a Firefox page's other frames is, by context: what a
+    /// dialog one of them opens says it came from.
+    frame_urls: HashMap<String, String>,
+    /// How many dialogs a Firefox page has opened.
+    prompts: u64,
     /// Frames Chrome runs in processes of their own (from other sites),
     /// each with a session: (session, frame id), in the order they came.
     pub(crate) children: Vec<(String, String)>,
@@ -792,7 +797,7 @@ impl Page {
         });
         let own = session.clone();
         let handler: Handler = if browser.engine() == Engine::Firefox {
-            bidi::handler(shared.clone(), tokio::runtime::Handle::current())
+            bidi::handler(shared.clone(), &browser, tokio::runtime::Handle::current())
         } else {
             Arc::new(move |method, params| watch.hear(&own, method, params))
         };
@@ -1461,7 +1466,7 @@ impl Page {
     pub fn dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<Dialog> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = self.state();
-        if !state.gone && !self.inner.closed.load(Ordering::Relaxed) && !self.is_firefox() {
+        if !state.gone && !self.inner.closed.load(Ordering::Relaxed) {
             state.dialogs = Some(tx);
         }
         rx

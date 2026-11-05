@@ -23,6 +23,8 @@ const SANDBOX: &str = "netweir";
 
 /// Events a page keeps its state by.
 const EVENTS: &[&str] = &[
+    // Only for the connection, which learns each frame's page from it.
+    "browsingContext.contextCreated",
     "browsingContext.navigationStarted",
     "browsingContext.navigationCommitted",
     "browsingContext.navigationFailed",
@@ -34,6 +36,7 @@ const EVENTS: &[&str] = &[
     "network.responseCompleted",
     "network.fetchError",
     "script.message",
+    "browsingContext.userPromptOpened",
 ];
 
 /// The channel [`WATCH`] tells netweir on.
@@ -220,7 +223,12 @@ async fn place(browser: &Inner, context: &str) -> Result<()> {
 /// keep: a navigation's id is its loader, as a document's loader is on
 /// Chrome. Only the page's own context navigates the page; requests from
 /// any of its frames count towards network idle.
-pub(super) fn handler(shared: Arc<Shared>, runtime: tokio::runtime::Handle) -> Handler {
+pub(super) fn handler(
+    shared: Arc<Shared>,
+    browser: &Inner,
+    runtime: tokio::runtime::Handle,
+) -> Handler {
+    let (conn, timeout, pause) = (browser.conn.clone(), browser.timeout, browser.pause);
     Arc::new(move |method, params| {
         let mut state = lock_state(&shared);
         let own = params["context"] == state.frame.as_str();
@@ -276,7 +284,12 @@ pub(super) fn handler(shared: Arc<Shared>, runtime: tokio::runtime::Handle) -> H
                 state.quiet += 1;
             }
             "browsingContext.navigationCommitted" => {
-                note_origin(&state.origins, params["url"].as_str().unwrap_or_default());
+                let url = str_of(params, "url");
+                note_origin(&state.origins, &url);
+                if state.frame_urls.len() >= KEPT * 4 {
+                    state.frame_urls.clear();
+                }
+                state.frame_urls.insert(str_of(params, "context"), url);
             }
             "browsingContext.domContentLoaded" | "browsingContext.load" if own => {
                 let loader = str_of(params, "navigation");
@@ -303,6 +316,27 @@ pub(super) fn handler(shared: Arc<Shared>, runtime: tokio::runtime::Handle) -> H
                 state.navigations += 1;
                 state.within = true;
                 state.moved_within = state.navigations;
+            }
+            // In the page's own frame or any of its others: the page's.
+            "browsingContext.userPromptOpened" => {
+                let url = match own {
+                    true => state.url.clone(),
+                    false => state
+                        .frame_urls
+                        .get(params["context"].as_str().unwrap_or_default())
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                let dialog = crate::events::Dialog::opened_bidi(
+                    &conn, params, url, timeout, pause, &runtime,
+                );
+                state.prompts += 1;
+                // Nobody listening drops it, which answers it.
+                if let Some(to) = &state.dialogs
+                    && to.send(dialog).is_err()
+                {
+                    state.dialogs = None;
+                }
             }
             "script.message" if params["channel"] == CHANNEL => {
                 if params["source"]["context"] != state.frame.as_str() {
@@ -864,12 +898,30 @@ pub(crate) async fn holder(page: &Page, parent: &str, child: &str) -> Result<Opt
 /// Sends `sources`, BiDi's input sources each with its actions, to the
 /// page. Firefox keeps each source's state between calls: a key or button
 /// that went down stays down until it comes up.
+///
+/// Firefox doesn't answer until the page has handled what the actions
+/// did, and a dialog that opens meanwhile (a click's alert) holds that
+/// up until it's answered. Chrome answers once it opens, and so does this:
+/// the caller may be the one to answer it.
 async fn perform(page: &Page, context: &str, sources: Value) -> Result<Value> {
-    page.call(
+    let opened = page.state().prompts;
+    let performed = page.call(
         "input.performActions",
         json!({"context": context, "actions": sources}),
-    )
-    .await
+    );
+    let asked = async {
+        loop {
+            let changed = page.inner.shared.changed.notified();
+            if page.state().prompts != opened {
+                return;
+            }
+            changed.await;
+        }
+    };
+    tokio::select! {
+        r = performed => r,
+        () = asked => Ok(Value::Null),
+    }
 }
 
 /// The key Chrome's `event` names, going down or up, as one keyboard

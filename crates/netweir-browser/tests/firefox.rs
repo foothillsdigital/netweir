@@ -809,3 +809,42 @@ async fn firefox_typed_text_is_trusted() {
         serde_json::json!([["a", true], ["é", true]])
     );
 }
+
+#[tokio::test]
+async fn an_alert_from_a_click_doesnt_hang_the_page() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html("<button id=b onclick=\"alert('clicked'); window.after = 1\">b</button>"),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    // Nobody listening: dismissed at once, as a person would.
+    page.click("#b", Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    // Firefox runs a script while its alert is open, so the page is
+    // waited on to carry on.
+    let carried_on =
+        "new Promise(r => { const t = () => window.after ? r(1) : setTimeout(t, 20); t(); })";
+    let after = tokio::time::timeout(Duration::from_secs(10), page.evaluate(carried_on))
+        .await
+        .expect("the page waited on the alert");
+    assert_eq!(after.unwrap(), 1);
+    // Listening: the alert is handed over, and answering it lets the page
+    // go on.
+    let mut dialogs = page.dialogs();
+    page.evaluate("window.after = 0").await.unwrap();
+    page.click("#b", None).await.unwrap();
+    let dialog = tokio::time::timeout(Duration::from_secs(10), dialogs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((dialog.kind(), dialog.message()), ("alert", "clicked"));
+    dialog.accept(None).await.unwrap();
+    assert_eq!(page.evaluate(carried_on).await.unwrap(), 1);
+}

@@ -57,12 +57,50 @@ struct DialogInner {
     default_value: String,
     url: String,
     conn: Connection,
-    session: String,
+    answer: Answer,
     timeout: Duration,
     /// A moment after it opened: no answer goes sooner.
     not_before: Instant,
     answered: AtomicBool,
     runtime: tokio::runtime::Handle,
+}
+
+/// What a dialog says when it opens.
+struct Opened {
+    kind: String,
+    message: String,
+    default_value: String,
+    url: String,
+    answer: Answer,
+}
+
+/// Where a dialog's answer goes: Chrome's page session, or Firefox's
+/// browsing context.
+enum Answer {
+    Cdp { session: String },
+    Bidi { context: String },
+}
+
+impl Answer {
+    /// The command that answers, with `accept`, and `text` for a prompt.
+    fn command(&self, accept: bool, text: Option<&str>) -> (&str, &'static str, Value) {
+        match self {
+            Answer::Cdp { session } => {
+                let mut params = json!({"accept": accept});
+                if let Some(text) = text {
+                    params["promptText"] = Value::from(text);
+                }
+                (session, "Page.handleJavaScriptDialog", params)
+            }
+            Answer::Bidi { context } => {
+                let mut params = json!({"context": context, "accept": accept});
+                if let Some(text) = text {
+                    params["userText"] = Value::from(text);
+                }
+                ("", "browsingContext.handleUserPrompt", params)
+            }
+        }
+    }
 }
 
 /// How long a person takes to react: to read a dialog and answer it, or
@@ -136,14 +174,62 @@ impl Dialog {
         pause_range: (Duration, Duration),
         runtime: &tokio::runtime::Handle,
     ) -> Dialog {
+        let opened = Opened {
+            kind: str_of(params, "type"),
+            message: str_of(params, "message"),
+            default_value: str_of(params, "defaultPrompt"),
+            url: str_of(params, "url"),
+            answer: Answer::Cdp {
+                session: session.to_string(),
+            },
+        };
+        Dialog::make(conn, opened, timeout, pause_range, runtime)
+    }
+
+    /// For `browsingContext.userPromptOpened`, on Firefox, in the frame
+    /// `context`, whose document is at `url`.
+    pub(crate) fn opened_bidi(
+        conn: &Connection,
+        params: &Value,
+        url: String,
+        timeout: Duration,
+        pause_range: (Duration, Duration),
+        runtime: &tokio::runtime::Handle,
+    ) -> Dialog {
+        let opened = Opened {
+            kind: str_of(params, "type"),
+            message: str_of(params, "message"),
+            default_value: str_of(params, "defaultValue"),
+            url,
+            answer: Answer::Bidi {
+                context: str_of(params, "context"),
+            },
+        };
+        Dialog::make(conn, opened, timeout, pause_range, runtime)
+    }
+
+    fn make(
+        conn: &Connection,
+        opened: Opened,
+        timeout: Duration,
+        pause_range: (Duration, Duration),
+        runtime: &tokio::runtime::Handle,
+    ) -> Dialog {
+        let Opened {
+            kind,
+            message,
+            default_value,
+            url,
+            answer,
+        } = opened;
         let dialog = Dialog {
             inner: Arc::new(DialogInner {
-                kind: str_of(params, "type"),
-                message: str_of(params, "message"),
-                default_value: str_of(params, "defaultPrompt"),
-                url: str_of(params, "url"),
+                kind,
+                message,
+                default_value,
+                url,
                 conn: conn.clone(),
-                session: session.to_string(),
+                answer,
                 timeout,
                 not_before: Instant::now() + pause(pause_range),
                 answered: AtomicBool::new(false),
@@ -209,10 +295,7 @@ impl Dialog {
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let inner = self.inner.clone();
         let answered = inner.answered.swap(true, Ordering::Relaxed);
-        let mut params = json!({"accept": accept});
-        if let Some(text) = text {
-            params["promptText"] = Value::from(text);
-        }
+        let text = text.map(str::to_string);
         let already = format!(
             "the {} \"{}\" was already answered, or answered the default way when nobody had \
              in time",
@@ -223,7 +306,7 @@ impl Dialog {
         // dialog counts as answered, and nothing else would answer it.
         let sending = (!answered).then(|| {
             let runtime = inner.runtime.clone();
-            runtime.spawn(async move { inner.send(params).await })
+            runtime.spawn(async move { inner.send(accept, text.as_deref()).await })
         });
         async move {
             match sending {
@@ -235,14 +318,10 @@ impl Dialog {
 }
 
 impl DialogInner {
-    async fn send(&self, params: Value) -> Result<()> {
+    async fn send(&self, accept: bool, text: Option<&str>) -> Result<()> {
         tokio::time::sleep_until(self.not_before).await;
-        let answer = self.conn.call_within(
-            self.timeout,
-            &self.session,
-            "Page.handleJavaScriptDialog",
-            params,
-        );
+        let (session, method, params) = self.answer.command(accept, text);
+        let answer = self.conn.call_within(self.timeout, session, method, params);
         match answer.await {
             Ok(_) => Ok(()),
             Err(e) if went_away(&e) => Ok(()),
@@ -260,14 +339,11 @@ impl DialogInner {
         // Leaving is what netweir's own goto() asked for; anything else
         // is Escape.
         let accept = self.kind == "beforeunload";
-        let (conn, session, at) = (self.conn.clone(), self.session.clone(), self.not_before);
+        let (session, method, params) = self.answer.command(accept, None);
+        let (conn, session, at) = (self.conn.clone(), session.to_string(), self.not_before);
         self.runtime.spawn(async move {
             tokio::time::sleep_until(at).await;
-            conn.send(
-                &session,
-                "Page.handleJavaScriptDialog",
-                json!({"accept": accept}),
-            );
+            conn.send(&session, method, params);
         });
     }
 }
