@@ -431,10 +431,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "network control (phase 4)",
     ),
     (
-        "a_page_saves_as_a_pdf_of_the_size_and_pages_asked_for",
-        "screenshots and PDF (phase 3, task 7)",
-    ),
-    (
         "a_popup_from_a_link_is_read_and_carries_its_openers_rules",
         "network control (phase 4)",
     ),
@@ -465,10 +461,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "pages_keep_their_cookies_to_their_own_context",
         "network control (phase 4)",
-    ),
-    (
-        "screenshots_are_png",
-        "screenshots and PDF (phase 3, task 7)",
     ),
     (
         "steps_answer_dialogs_act_in_frames_and_run_calls",

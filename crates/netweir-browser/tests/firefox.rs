@@ -848,3 +848,38 @@ async fn an_alert_from_a_click_doesnt_hang_the_page() {
     dialog.accept(None).await.unwrap();
     assert_eq!(page.evaluate(carried_on).await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn firefox_full_page_screenshot_is_the_page_s_size() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html("<style>body { margin: 0 }</style><div style='height: 3000px'></div>"),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let ratio = page
+        .evaluate("devicePixelRatio")
+        .await
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    // A PNG's height is in its header, after the width.
+    let height = |png: &[u8]| u32::from_be_bytes(png[20..24].try_into().unwrap());
+    let whole = page.screenshot(true).await.unwrap();
+    assert_eq!(f64::from(height(&whole)), 3000.0 * ratio);
+    let view = page.screenshot(false).await.unwrap();
+    let inner = page
+        .evaluate("innerHeight")
+        .await
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    assert_eq!(f64::from(height(&view)), inner * ratio);
+    let jpeg = page.capture(false, Some(50)).await.unwrap();
+    assert_eq!(&jpeg[..2], [0xFF, 0xD8], "a JPEG");
+}

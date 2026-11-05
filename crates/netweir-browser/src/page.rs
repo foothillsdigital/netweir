@@ -2430,14 +2430,15 @@ impl Page {
 
     /// A PNG of the viewport, or of the whole page.
     pub async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>> {
-        self.chrome_only("Page.screenshot")?;
         self.capture(full_page, None).await
     }
 
     /// [`Page::screenshot`], or with a `quality` (1 to 100) a JPEG of
     /// that quality, which is often a tenth the size.
     pub async fn capture(&self, full_page: bool, quality: Option<u8>) -> Result<Vec<u8>> {
-        self.chrome_only("Page.capture")?;
+        if self.is_firefox() {
+            return bidi::capture(self, full_page, quality).await;
+        }
         let mut params = match quality {
             Some(q) => json!({"format": "jpeg", "quality": q.clamp(1, 100)}),
             None => json!({"format": "png"}),
@@ -2463,7 +2464,9 @@ impl Page {
 
     /// The page as a PDF, laid out as for printing.
     pub async fn pdf(&self, options: &PdfOptions) -> Result<Vec<u8>> {
-        self.chrome_only("Page.pdf")?;
+        if self.is_firefox() {
+            return bidi::pdf(self, options).await;
+        }
         let mut params = json!({
             "landscape": options.landscape,
             "printBackground": options.print_background,

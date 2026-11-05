@@ -1099,6 +1099,77 @@ pub(super) async fn mouse_drag(page: &Page, from: (f64, f64), to: (f64, f64)) ->
     released.map(drop)
 }
 
+/// A PNG of the viewport or the whole page, or with a `quality` (1 to
+/// 100), a JPEG of that quality.
+pub(super) async fn capture(page: &Page, full_page: bool, quality: Option<u8>) -> Result<Vec<u8>> {
+    let format = match quality {
+        Some(q) => json!({"type": "image/jpeg", "quality": f64::from(q.clamp(1, 100)) / 100.0}),
+        None => json!({"type": "image/png"}),
+    };
+    let r = page
+        .call(
+            "browsingContext.captureScreenshot",
+            json!({
+                "context": page.inner.target,
+                "origin": if full_page { "document" } else { "viewport" },
+                "format": format,
+            }),
+        )
+        .await?;
+    decoded("browsingContext.captureScreenshot", &r)
+}
+
+/// Centimetres in an inch: `PdfOptions` is in inches, as Chrome's
+/// printing is, and BiDi's in centimetres.
+const CM: f64 = 2.54;
+
+/// The page as a PDF, laid out for printing as [`Page::pdf`] says.
+pub(super) async fn pdf(page: &Page, options: &super::PdfOptions) -> Result<Vec<u8>> {
+    let mut params = json!({
+        "context": page.inner.target,
+        "background": options.print_background,
+        "orientation": if options.landscape { "landscape" } else { "portrait" },
+        // As Chrome prints: at the scale asked for, not shrunk to fit.
+        "shrinkToFit": false,
+    });
+    if let Some(scale) = options.scale {
+        params["scale"] = json!(scale);
+    }
+    if let Some((width, height)) = options.paper {
+        params["page"] = json!({"width": width * CM, "height": height * CM});
+    }
+    if let Some(m) = options.margin {
+        let m = m * CM;
+        params["margin"] = json!({"top": m, "bottom": m, "left": m, "right": m});
+    }
+    if let Some(ranges) = &options.page_ranges {
+        // "1-5, 8" is a list to BiDi, of page numbers and ranges.
+        let ranges: Vec<Value> = ranges
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(|r| match r.parse::<u64>() {
+                Ok(n) => Value::from(n),
+                Err(_) => Value::from(r),
+            })
+            .collect();
+        params["pageRanges"] = Value::Array(ranges);
+    }
+    let r = page.call("browsingContext.print", params).await?;
+    decoded("browsingContext.print", &r)
+}
+
+/// The base64 `data` of `method`'s answer, as bytes.
+fn decoded(method: &str, answer: &Value) -> Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(answer["data"].as_str().unwrap_or_default())
+        .map_err(|e| Error::Protocol {
+            method: method.into(),
+            message: e.to_string(),
+        })
+}
+
 pub(super) async fn close(page: &Page) -> Result<()> {
     let inner = &page.inner;
     let browser = &inner.browser;
