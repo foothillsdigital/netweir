@@ -685,3 +685,127 @@ async fn wait_for_navigation_sees_a_script_redirect() {
     assert_eq!(next.url, format!("{}/next", server.url));
     assert_eq!(next.status, 200);
 }
+
+#[tokio::test]
+async fn firefox_helper_survives_its_document_going() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![
+        (
+            "/",
+            common::html("<script>setTimeout(() => location = '/next', 200)</script>"),
+        ),
+        (
+            "/next",
+            common::html(
+                "<script>setTimeout(() => document.body.innerHTML = '<p id=late>x</p>', 200)</script>",
+            ),
+        ),
+    ]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    // The wait began in the first document, and its element is in the
+    // second.
+    page.wait_for("#late", "visible", Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(page.url(), format!("{}/next", server.url));
+}
+
+#[tokio::test]
+async fn a_firefox_frame_has_its_name_and_its_own_document() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let other = common::serve(vec![(
+        "/inner",
+        common::html("<title>inner</title><p id=in>in</p>"),
+    )]);
+    let page_html = format!("<iframe name=box src='{}/inner'></iframe>", other.url);
+    let server = common::serve(vec![(
+        "/",
+        common::html(Box::leak(page_html.into_boxed_str())),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let frames = page.frames().await.unwrap();
+    assert_eq!(frames.len(), 2);
+    let inner = &frames[1];
+    assert_eq!(inner.name(), "box");
+    assert_eq!(inner.parent_id(), Some(frames[0].id()));
+    assert_eq!(inner.title().await.unwrap(), "inner");
+    assert_eq!(
+        inner
+            .evaluate("document.getElementById('in').textContent")
+            .await
+            .unwrap(),
+        "in"
+    );
+    page.evaluate("document.querySelector('iframe').remove()")
+        .await
+        .unwrap();
+    assert!(
+        matches!(inner.title().await, Err(Error::Gone(_))),
+        "removed"
+    );
+}
+
+#[tokio::test]
+async fn an_html5_drag_is_unsupported_and_presses_nothing() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html(
+            "<div id=item draggable=true style='width:60px;height:30px'>item</div>\
+             <div id=handle style='width:60px;height:30px'>handle</div>\
+             <div id=bin style='width:200px;height:80px'>bin</div>\
+             <script>window.downs = 0; addEventListener('mousedown', () => downs++)</script>",
+        ),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let r = page.drag("#item", "#bin", None).await;
+    assert!(
+        matches!(&r, Err(Error::Unsupported { feature, .. }) if feature.contains("HTML5")),
+        "{r:?}"
+    );
+    assert_eq!(page.evaluate("downs").await.unwrap(), 0);
+    // What only follows the mouse is dragged as on Chrome.
+    page.drag("#handle", "#bin", None).await.unwrap();
+    assert_eq!(page.evaluate("downs").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn firefox_typed_text_is_trusted() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html(
+            "<input id=t><script>window.seen = []; \
+             t.addEventListener('input', e => seen.push([e.data, e.isTrusted]))</script>",
+        ),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    page.type_text("#t", "aé", (Duration::ZERO, Duration::from_millis(1)), None)
+        .await
+        .unwrap();
+    assert_eq!(page.evaluate("t.value").await.unwrap(), "aé");
+    assert_eq!(
+        page.evaluate("seen").await.unwrap(),
+        serde_json::json!([["a", true], ["é", true]])
+    );
+}
