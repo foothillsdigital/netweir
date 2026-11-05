@@ -375,6 +375,10 @@ pub fn engine() -> netweir_browser::Engine {
 /// with what they're waiting for.
 pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
+        "a_guarded_page_fetches_nothing_ahead_past_the_guard",
+        "speculation rules and prerendering, which Firefox has none of",
+    ),
+    (
         "steps_click_type_and_wait_with_the_page_own_actions",
         "wait_for_response, on a page's responses (phase 4)",
     ),
@@ -429,10 +433,6 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
         "a_blank_popup_a_script_writes_into_is_read",
         "popups, told of by the page's events (phase 4)",
-    ),
-    (
-        "a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched",
-        "network control (phase 4)",
     ),
     (
         "a_popup_from_a_link_is_read_and_carries_its_openers_rules",

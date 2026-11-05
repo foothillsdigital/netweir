@@ -322,6 +322,9 @@ async fn netweir_sends_firefox_only_these_methods() {
         "browsingContext.handleUserPrompt",
         "input.performActions",
         "input.setFiles",
+        // Keep response bodies for Page::body, and let them go.
+        "network.addDataCollector",
+        "network.disownData",
         "script.addPreloadScript",
         "script.callFunction",
         "session.new",

@@ -264,7 +264,7 @@ jobs:
       # As a user gets it, which tests the installer on each system too.
       - run: uv run netweir install firefox
         timeout-minutes: 10
-      - run: cargo test --no-fail-fast -p netweir-browser --test actions --test page --test events --test steps
+      - run: cargo test --no-fail-fast -p netweir-browser --test actions --test page --test events --test steps --test network
         timeout-minutes: 20
 
   bench:

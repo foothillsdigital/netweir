@@ -101,6 +101,67 @@ impl Request {
     }
 }
 
+impl Request {
+    /// From a BiDi `network.RequestData`; `navigation` when it loads a
+    /// document. Firefox doesn't put a request's body in its events, so
+    /// `post_data` is None.
+    pub(crate) fn from_bidi(request: &Value, navigation: bool) -> Request {
+        Request {
+            id: str_of(request, "request"),
+            url: str_of(request, "url"),
+            method: str_of(request, "method"),
+            headers: bidi_headers(&request["headers"]),
+            resource_type: bidi_type(request, navigation).into(),
+            post_data: None,
+        }
+    }
+}
+
+/// BiDi `network.Header`s as pairs; a value that isn't text is decoded
+/// as bytes would be read.
+pub(crate) fn bidi_headers(headers: &Value) -> Vec<(String, String)> {
+    headers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|h| {
+            let value = &h["value"];
+            let text = match value["type"].as_str() {
+                Some("base64") => base64::engine::general_purpose::STANDARD
+                    .decode(value["value"].as_str().unwrap_or_default())
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default(),
+                _ => str_of(value, "value"),
+            };
+            (str_of(h, "name"), text)
+        })
+        .collect()
+}
+
+/// Netweir's resource type for a BiDi request, from what it's for (its
+/// fetch destination) and, where that's empty, what asked for it.
+pub(crate) fn bidi_type(request: &Value, navigation: bool) -> &'static str {
+    let destination = request["destination"].as_str().unwrap_or_default();
+    match destination {
+        _ if navigation => "document",
+        "document" | "iframe" | "frame" => "document",
+        "style" => "stylesheet",
+        "image" => "image",
+        "font" => "font",
+        "script" | "worker" | "sharedworker" | "serviceworker" => "script",
+        "audio" | "video" => "media",
+        "track" => "texttrack",
+        "manifest" => "manifest",
+        "" => match request["initiatorType"].as_str().unwrap_or_default() {
+            "xmlhttprequest" => "xhr",
+            "fetch" => "fetch",
+            "beacon" | "ping" => "ping",
+            _ => "other",
+        },
+        _ => "other",
+    }
+}
+
 /// A `Network.Headers` object as pairs.
 pub(crate) fn headers_of(headers: &Value) -> Vec<(String, String)> {
     headers
@@ -136,6 +197,9 @@ struct RouteInner {
     guard: Option<crate::Guard>,
     /// Told when it's decided, so its timer can stop.
     settled: Arc<tokio::sync::Notify>,
+    /// Firefox paused it, where Chrome's decisions are said BiDi's way.
+    bidi: bool,
+    refused: Refused,
 }
 
 /// Changes [`Route::continue_`] makes to a request on its way out.
@@ -229,6 +293,7 @@ impl Route {
                 inner.request.url
             )));
         }
+        let (method, params) = said(inner.bidi, &inner.refused, method, params);
         let answer = inner
             .conn
             .call_within(inner.timeout, &inner.session, method, params);
@@ -262,8 +327,8 @@ impl RouteInner {
             if let Some(headers) = &self.tidied {
                 params["headers"] = entries(headers);
             }
-            self.conn
-                .send(&self.session, "Fetch.continueRequest", params);
+            let (method, params) = said(self.bidi, &self.refused, "Fetch.continueRequest", params);
+            self.conn.send(&self.session, method, params);
         }
         self.settled.notify_one();
     }
@@ -292,6 +357,75 @@ fn entries(headers: &[(String, String)]) -> Value {
         .iter()
         .map(|(name, value)| json!({"name": name, "value": value}))
         .collect()
+}
+
+/// Requests a Firefox page failed as blocked by netweir: its guard, its
+/// blocks, or a route sending a document where the guard refuses. Their
+/// failure reads as Chrome's `ERR_BLOCKED_BY_CLIENT`.
+#[derive(Clone, Default)]
+pub(crate) struct Refused(Arc<Mutex<std::collections::HashSet<String>>>);
+
+impl Refused {
+    pub(crate) fn add(&self, request: String) {
+        let mut refused = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Each is taken when its failure comes; a few never fail (the
+        // page closed first), so the set is kept from growing.
+        if refused.len() >= 4096 {
+            refused.clear();
+        }
+        refused.insert(request);
+    }
+
+    /// Whether `request` was refused, forgetting it.
+    pub(crate) fn take(&self, request: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request)
+    }
+}
+
+/// A decision about a paused request, given as Chrome's Fetch domain
+/// takes it, as the browser that paused it takes it: unchanged for
+/// Chrome, BiDi's `network.*` for Firefox.
+fn said<'a>(bidi: bool, refused: &Refused, method: &'a str, cdp: Value) -> (&'a str, Value) {
+    if !bidi {
+        return (method, cdp);
+    }
+    if cdp["errorReason"] == "BlockedByClient" {
+        refused.add(str_of(&cdp, "requestId"));
+    }
+    let headers = |h: &Value| -> Value {
+        h.as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| json!({"name": h["name"], "value": {"type": "string", "value": h["value"]}}))
+            .collect()
+    };
+    let mut params = json!({"request": cdp["requestId"]});
+    match method {
+        "Fetch.failRequest" => ("network.failRequest", params),
+        "Fetch.fulfillRequest" => {
+            params["statusCode"] = cdp["responseCode"].clone();
+            params["headers"] = headers(&cdp["responseHeaders"]);
+            params["body"] = json!({"type": "base64", "value": cdp["body"]});
+            ("network.provideResponse", params)
+        }
+        _ => {
+            for key in ["url", "method"] {
+                if !cdp[key].is_null() {
+                    params[key] = cdp[key].clone();
+                }
+            }
+            if !cdp["headers"].is_null() {
+                params["headers"] = headers(&cdp["headers"]);
+            }
+            if !cdp["postData"].is_null() {
+                params["body"] = json!({"type": "base64", "value": cdp["postData"]});
+            }
+            ("network.continueRequest", params)
+        }
+    }
 }
 
 /// What a page, or every page of a context, blocks and routes.
@@ -344,6 +478,11 @@ pub(crate) struct Decider {
     /// sessions has it changed, so none is left with patterns from
     /// before the rules last changed.
     pub fetching: tokio::sync::Mutex<bool>,
+    /// A Firefox page's intercept, while its rules need one.
+    pub intercept: Mutex<Option<String>>,
+    /// The requests a Firefox page failed as blocked by netweir, whose
+    /// failure Firefox doesn't tell apart from any other.
+    pub refused: Refused,
     /// What Chrome itself adds to a request, for the page's sessions with
     /// a user agent override; see [`Tidy`].
     pub tidy: Option<Tidy>,
@@ -473,31 +612,67 @@ impl Decider {
             .as_str()
             .map_or_else(|| paused.clone(), str::to_string);
         let request = Request::from_cdp(id, &params["request"], &params["resourceType"]);
+        // Only the page's own session has its main frame: a frame from
+        // another site never fetches a document for it.
+        let guarded = session == self.session
+            && chrome_type == "Document"
+            && params["frameId"] == self.frame.as_str();
+        let tidied = self
+            .tidy
+            .as_ref()
+            .and_then(|t| t.headers(chrome_type, &request));
+        self.hand_on(
+            session,
+            paused,
+            request,
+            chrome_type,
+            guarded,
+            tidied,
+            false,
+        );
+    }
+
+    /// Decides about a request a Firefox page's intercept paused
+    /// (`network.beforeRequestSent` with `isBlocked`).
+    pub(crate) fn decide_bidi(&self, params: &Value) {
+        let navigation = params["navigation"].is_string();
+        let request = Request::from_bidi(&params["request"], navigation);
+        let paused = request.id.clone();
+        let chrome_type = chrome_type(&request.resource_type).unwrap_or("Other");
+        let guarded = navigation && params["context"] == self.frame.as_str();
+        self.hand_on("", paused, request, chrome_type, guarded, None, true);
+    }
+
+    /// Blocks `request`, hands it to a route, or lets it go.
+    #[allow(clippy::too_many_arguments)]
+    fn hand_on(
+        &self,
+        session: &str,
+        paused: String,
+        request: Request,
+        chrome_type: &str,
+        guarded: bool,
+        tidied: Option<Vec<(String, String)>>,
+        bidi: bool,
+    ) {
         let mut routes = None;
         for rules in &self.rules {
             let rules = lock(rules);
             if rules.blocks(&request, chrome_type) {
-                self.conn.send(
-                    session,
+                let (method, params) = said(
+                    bidi,
+                    &self.refused,
                     "Fetch.failRequest",
                     json!({"requestId": paused, "errorReason": "BlockedByClient"}),
                 );
+                self.conn.send(session, method, params);
                 return;
             }
             if routes.is_none() {
                 routes = rules.routes.clone().filter(|tx| !tx.is_closed());
             }
         }
-        // Only the page's own session has its main frame: a frame from
-        // another site never fetches a document for it.
-        let guarded = session == self.session
-            && chrome_type == "Document"
-            && params["frameId"] == self.frame.as_str();
         let settled = Arc::new(tokio::sync::Notify::new());
-        let tidied = self
-            .tidy
-            .as_ref()
-            .and_then(|t| t.headers(chrome_type, &request));
         let route = Route {
             inner: Arc::new(RouteInner {
                 paused,
@@ -509,6 +684,8 @@ impl Decider {
                 decided: AtomicBool::new(false),
                 guard: self.guard.clone().filter(|_| guarded),
                 settled: settled.clone(),
+                bidi,
+                refused: self.refused.clone(),
             }),
         };
         let Some(routes) = routes else {
@@ -685,6 +862,43 @@ mod tests {
         assert!(glob_match(r"**/\*", "http://a.test/*"));
         assert!(!glob_match(r"**/\*", "http://a.test/a"));
         assert!(glob_match("**/{a", "http://a.test/{a"));
+    }
+
+    #[test]
+    fn bidi_resource_types_read_as_chrome_names_them() {
+        let of = |destination: &str, initiator: Value| {
+            bidi_type(
+                &json!({"destination": destination, "initiatorType": initiator}),
+                false,
+            )
+        };
+        assert_eq!(bidi_type(&json!({"destination": ""}), true), "document");
+        assert_eq!(of("iframe", Value::Null), "document");
+        assert_eq!(of("style", json!("link")), "stylesheet");
+        assert_eq!(of("image", json!("img")), "image");
+        assert_eq!(of("video", json!("video")), "media");
+        assert_eq!(of("", json!("xmlhttprequest")), "xhr");
+        assert_eq!(of("", json!("fetch")), "fetch");
+        assert_eq!(of("", json!("beacon")), "ping");
+        assert_eq!(of("", Value::Null), "other");
+        assert_eq!(of("json", Value::Null), "other");
+        // Each is one of the types block() takes.
+        for ours in [
+            "document",
+            "stylesheet",
+            "image",
+            "font",
+            "script",
+            "media",
+            "texttrack",
+            "manifest",
+            "xhr",
+            "fetch",
+            "ping",
+            "other",
+        ] {
+            assert!(resource_types().any(|t| t == ours), "{ours}");
+        }
     }
 
     #[test]

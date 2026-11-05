@@ -1028,7 +1028,6 @@ impl Browser {
     /// to `guard` first, and one it refuses isn't fetched: navigating there
     /// fails with `ERR_BLOCKED_BY_CLIENT`.
     pub async fn new_guarded_page(&self, guard: Guard) -> Result<Page> {
-        self.inner.chrome_only("Browser.new_guarded_page")?;
         let context = self.create_context().await?;
         let env = self.inner.environment.clone();
         Page::open(
@@ -2152,7 +2151,6 @@ impl Context {
     /// Like [`Page::route`], for every page of the context, those open
     /// now and those opened later. A page's own routes come first.
     pub async fn route(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Route>> {
-        self.browser.chrome_only("Context.route")?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::network::lock(&self.rules.rules).routes = Some(tx);
         self.refresh().await?;
@@ -2162,7 +2160,6 @@ impl Context {
     /// Stops the context's routing; requests waiting for a decision go on
     /// unchanged.
     pub async fn unroute(&self) -> Result<()> {
-        self.browser.chrome_only("Context.unroute")?;
         crate::network::lock(&self.rules.rules).routes = None;
         self.refresh().await
     }

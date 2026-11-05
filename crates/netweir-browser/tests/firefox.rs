@@ -475,8 +475,8 @@ async fn unported_methods_are_unsupported_and_send_nothing() {
         }) => assert!(feature.contains(what), "{feature}"),
         other => panic!("{what}: {other:?}"),
     };
-    unsupported(page.route().await.map(drop), "route");
-    unsupported(page.block(&["image"], &[]).await, "block");
+    unsupported(page.add_init_script("1").await, "add_init_script");
+    unsupported(page.set_offline(true).await, "set_offline");
     unsupported(
         browser
             .new_page_with(netweir_browser::Environment {
