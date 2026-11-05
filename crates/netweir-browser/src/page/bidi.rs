@@ -587,9 +587,13 @@ pub(super) async fn go_by(
         return Ok(Some(Response::bare(s.url.clone(), s.loader.clone())));
     };
     // A document from the back-forward cache commits nothing: it's back,
-    // loaded already, once the sandbox is one without the mark.
+    // loaded already, once the sandbox is one without the mark, at the
+    // entry's URL. Firefox's error page for one that can't be loaded is a
+    // new document too, at its own URL, and does commit.
     let back = format!(
-        "return globalThis.__netweirLeft !== '{mark}' && document.readyState === 'complete';"
+        "return globalThis.__netweirLeft !== '{mark}' && document.readyState === 'complete' \
+         && location.href === {};",
+        Value::from(start.url.as_str())
     );
     loop {
         if page.state().committed.contains(&start.loader) {
