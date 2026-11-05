@@ -375,6 +375,14 @@ pub fn engine() -> netweir_browser::Engine {
 /// with what they're waiting for.
 pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
     (
+        "steps_click_type_and_wait_with_the_page_own_actions",
+        "wait_for_response, on a page's responses (phase 4)",
+    ),
+    (
+        "double_clicks_xpath_and_two_waits_for_one_url",
+        "wait_for_response, on a page's responses (phase 4)",
+    ),
+    (
         "drag_to_a_target_out_of_view_with_the_source_says_so_and_presses_nothing",
         "HTML5 drag and drop, which Firefox doesn't begin from WebDriver's mouse",
     ),
@@ -423,32 +431,8 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "popups, told of by the page's events (phase 4)",
     ),
     (
-        "a_page_that_asks_before_it_unloads_is_left_and_closed",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
-        "a_dialog_from_a_frame_on_another_site_is_heard_and_answered",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
-        "a_dialog_nobody_answers_is_dismissed_as_a_person_would",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
-        "a_failing_step_continues_stops_or_fails_as_it_says",
-        "steps (phase 3, task 8)",
-    ),
-    (
         "a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched",
         "network control (phase 4)",
-    ),
-    (
-        "a_listener_answers_a_dialog_and_reads_what_it_says",
-        "dialogs (phase 3, task 6)",
-    ),
-    (
-        "a_page_saves_as_a_pdf_of_the_size_and_pages_asked_for",
-        "screenshots and PDF (phase 3, task 7)",
     ),
     (
         "a_popup_from_a_link_is_read_and_carries_its_openers_rules",
@@ -475,28 +459,8 @@ pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
         "environments (phase 4)",
     ),
     (
-        "double_clicks_xpath_and_two_waits_for_one_url",
-        "steps (phase 3, task 8)",
-    ),
-    (
         "pages_keep_their_cookies_to_their_own_context",
         "network control (phase 4)",
-    ),
-    (
-        "screenshots_are_png",
-        "screenshots and PDF (phase 3, task 7)",
-    ),
-    (
-        "steps_answer_dialogs_act_in_frames_and_run_calls",
-        "steps (phase 3, task 8)",
-    ),
-    (
-        "steps_click_type_and_wait_with_the_page_own_actions",
-        "steps (phase 3, task 8)",
-    ),
-    (
-        "the_steps_stop_at_their_cap_whatever_their_on_error",
-        "steps (phase 3, task 8)",
     ),
     (
         "undo_and_redo_take_back_typing_on_each_system",

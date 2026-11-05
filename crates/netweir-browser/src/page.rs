@@ -376,6 +376,13 @@ pub(crate) struct State {
     /// The frame a Firefox page's last action was on, when not its own,
     /// with where its viewport is in the page's: (context, x, y).
     pub(crate) input_frame: Option<(String, f64, f64)>,
+    /// Where each of a Firefox page's other frames is, by context: what a
+    /// dialog one of them opens says it came from.
+    frame_urls: HashMap<String, String>,
+    /// How many dialogs a Firefox page has opened, and how many of them
+    /// are open now.
+    prompts: u64,
+    open_prompts: u64,
     /// Frames Chrome runs in processes of their own (from other sites),
     /// each with a session: (session, frame id), in the order they came.
     pub(crate) children: Vec<(String, String)>,
@@ -792,7 +799,7 @@ impl Page {
         });
         let own = session.clone();
         let handler: Handler = if browser.engine() == Engine::Firefox {
-            bidi::handler(shared.clone(), tokio::runtime::Handle::current())
+            bidi::handler(shared.clone(), &browser, tokio::runtime::Handle::current())
         } else {
             Arc::new(move |method, params| watch.hear(&own, method, params))
         };
@@ -1461,7 +1468,7 @@ impl Page {
     pub fn dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<Dialog> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = self.state();
-        if !state.gone && !self.inner.closed.load(Ordering::Relaxed) && !self.is_firefox() {
+        if !state.gone && !self.inner.closed.load(Ordering::Relaxed) {
             state.dialogs = Some(tx);
         }
         rx
@@ -2425,14 +2432,15 @@ impl Page {
 
     /// A PNG of the viewport, or of the whole page.
     pub async fn screenshot(&self, full_page: bool) -> Result<Vec<u8>> {
-        self.chrome_only("Page.screenshot")?;
         self.capture(full_page, None).await
     }
 
     /// [`Page::screenshot`], or with a `quality` (1 to 100) a JPEG of
     /// that quality, which is often a tenth the size.
     pub async fn capture(&self, full_page: bool, quality: Option<u8>) -> Result<Vec<u8>> {
-        self.chrome_only("Page.capture")?;
+        if self.is_firefox() {
+            return bidi::capture(self, full_page, quality).await;
+        }
         let mut params = match quality {
             Some(q) => json!({"format": "jpeg", "quality": q.clamp(1, 100)}),
             None => json!({"format": "png"}),
@@ -2458,7 +2466,9 @@ impl Page {
 
     /// The page as a PDF, laid out as for printing.
     pub async fn pdf(&self, options: &PdfOptions) -> Result<Vec<u8>> {
-        self.chrome_only("Page.pdf")?;
+        if self.is_firefox() {
+            return bidi::pdf(self, options).await;
+        }
         let mut params = json!({
             "landscape": options.landscape,
             "printBackground": options.print_background,

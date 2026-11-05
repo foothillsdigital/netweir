@@ -904,6 +904,11 @@ pub async fn run(page: &Page, steps: &[Step], call: &Call, cap: Option<Duration>
                 dialogs = Some(answer_dialogs(page, *accept, text.clone()));
                 Ok(None)
             }
+            // A Firefox page doesn't tell of its responses yet.
+            Action::WaitForResponse { .. } if page.is_firefox() => Err(Error::Unsupported {
+                engine: "Firefox",
+                feature: "a page's responses, which wait_for_response waits on".into(),
+            }),
             Action::WaitForResponse { url } => {
                 let h = heard.as_mut().expect("listening for responses");
                 h.wait(i, url, timeout).await.map(Some)

@@ -23,6 +23,8 @@ const SANDBOX: &str = "netweir";
 
 /// Events a page keeps its state by.
 const EVENTS: &[&str] = &[
+    // Only for the connection, which learns each frame's page from it.
+    "browsingContext.contextCreated",
     "browsingContext.navigationStarted",
     "browsingContext.navigationCommitted",
     "browsingContext.navigationFailed",
@@ -34,6 +36,8 @@ const EVENTS: &[&str] = &[
     "network.responseCompleted",
     "network.fetchError",
     "script.message",
+    "browsingContext.userPromptOpened",
+    "browsingContext.userPromptClosed",
 ];
 
 /// The channel [`WATCH`] tells netweir on.
@@ -241,7 +245,12 @@ async fn place(browser: &Inner, context: &str) -> Result<()> {
 /// keep: a navigation's id is its loader, as a document's loader is on
 /// Chrome. Only the page's own context navigates the page; requests from
 /// any of its frames count towards network idle.
-pub(super) fn handler(shared: Arc<Shared>, runtime: tokio::runtime::Handle) -> Handler {
+pub(super) fn handler(
+    shared: Arc<Shared>,
+    browser: &Inner,
+    runtime: tokio::runtime::Handle,
+) -> Handler {
+    let (conn, timeout, pause) = (browser.conn.clone(), browser.timeout, browser.pause);
     Arc::new(move |method, params| {
         let mut state = lock_state(&shared);
         let own = params["context"] == state.frame.as_str();
@@ -297,7 +306,12 @@ pub(super) fn handler(shared: Arc<Shared>, runtime: tokio::runtime::Handle) -> H
                 state.quiet += 1;
             }
             "browsingContext.navigationCommitted" => {
-                note_origin(&state.origins, params["url"].as_str().unwrap_or_default());
+                let url = str_of(params, "url");
+                note_origin(&state.origins, &url);
+                if state.frame_urls.len() >= KEPT * 4 {
+                    state.frame_urls.clear();
+                }
+                state.frame_urls.insert(str_of(params, "context"), url);
             }
             "browsingContext.domContentLoaded" | "browsingContext.load" if own => {
                 let loader = str_of(params, "navigation");
@@ -324,6 +338,31 @@ pub(super) fn handler(shared: Arc<Shared>, runtime: tokio::runtime::Handle) -> H
                 state.navigations += 1;
                 state.within = true;
                 state.moved_within = state.navigations;
+            }
+            // In the page's own frame or any of its others: the page's.
+            "browsingContext.userPromptOpened" => {
+                let url = match own {
+                    true => state.url.clone(),
+                    false => state
+                        .frame_urls
+                        .get(params["context"].as_str().unwrap_or_default())
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                let dialog = crate::events::Dialog::opened_bidi(
+                    &conn, params, url, timeout, pause, &runtime,
+                );
+                state.prompts += 1;
+                state.open_prompts += 1;
+                // Nobody listening drops it, which answers it.
+                if let Some(to) = &state.dialogs
+                    && to.send(dialog).is_err()
+                {
+                    state.dialogs = None;
+                }
+            }
+            "browsingContext.userPromptClosed" => {
+                state.open_prompts = state.open_prompts.saturating_sub(1);
             }
             "script.message" if params["channel"] == CHANNEL => {
                 if params["source"]["context"] != state.frame.as_str() {
@@ -718,6 +757,25 @@ pub(super) async fn to_front(page: &Page) -> Result<()> {
     Ok(())
 }
 
+/// Waits until none of the page's dialogs is open. Chrome runs nothing in
+/// a page's own world while it has one open, and Firefox would: a script
+/// would see the page from before its dialog was answered.
+pub(crate) async fn no_dialog_open(page: &Page) -> Result<()> {
+    loop {
+        let changed = page.inner.shared.changed.notified();
+        {
+            let s = page.state();
+            if s.open_prompts == 0 {
+                return Ok(());
+            }
+            if s.gone || page.inner.closed.load(Ordering::Relaxed) {
+                return Err(Error::PageClosed);
+            }
+        }
+        changed.await;
+    }
+}
+
 /// Runs `body` (a function body; `await` allowed) as an async function in
 /// the page's main frame: in the page's own world, or with `sandboxed`,
 /// in netweir's, where page script can't see it.
@@ -889,12 +947,30 @@ pub(crate) async fn holder(page: &Page, parent: &str, child: &str) -> Result<Opt
 /// Sends `sources`, BiDi's input sources each with its actions, to the
 /// page. Firefox keeps each source's state between calls: a key or button
 /// that went down stays down until it comes up.
+///
+/// Firefox doesn't answer until the page has handled what the actions
+/// did, and a dialog that opens meanwhile (a click's alert) holds that
+/// up until it's answered. Chrome answers once it opens, and so does this:
+/// the caller may be the one to answer it.
 async fn perform(page: &Page, context: &str, sources: Value) -> Result<Value> {
-    page.call(
+    let opened = page.state().prompts;
+    let performed = page.call(
         "input.performActions",
         json!({"context": context, "actions": sources}),
-    )
-    .await
+    );
+    let asked = async {
+        loop {
+            let changed = page.inner.shared.changed.notified();
+            if page.state().prompts != opened {
+                return;
+            }
+            changed.await;
+        }
+    };
+    tokio::select! {
+        r = performed => r,
+        () = asked => Ok(Value::Null),
+    }
 }
 
 /// The key Chrome's `event` names, going down or up, as one keyboard
@@ -1070,6 +1146,77 @@ pub(super) async fn mouse_drag(page: &Page, from: (f64, f64), to: (f64, f64)) ->
     let released = page.mouse_event(at(now, "mouseReleased")).await;
     dragged?;
     released.map(drop)
+}
+
+/// A PNG of the viewport or the whole page, or with a `quality` (1 to
+/// 100), a JPEG of that quality.
+pub(super) async fn capture(page: &Page, full_page: bool, quality: Option<u8>) -> Result<Vec<u8>> {
+    let format = match quality {
+        Some(q) => json!({"type": "image/jpeg", "quality": f64::from(q.clamp(1, 100)) / 100.0}),
+        None => json!({"type": "image/png"}),
+    };
+    let r = page
+        .call(
+            "browsingContext.captureScreenshot",
+            json!({
+                "context": page.inner.target,
+                "origin": if full_page { "document" } else { "viewport" },
+                "format": format,
+            }),
+        )
+        .await?;
+    decoded("browsingContext.captureScreenshot", &r)
+}
+
+/// Centimetres in an inch: `PdfOptions` is in inches, as Chrome's
+/// printing is, and BiDi's in centimetres.
+const CM: f64 = 2.54;
+
+/// The page as a PDF, laid out for printing as [`Page::pdf`] says.
+pub(super) async fn pdf(page: &Page, options: &super::PdfOptions) -> Result<Vec<u8>> {
+    let mut params = json!({
+        "context": page.inner.target,
+        "background": options.print_background,
+        "orientation": if options.landscape { "landscape" } else { "portrait" },
+        // As Chrome prints: at the scale asked for, not shrunk to fit.
+        "shrinkToFit": false,
+    });
+    if let Some(scale) = options.scale {
+        params["scale"] = json!(scale);
+    }
+    if let Some((width, height)) = options.paper {
+        params["page"] = json!({"width": width * CM, "height": height * CM});
+    }
+    if let Some(m) = options.margin {
+        let m = m * CM;
+        params["margin"] = json!({"top": m, "bottom": m, "left": m, "right": m});
+    }
+    if let Some(ranges) = &options.page_ranges {
+        // "1-5, 8" is a list to BiDi, of page numbers and ranges.
+        let ranges: Vec<Value> = ranges
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(|r| match r.parse::<u64>() {
+                Ok(n) => Value::from(n),
+                Err(_) => Value::from(r),
+            })
+            .collect();
+        params["pageRanges"] = Value::Array(ranges);
+    }
+    let r = page.call("browsingContext.print", params).await?;
+    decoded("browsingContext.print", &r)
+}
+
+/// The base64 `data` of `method`'s answer, as bytes.
+fn decoded(method: &str, answer: &Value) -> Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(answer["data"].as_str().unwrap_or_default())
+        .map_err(|e| Error::Protocol {
+            method: method.into(),
+            message: e.to_string(),
+        })
 }
 
 pub(super) async fn close(page: &Page) -> Result<()> {

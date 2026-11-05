@@ -809,3 +809,94 @@ async fn firefox_typed_text_is_trusted() {
         serde_json::json!([["a", true], ["é", true]])
     );
 }
+
+#[tokio::test]
+async fn an_alert_from_a_click_doesnt_hang_the_page() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html("<button id=b onclick=\"alert('clicked'); window.after = 1\">b</button>"),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    // Nobody listening: dismissed at once, as a person would.
+    page.click("#b", Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    // Firefox runs a script while its alert is open, so the page is
+    // waited on to carry on.
+    let carried_on =
+        "new Promise(r => { const t = () => window.after ? r(1) : setTimeout(t, 20); t(); })";
+    let after = tokio::time::timeout(Duration::from_secs(10), page.evaluate(carried_on))
+        .await
+        .expect("the page waited on the alert");
+    assert_eq!(after.unwrap(), 1);
+    // Listening: the alert is handed over, and answering it lets the page
+    // go on.
+    let mut dialogs = page.dialogs();
+    page.evaluate("window.after = 0").await.unwrap();
+    page.click("#b", None).await.unwrap();
+    let dialog = tokio::time::timeout(Duration::from_secs(10), dialogs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((dialog.kind(), dialog.message()), ("alert", "clicked"));
+    dialog.accept(None).await.unwrap();
+    assert_eq!(page.evaluate(carried_on).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn firefox_full_page_screenshot_is_the_page_s_size() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![(
+        "/",
+        common::html("<style>body { margin: 0 }</style><div style='height: 3000px'></div>"),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    page.goto(&server.url, netweir_browser::WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let ratio = page
+        .evaluate("devicePixelRatio")
+        .await
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    // A PNG's height is in its header, after the width.
+    let height = |png: &[u8]| u32::from_be_bytes(png[20..24].try_into().unwrap());
+    let whole = page.screenshot(true).await.unwrap();
+    assert_eq!(f64::from(height(&whole)), 3000.0 * ratio);
+    let view = page.screenshot(false).await.unwrap();
+    let inner = page
+        .evaluate("innerHeight")
+        .await
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    assert_eq!(f64::from(height(&view)), inner * ratio);
+    let jpeg = page.capture(false, Some(50)).await.unwrap();
+    assert_eq!(&jpeg[..2], [0xFF, 0xD8], "a JPEG");
+}
+
+#[tokio::test]
+async fn a_firefox_step_waiting_for_a_response_says_it_cant() {
+    use netweir_browser::steps::{self, Call};
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let page = browser.new_page().await.unwrap();
+    let list = steps::parse(&serde_json::json!([
+        {"action": "wait_for_response", "url": "**/api"},
+    ]))
+    .unwrap();
+    let no_calls: Box<Call> = Box::new(|_, _, _| Box::pin(async { Ok(serde_json::Value::Null) }));
+    let report = steps::run(&page, &list, &*no_calls, None).await;
+    let failure = report.failure().unwrap_or_default();
+    assert!(failure.contains("isn't available on Firefox"), "{failure}");
+}
