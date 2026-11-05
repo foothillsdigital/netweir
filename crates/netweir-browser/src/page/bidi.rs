@@ -837,16 +837,19 @@ pub(crate) async fn helper(page: &Page, context: &str, expression: &str) -> Resu
 /// can name in other commands.
 pub(crate) async fn helper_remote(page: &Page, context: &str, expression: &str) -> Result<Value> {
     let body = format!("return await ({expression}\n);");
-    let (mut loaded, mut again) = (false, false);
+    // A document that goes between the helpers' loading and the call
+    // leaves them behind, and the next is loaded again: a few times, for a
+    // page that moves on quickly.
+    let (mut loads, mut again) = (0, false);
     loop {
         match remote(page, context, &body, true, true).await {
-            Err(Error::Script(m)) if m.contains("__netweir is not defined") && !loaded => {
+            Err(Error::Script(m)) if m.contains("__netweir is not defined") && loads < 3 => {
                 remote(page, context, crate::frame::HELPERS, true, true).await?;
-                loaded = true;
+                loads += 1;
             }
             Err(Error::Protocol { message, .. }) if gone_under(&message) && !again => {
                 again = true;
-                loaded = false;
+                loads = 0;
             }
             r => return r,
         }
