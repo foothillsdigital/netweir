@@ -218,6 +218,61 @@ pub(crate) struct Started {
 /// Starts Firefox as `options` ask: the stealth start for a Firefox
 /// Netweir installed, automation mode only when `stealth` is false.
 pub(crate) async fn start(options: &LaunchOptions) -> Result<Started> {
+    let started = start_once(options).await?;
+    if names_its_windows(&started.conn).await? {
+        return Ok(started);
+    }
+    // A Firefox on Windows can start unable to name any of its windows, and
+    // then no page opens in it: end it and start another.
+    end(started);
+    let again = start_once(options).await?;
+    if names_its_windows(&again.conn).await? {
+        return Ok(again);
+    }
+    end(again);
+    Err(Error::Launch(
+        "Firefox started twice without an id for any of its windows, so no page can open in it"
+            .into(),
+    ))
+}
+
+/// Whether Firefox gives its first window an id within a few seconds of
+/// starting.
+async fn names_its_windows(conn: &Connection) -> Result<bool> {
+    let gives_up = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tree = conn
+            .call("", "browsingContext.getTree", json!({"maxDepth": 0}))
+            .await?;
+        let named = tree["contexts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["context"].as_str().is_some_and(|id| !id.is_empty()));
+        if named || Instant::now() >= gives_up {
+            return Ok(named);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Ends a Firefox started here before any browser took it over.
+fn end(started: Started) {
+    let Started {
+        conn,
+        mut process,
+        temp,
+        ..
+    } = started;
+    conn.shut();
+    let _ = process.child.kill();
+    let _ = process.child.wait();
+    process.lifeline.process_gone();
+    // The temporary profile goes only once Firefox has let go of it.
+    drop(temp);
+}
+
+async fn start_once(options: &LaunchOptions) -> Result<Started> {
     let executable = match &options.executable {
         Some(path) => path.clone(),
         None => find_firefox()?,

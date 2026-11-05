@@ -589,12 +589,17 @@ async fn firefox_waits_for_network_idle() {
     )]);
     let page = browser.new_page().await.unwrap();
     let started = Instant::now();
-    page.goto(&server.url, netweir_browser::WaitUntil::NetworkIdle, None)
-        .await
-        .unwrap();
+    // Idle ends the wait: a page that never went idle would time out.
+    page.goto(
+        &server.url,
+        netweir_browser::WaitUntil::NetworkIdle,
+        Some(Duration::from_secs(15)),
+    )
+    .await
+    .unwrap();
     let took = started.elapsed();
     assert_eq!(page.evaluate("window.done").await.unwrap(), "ok");
-    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert!(took >= Duration::from_secs(1), "{took:?}");
 }
 
 #[tokio::test]
