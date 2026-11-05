@@ -649,15 +649,20 @@ async fn back_and_forward_return_each_documents_response_and_none_at_the_ends() 
     assert_eq!((r.url.as_str(), r.status), (one.as_str(), 200));
     assert_eq!(page.url(), one);
     assert_eq!(page.title().await.unwrap(), "one");
-    // A new page's history starts at the blank page it opened on.
-    let r = page.go_back(WaitUntil::Load, None).await.unwrap().unwrap();
-    assert_eq!((r.url.as_str(), r.status), ("about:blank", 0));
-    assert!(
-        page.go_back(WaitUntil::Load, None).await.unwrap().is_none(),
-        "the blank page has nothing before it"
-    );
-    assert_eq!(page.url(), "about:blank");
-    page.go_forward(WaitUntil::Load, None).await.unwrap();
+    // A new Chrome page's history starts at the blank page it opened on;
+    // Firefox's replaces that page with the first it loads.
+    if common::engine() == netweir_browser::Engine::Chrome {
+        let r = page.go_back(WaitUntil::Load, None).await.unwrap().unwrap();
+        assert_eq!((r.url.as_str(), r.status), ("about:blank", 0));
+        assert!(
+            page.go_back(WaitUntil::Load, None).await.unwrap().is_none(),
+            "the blank page has nothing before it"
+        );
+        assert_eq!(page.url(), "about:blank");
+        page.go_forward(WaitUntil::Load, None).await.unwrap();
+    } else {
+        assert!(page.go_back(WaitUntil::Load, None).await.unwrap().is_none());
+    }
     assert_eq!(page.url(), one);
 
     let r = page
@@ -793,8 +798,10 @@ fn a_dropped_server_doesnt_answer_on_a_connection_already_open() {
     // Accepted before the drop, as a connection Chrome opened ahead of need.
     let mut probe = std::net::TcpStream::connect(&addr).unwrap();
     probe.write_all(b"GET /a HTTP/1.1\r\n\r\n").unwrap();
-    let mut answer = String::new();
-    probe.read_to_string(&mut answer).unwrap();
+    let mut answer = Vec::new();
+    // Windows may reset the connection once the answer is sent: the bytes read stay.
+    let _ = probe.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer);
     assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     drop(server);
     let _ = idle.write_all(b"GET /a HTTP/1.1\r\n\r\n");

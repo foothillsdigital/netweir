@@ -475,10 +475,8 @@ async fn unported_methods_are_unsupported_and_send_nothing() {
         }) => assert!(feature.contains(what), "{feature}"),
         other => panic!("{what}: {other:?}"),
     };
-    unsupported(page.screenshot(false).await.map(drop), "screenshot");
-    unsupported(page.click("p", None).await, "click");
     unsupported(page.route().await.map(drop), "route");
-    unsupported(page.main_frame().fill("input", "x", None).await, "fill");
+    unsupported(page.block(&["image"], &[]).await, "block");
     unsupported(
         browser
             .new_page_with(netweir_browser::Environment {
@@ -488,12 +486,6 @@ async fn unported_methods_are_unsupported_and_send_nothing() {
             .await
             .map(drop),
         "environment",
-    );
-    unsupported(
-        page.goto("about:blank", netweir_browser::WaitUntil::NetworkIdle, None)
-            .await
-            .map(drop),
-        "NetworkIdle",
     );
     let context = browser.new_context().await.unwrap();
     unsupported(context.cookies().await.map(drop), "cookies");
@@ -559,4 +551,137 @@ async fn connecting_to_firefox_is_unsupported() {
         matches!(&err, Error::Unsupported { engine: "Firefox", feature } if feature == "Browser.connect"),
         "{err:?}"
     );
+}
+
+/// Answers every request after `delay`, from any origin.
+fn slow(delay: Duration) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut buf = [0; 4096];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn firefox_waits_for_network_idle() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let slow = slow(Duration::from_secs(1));
+    let page_html = format!(
+        "<script>fetch('{slow}').then(r => r.text()).then(t => {{ window.done = t }})</script>"
+    );
+    let server = common::serve(vec![(
+        "/",
+        common::html(Box::leak(page_html.into_boxed_str())),
+    )]);
+    let page = browser.new_page().await.unwrap();
+    let started = Instant::now();
+    page.goto(&server.url, netweir_browser::WaitUntil::NetworkIdle, None)
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert_eq!(page.evaluate("window.done").await.unwrap(), "ok");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+#[tokio::test]
+async fn back_forward_and_reload_on_firefox() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![
+        ("/a", common::html("<p>a</p>")),
+        ("/b", common::html("<p>b</p>")),
+    ]);
+    let (a, b) = (format!("{}/a", server.url), format!("{}/b", server.url));
+    let page = browser.new_page().await.unwrap();
+    let load = netweir_browser::WaitUntil::Load;
+    page.goto(&a, load, None).await.unwrap();
+    page.goto(&b, load, None).await.unwrap();
+    let back = page.go_back(load, None).await.unwrap().unwrap();
+    assert_eq!((back.url.as_str(), back.status), (a.as_str(), 200));
+    assert_eq!(page.url(), a);
+    let forward = page.go_forward(load, None).await.unwrap().unwrap();
+    assert_eq!(forward.url, b);
+    // A #fragment of the document showing moves within it, loading nothing.
+    let part = page
+        .goto(&format!("{b}#part"), load, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(part.url, b, "the document's own response");
+    assert_eq!(page.url(), format!("{b}#part"));
+    // Firefox asks for the site's icon now and then too.
+    let fetches = || server.paths().iter().filter(|p| *p == "/b").count();
+    let fetched = fetches();
+    let reloaded = page.reload(load, None).await.unwrap();
+    assert_eq!(reloaded.status, 200);
+    assert_eq!(fetches(), fetched + 1, "{:?}", server.paths());
+    assert!(page.go_forward(load, None).await.unwrap().is_none());
+    let within = page.go_back(load, None).await.unwrap().unwrap();
+    assert_eq!((within.url.as_str(), within.status), (b.as_str(), 0));
+    page.go_back(load, None).await.unwrap();
+    assert_eq!(page.url(), a);
+    // Firefox keeps no entry for the blank page a window opens on.
+    assert!(page.go_back(load, None).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn back_to_a_cached_page_returns() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![
+        ("/a", common::html("<p>a</p>")),
+        ("/b", common::html("<p>b</p>")),
+    ]);
+    let (a, b) = (format!("{}/a", server.url), format!("{}/b", server.url));
+    let page = browser.new_page().await.unwrap();
+    let load = netweir_browser::WaitUntil::Load;
+    page.goto(&a, load, None).await.unwrap();
+    page.evaluate("window.kept = 1").await.unwrap();
+    page.goto(&b, load, None).await.unwrap();
+    let back = page
+        .go_back(load, Some(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((back.url.as_str(), back.status), (a.as_str(), 200));
+    assert_eq!(
+        page.evaluate("window.kept").await.unwrap(),
+        1,
+        "came from the cache"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_navigation_sees_a_script_redirect() {
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let server = common::serve(vec![
+        (
+            "/",
+            common::html("<script>setTimeout(() => location = '/next', 300)</script>"),
+        ),
+        ("/next", common::html("<p>next</p>")),
+    ]);
+    let page = browser.new_page().await.unwrap();
+    let load = netweir_browser::WaitUntil::Load;
+    let first = page.goto(&server.url, load, None).await.unwrap();
+    let next = page.wait_for_navigation(&first, load, None).await.unwrap();
+    assert_eq!(next.url, format!("{}/next", server.url));
+    assert_eq!(next.status, 200);
 }

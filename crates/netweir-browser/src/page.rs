@@ -1,6 +1,6 @@
 //! A page: one target, one session, its navigation state and its actions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -370,6 +370,16 @@ pub(crate) struct State {
     listeners: Vec<tokio::sync::mpsc::UnboundedSender<PageEvent>>,
     /// Where dialogs go, while anyone answers them.
     dialogs: Option<tokio::sync::mpsc::UnboundedSender<Dialog>>,
+    /// A Firefox page's requests not yet answered, from any of its
+    /// frames: Firefox tells of no network idle, so the page works it
+    /// out, as Chrome does, from these.
+    in_flight: HashSet<String>,
+    /// Counts each change to `in_flight`, so a wait for quiet that
+    /// started before one knows it's out of date.
+    quiet: u64,
+    /// The kind of the next navigation a Firefox page starts, when
+    /// netweir asked for it (back, forward): Firefox doesn't say.
+    next_kind: Option<&'static str>,
     /// Frames Chrome runs in processes of their own (from other sites),
     /// each with a session: (session, frame id), in the order they came.
     pub(crate) children: Vec<(String, String)>,
@@ -394,6 +404,8 @@ struct Start {
     /// "differentDocument", "historySameDocument", "reload" and so on.
     kind: String,
     loader: String,
+    /// Where it's going.
+    url: String,
     /// The count of navigations when it started.
     navigations: u64,
 }
@@ -460,6 +472,7 @@ impl State {
                     number: self.started,
                     kind: str_of(p, "navigationType"),
                     loader: str_of(p, "loaderId"),
+                    url: str_of(p, "url"),
                     navigations: self.navigations,
                 });
                 if self.starts.len() > KEPT {
@@ -783,7 +796,7 @@ impl Page {
         });
         let own = session.clone();
         let handler: Handler = if browser.engine() == Engine::Firefox {
-            bidi::handler(shared.clone())
+            bidi::handler(shared.clone(), tokio::runtime::Handle::current())
         } else {
             Arc::new(move |method, params| watch.hear(&own, method, params))
         };
@@ -950,6 +963,9 @@ impl Page {
     /// nor for one Chrome has shown again by itself.
     pub(crate) async fn to_front(&self) -> Result<()> {
         let target = &self.inner.target;
+        if self.is_firefox() {
+            return bidi::to_front(self).await;
+        }
         if *self.inner.front.lock().unwrap_or_else(|e| e.into_inner()) == *target {
             return Ok(());
         }
@@ -1156,7 +1172,9 @@ impl Page {
         wait: WaitUntil,
         timeout: Option<Duration>,
     ) -> Result<Option<Response>> {
-        self.chrome_only("Page.go_back")?;
+        if self.is_firefox() {
+            return bidi::go_by(self, -1, wait, timeout).await;
+        }
         self.go_by(-1, wait, timeout).await
     }
 
@@ -1172,7 +1190,9 @@ impl Page {
         wait: WaitUntil,
         timeout: Option<Duration>,
     ) -> Result<Option<Response>> {
-        self.chrome_only("Page.go_forward")?;
+        if self.is_firefox() {
+            return bidi::go_by(self, 1, wait, timeout).await;
+        }
         self.go_by(1, wait, timeout).await
     }
 
@@ -1205,7 +1225,9 @@ impl Page {
     /// Loads the document again, as the reload button does, and waits
     /// for `wait`.
     pub async fn reload(&self, wait: WaitUntil, timeout: Option<Duration>) -> Result<Response> {
-        self.chrome_only("Page.reload")?;
+        if self.is_firefox() {
+            return bidi::reload(self, wait, timeout).await;
+        }
         let deadline = self.deadline(timeout);
         let url = self.url();
         let go = self.call("Page.reload", json!({}));
@@ -1290,6 +1312,16 @@ impl Page {
         deadline: Instant,
         url: &str,
     ) -> Result<Response> {
+        // Firefox may tell of a failure after the navigation began, and
+        // commits no page for it: that ends the wait too.
+        let event = wait.event();
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.until(
+            || format!("{event} of {url}"),
+            left,
+            |s| s.reached(loader, event) || s.unreachable.contains_key(loader),
+        )
+        .await?;
         let failed = {
             let s = self.state();
             s.unreachable.get(loader).map(|url| {
@@ -1333,7 +1365,6 @@ impl Page {
         wait: WaitUntil,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        self.chrome_only("Page.wait_for_navigation")?;
         let event = wait.event();
         let deadline = Instant::now() + self.timeout(timeout);
         // A page's script that navigates may wait on a frame, or check
@@ -1357,7 +1388,6 @@ impl Page {
         wait: WaitUntil,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        self.chrome_only("Page.wait_for_load")?;
         let event = wait.event();
         let deadline = Instant::now() + self.timeout(timeout);
         let (loader, url) = {

@@ -6,6 +6,10 @@ use std::path::PathBuf;
 /// the browser tests skip on machines without Chrome. CI sets
 /// NETWEIR_REQUIRE_CHROME to make that a failure instead.
 pub fn chrome() -> Option<PathBuf> {
+    if engine() == netweir_browser::Engine::Firefox {
+        eprintln!("skipped on Firefox: the test launches Chrome itself");
+        return None;
+    }
     match netweir_browser::find_chrome() {
         Ok(path) => Some(path),
         Err(e) if std::env::var_os("NETWEIR_REQUIRE_CHROME").is_some() => panic!("{e}"),
@@ -357,7 +361,342 @@ pub async fn launch(options: netweir_browser::LaunchOptions) -> TestBrowser {
     }
 }
 
+/// The engine the suites run on: Chrome, or Firefox when
+/// NETWEIR_TEST_ENGINE is `firefox`.
+pub fn engine() -> netweir_browser::Engine {
+    match std::env::var("NETWEIR_TEST_ENGINE").as_deref() {
+        Err(_) | Ok("chrome") => netweir_browser::Engine::Chrome,
+        Ok("firefox") => netweir_browser::Engine::Firefox,
+        Ok(other) => panic!("NETWEIR_TEST_ENGINE is {other:?}: it can be chrome or firefox"),
+    }
+}
+
+/// Tests of the Chrome suites that can't pass on Firefox yet, by name,
+/// with what they're waiting for.
+pub const FIREFOX_SKIPS: &[(&str, &str)] = &[
+    (
+        "a_blank_popup_a_script_writes_into_is_read",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_cancelled_or_broken_download_says_it_didnt_finish",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_dialog_from_a_frame_on_another_site_is_heard_and_answered",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "a_dialog_nobody_answers_is_dismissed_as_a_person_would",
+        "dialogs (phase 3, task 6)",
+    ),
+    (
+        "a_download_a_service_worker_answers_is_its_pages",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_download_from_a_frame_on_another_site_is_its_pages",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "a_download_is_saved_in_its_contexts_own_folder",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_download_nobody_holds_is_cancelled",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_failing_step_continues_stops_or_fails_as_it_says",
+        "steps (phase 3, task 8)",
+    ),
+    (
+        "a_frame_drags_within_itself_wherever_it_sits_in_the_page",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "a_frame_is_followed_when_it_moves_to_another_site_and_back",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "a_guard_sees_every_hop_and_can_stop_one_before_it_is_fetched",
+        "network control (phase 4)",
+    ),
+    (
+        "a_history_step_that_never_commits_says_so_when_time_runs_out",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_listener_answers_a_dialog_and_reads_what_it_says",
+        "dialogs (phase 3, task 6)",
+    ),
+    (
+        "a_page_saves_as_a_pdf_of_the_size_and_pages_asked_for",
+        "screenshots and PDF (phase 3, task 7)",
+    ),
+    (
+        "a_page_that_asks_before_it_unloads_is_left_and_closed",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_popup_from_a_frame_on_another_site_is_its_pages",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "a_popup_from_a_link_is_read_and_carries_its_openers_rules",
+        "network control (phase 4)",
+    ),
+    (
+        "a_popup_of_a_guarded_page_is_guarded_from_its_first_request",
+        "network control (phase 4)",
+    ),
+    (
+        "a_popup_of_a_shared_context_is_routed_by_the_context",
+        "network control (phase 4)",
+    ),
+    (
+        "a_popup_on_another_site_keeps_its_openers_route",
+        "network control (phase 4)",
+    ),
+    (
+        "a_timeout_on_the_first_trip_down_says_so",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "a_trace_records_what_the_page_did_and_can_be_taken_again",
+        "CDP-format tracing, which Firefox has none of",
+    ),
+    (
+        "an_endless_timeout_is_capped_not_a_panic",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "an_unknown_modifier_or_key_is_refused_before_anything_is_pressed",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "back_to_a_posted_form_chrome_wont_send_again_is_a_navigation_error",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "check_and_uncheck_click_only_when_the_state_differs",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "checking_waits_for_the_box_and_says_to_use_its_label",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "choosing_on_an_opener_behind_its_popup_brings_it_back_first",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "click_waits_until_the_element_can_be_clicked",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "control_or_meta_a_selects_the_field_on_each_system_and_backspace_empties_it",
+        "environments (phase 4)",
+    ),
+    (
+        "double_clicks_xpath_and_two_waits_for_one_url",
+        "steps (phase 3, task 8)",
+    ),
+    (
+        "drag_drops_an_item_by_html5_drag_and_drop",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "drag_moves_a_handle_that_follows_the_mouse",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "drag_to_a_target_out_of_view_with_the_source_says_so_and_presses_nothing",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "fill_refuses_a_select",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "fill_replaces_the_text_and_press_sends_keys",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "frames_from_this_site_and_others_can_be_read_and_acted_on",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "hover_brings_the_mouse_over_the_element",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "hover_reaches_a_disabled_control_that_needs_no_scrolling",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "hover_returns_once_the_page_has_seen_the_mouse_arrive",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "hover_sends_mouseover_even_with_the_mouse_already_on_the_spot",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "into_view_moves_the_page_when_the_box_holding_it_runs_out",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "modifiers_alone_are_pressed_and_released",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "modifiers_go_down_in_order_and_up_in_reverse_and_the_page_sees_them",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "pages_keep_their_cookies_to_their_own_context",
+        "network control (phase 4)",
+    ),
+    (
+        "screenshots_are_png",
+        "screenshots and PDF (phase 3, task 7)",
+    ),
+    (
+        "scroll_brings_elements_into_view_and_moves_by_a_distance",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "scrolling_stops_after_as_many_times_as_asked",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "scrolling_to_the_bottom_gets_past_a_box_in_the_middle_of_the_page",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "scrolling_to_the_bottom_gets_past_a_box_that_keeps_its_scroll_to_itself",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "scrolling_to_the_bottom_gets_past_a_tall_frame_that_scrolls_itself",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "scrolling_to_the_bottom_loads_an_endless_list_until_it_ends",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "scrolling_to_the_bottom_turns_whole_notches_as_a_mouse_wheel_does",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "select_option_chooses_by_value_label_or_index_and_tells_the_page",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "set_input_files_gives_a_file_input_its_files",
+        "uploads (phase 3, task 5)",
+    ),
+    (
+        "shift_tab_moves_focus_backwards",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "shift_with_a_digit_or_symbol_presses_the_character_above_it",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "steps_answer_dialogs_act_in_frames_and_run_calls",
+        "steps (phase 3, task 8)",
+    ),
+    (
+        "steps_click_type_and_wait_with_the_page_own_actions",
+        "steps (phase 3, task 8)",
+    ),
+    (
+        "text_and_role_selectors_find_an_element_by_what_it_says",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "the_last_pixels_the_wheel_wont_take_are_scrolled_all_the_same",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "the_steps_stop_at_their_cap_whatever_their_on_error",
+        "steps (phase 3, task 8)",
+    ),
+    (
+        "the_wheel_turns_a_notch_at_a_time",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "timeout_bounds_the_whole_scroll_to_the_bottom",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "typing_clicks_holds_keys_and_uses_shift_as_a_person_does",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "typing_gets_past_a_floating_label_and_a_field_that_swallows_select_all",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "typing_waits_out_an_overlay_and_replaces_every_kind_of_field",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "undo_and_redo_take_back_typing_on_each_system",
+        "environments (phase 4)",
+    ),
+    (
+        "wait_for_follows_the_element_through_its_states",
+        "frames (phase 3, task 3)",
+    ),
+    (
+        "waiting_on_an_opener_behind_its_popup_brings_it_back_first",
+        "the mouse and keyboard (phase 3, task 4)",
+    ),
+    (
+        "word_and_line_shortcuts_edit_the_field_as_each_system_does",
+        "environments (phase 4)",
+    ),
+];
+
+/// Why the running test can't pass on Firefox yet, if it can't. libtest
+/// names each test's thread after the test.
+fn firefox_skip() -> Option<&'static str> {
+    let thread = std::thread::current();
+    let name = thread.name()?;
+    FIREFOX_SKIPS
+        .iter()
+        .find(|(test, _)| *test == name)
+        .map(|(_, why)| *why)
+}
+
 pub async fn browser() -> Option<TestBrowser> {
+    if engine() == netweir_browser::Engine::Firefox {
+        if let Some(why) = firefox_skip() {
+            eprintln!("skipped on Firefox: {why}");
+            return None;
+        }
+        // As Chrome's below, rather than launch_firefox's longer timeout,
+        // which is for launching alone: tests rely on the browser's.
+        let turn = turn();
+        let browser = netweir_browser::Browser::launch(netweir_browser::LaunchOptions {
+            engine: netweir_browser::Engine::Firefox,
+            executable: Some(firefox()?),
+            timeout: std::time::Duration::from_secs(30),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        return Some(TestBrowser {
+            browser,
+            _turn: turn,
+        });
+    }
     let executable = chrome()?;
     Some(
         launch(netweir_browser::LaunchOptions {

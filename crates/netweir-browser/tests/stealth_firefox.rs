@@ -247,9 +247,10 @@ async fn a_headed_netweir_firefox_looks_like_one_nobody_drives() {
 /// Every BiDi method Netweir sends, each one a page can't see: making and
 /// closing contexts and windows, reading the browser's windows and
 /// frames, putting a new window where the first one is before anything
-/// loads in it, navigating as a person would, and script in a page's own
-/// world (evaluate, what the caller asked for) or netweir's sandbox. A
-/// method added here needs that said of it.
+/// loads in it, navigating as a person would (to a URL, back, forward,
+/// reload), and script in a page's own world (evaluate, what the caller
+/// asked for) or netweir's sandbox, including the one there in each
+/// document that only listens. A method added here needs that said of it.
 #[tokio::test]
 async fn netweir_sends_firefox_only_these_methods() {
     let Some(executable) = common::firefox() else {
@@ -261,6 +262,11 @@ async fn netweir_sends_firefox_only_these_methods() {
     page.goto(&format!("{}/", server.url), WaitUntil::Load, None)
         .await
         .unwrap();
+    page.goto(&format!("{}/#part", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    page.go_back(WaitUntil::Load, None).await.unwrap();
+    page.reload(WaitUntil::NetworkIdle, None).await.unwrap();
     page.evaluate("1").await.unwrap();
     page.content().await.unwrap();
     page.title().await.unwrap();
@@ -277,6 +283,9 @@ async fn netweir_sends_firefox_only_these_methods() {
         "browsingContext.close",
         "browsingContext.create",
         "browsingContext.navigate",
+        "browsingContext.reload",
+        "browsingContext.traverseHistory",
+        "script.addPreloadScript",
         "script.callFunction",
         "session.new",
         "session.subscribe",
