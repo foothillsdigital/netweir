@@ -37,6 +37,7 @@ const EVENTS: &[&str] = &[
     "network.fetchError",
     "script.message",
     "browsingContext.userPromptOpened",
+    "browsingContext.userPromptClosed",
 ];
 
 /// The channel [`WATCH`] tells netweir on.
@@ -331,12 +332,16 @@ pub(super) fn handler(
                     &conn, params, url, timeout, pause, &runtime,
                 );
                 state.prompts += 1;
+                state.open_prompts += 1;
                 // Nobody listening drops it, which answers it.
                 if let Some(to) = &state.dialogs
                     && to.send(dialog).is_err()
                 {
                     state.dialogs = None;
                 }
+            }
+            "browsingContext.userPromptClosed" => {
+                state.open_prompts = state.open_prompts.saturating_sub(1);
             }
             "script.message" if params["channel"] == CHANNEL => {
                 if params["source"]["context"] != state.frame.as_str() {
@@ -725,6 +730,25 @@ pub(super) async fn to_front(page: &Page) -> Result<()> {
     .await?;
     tokio::time::sleep(crate::events::pause(page.inner.browser.pause)).await;
     Ok(())
+}
+
+/// Waits until none of the page's dialogs is open. Chrome runs nothing in
+/// a page's own world while it has one open, and Firefox would: a script
+/// would see the page from before its dialog was answered.
+pub(crate) async fn no_dialog_open(page: &Page) -> Result<()> {
+    loop {
+        let changed = page.inner.shared.changed.notified();
+        {
+            let s = page.state();
+            if s.open_prompts == 0 {
+                return Ok(());
+            }
+            if s.gone || page.inner.closed.load(Ordering::Relaxed) {
+                return Err(Error::PageClosed);
+            }
+        }
+        changed.await;
+    }
 }
 
 /// Runs `body` (a function body; `await` allowed) as an async function in

@@ -379,8 +379,10 @@ pub(crate) struct State {
     /// Where each of a Firefox page's other frames is, by context: what a
     /// dialog one of them opens says it came from.
     frame_urls: HashMap<String, String>,
-    /// How many dialogs a Firefox page has opened.
+    /// How many dialogs a Firefox page has opened, and how many of them
+    /// are open now.
     prompts: u64,
+    open_prompts: u64,
     /// Frames Chrome runs in processes of their own (from other sites),
     /// each with a session: (session, frame id), in the order they came.
     pub(crate) children: Vec<(String, String)>,

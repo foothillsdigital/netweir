@@ -278,6 +278,7 @@ impl Frame {
         let body =
             format!("const v = ({js}\n); return typeof v === 'function' ? await v() : await v;");
         if self.page.is_firefox() {
+            crate::page::bidi::no_dialog_open(&self.page).await?;
             let r = crate::page::bidi::remote(&self.page, &self.id, &body, false, false)
                 .await
                 .map_err(|e| self.gone_if_lost(e))?;

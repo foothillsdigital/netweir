@@ -883,3 +883,20 @@ async fn firefox_full_page_screenshot_is_the_page_s_size() {
     let jpeg = page.capture(false, Some(50)).await.unwrap();
     assert_eq!(&jpeg[..2], [0xFF, 0xD8], "a JPEG");
 }
+
+#[tokio::test]
+async fn a_firefox_step_waiting_for_a_response_says_it_cant() {
+    use netweir_browser::steps::{self, Call};
+    let Some(browser) = firefox_browser().await else {
+        return;
+    };
+    let page = browser.new_page().await.unwrap();
+    let list = steps::parse(&serde_json::json!([
+        {"action": "wait_for_response", "url": "**/api"},
+    ]))
+    .unwrap();
+    let no_calls: Box<Call> = Box::new(|_, _, _| Box::pin(async { Ok(serde_json::Value::Null) }));
+    let report = steps::run(&page, &list, &*no_calls, None).await;
+    let failure = report.failure().unwrap_or_default();
+    assert!(failure.contains("isn't available on Firefox"), "{failure}");
+}
