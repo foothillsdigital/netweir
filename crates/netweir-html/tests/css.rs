@@ -249,6 +249,8 @@ fn selectors_read_as_css_reads_them() {
     assert_eq!(page("li/**/ .price"), ["span"]);
     assert_eq!(page("ul/**/>/**/li").len(), 4);
     assert!(SelectorList::parse("*/**/").is_ok());
+    // Two type selectors in one compound, not a descendant selector.
+    assert!(SelectorList::parse("a/**/b").is_err());
 
     // An+B has no whitespace inside a term, only around the sign before B.
     for bad in [
