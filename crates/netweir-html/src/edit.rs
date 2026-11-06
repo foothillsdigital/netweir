@@ -282,11 +282,13 @@ impl Document {
     }
 
     /// Whether `a`, on an element in `ns`, is the attribute code calls
-    /// `given`, stored as `stored`: by the name as stored, or on a foreign
+    /// `given`, stored as `stored`: by the name as stored when it has no
+    /// namespace (a namespaced one stores its local name), or on a foreign
     /// element by the name as written, so viewBox finds a parsed viewBox
     /// and no two attributes are ever written alike.
     fn is_attr(&self, ns: Ns, a: &Attr, stored: &str, given: &str) -> bool {
-        self.str(a.name) == stored || (ns != Ns::Html && self.written_name(ns, a) == given)
+        (a.ns == AttrNs::None && self.str(a.name) == stored)
+            || (ns != Ns::Html && self.written_name(ns, a) == given)
     }
 
     /// Changes an element's attributes through a copy at the end of the
@@ -368,6 +370,20 @@ mod tests {
         let used = doc.children(svg).next().unwrap();
         doc.set_attr(used, "xlink:href", "#b");
         assert_eq!(doc.outer_html(used), "<use xlink:href=\"#b\"></use>");
+        let attrs: Vec<_> = doc.attrs(used).collect();
+        assert_eq!(attrs, [(crate::AttrNs::XLink, "href", "#b")]);
+        // A plain href is another attribute: its qualified name isn't xlink:href.
+        assert!(!doc.remove_attr(used, "href"));
+        doc.set_attr(used, "href", "#c");
+        let attrs: Vec<_> = doc.attrs(used).collect();
+        assert_eq!(
+            attrs,
+            [
+                (crate::AttrNs::XLink, "href", "#b"),
+                (crate::AttrNs::None, "href", "#c")
+            ]
+        );
+        assert!(doc.remove_attr(used, "href"));
         let attrs: Vec<_> = doc.attrs(used).collect();
         assert_eq!(attrs, [(crate::AttrNs::XLink, "href", "#b")]);
     }
