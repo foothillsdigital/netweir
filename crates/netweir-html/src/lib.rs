@@ -12,7 +12,7 @@ mod tree;
 
 pub use dom::{AttrNs, Document, Kind, MAX_INPUT, NodeId, Ns, Quirks};
 pub use edit::EditError;
-pub use tree::{Options, ParseError, parse, parse_fragment, parse_with};
+pub use tree::{Options, ParseError, parse, parse_fragment, parse_fragment_with, parse_with};
 
 /// The character(s) HTML's named reference `name` stands for, without the
 /// `&` and with or without the `;` as the table has it: `nbsp;` gives

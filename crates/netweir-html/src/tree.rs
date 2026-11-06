@@ -2879,7 +2879,9 @@ pub struct Options {
     pub scripting: bool,
     /// Give up after this long. Some inputs are slow by design (the spec
     /// makes deeply misnested markup cost more), so a crawler parsing
-    /// pages it doesn't control should set one.
+    /// pages it doesn't control should set one. The clock is read every
+    /// 4,096 tokenizer steps, so a small input finishes even with
+    /// `Duration::ZERO`: the budget bounds slow parses, not fast ones.
     pub budget: Option<std::time::Duration>,
 }
 
@@ -2940,15 +2942,27 @@ pub fn parse_with(html: &str, options: Options) -> Result<Document, ParseError> 
 /// # Panics
 /// As [`parse`].
 pub fn parse_fragment(html: &str, ns: Ns, context: &str, scripting: bool) -> Document {
-    run(
+    parse_fragment_with(
         html,
+        ns,
+        context,
         Options {
             scripting,
             budget: None,
         },
-        Some((ns, context)),
     )
     .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Parses `html` as [`parse_fragment`] does, within a size limit and an
+/// optional budget, as [`parse_with`] does for a whole document.
+pub fn parse_fragment_with(
+    html: &str,
+    ns: Ns,
+    context: &str,
+    options: Options,
+) -> Result<Document, ParseError> {
+    run(html, options, Some((ns, context)))
 }
 
 fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Document, ParseError> {
@@ -3020,6 +3034,26 @@ mod tests {
         };
         assert!(parse_with(&html, roomy).is_ok());
     }
+    #[test]
+    fn a_fragment_has_a_budget_and_a_size_limit_too() {
+        let html = "<div><b>x</b> y</div>".repeat(200_000);
+        let tight = Options {
+            budget: Some(Duration::from_micros(50)),
+            ..Options::default()
+        };
+        match parse_fragment_with(&html, Ns::Html, "div", tight) {
+            Err(ParseError::Timeout { parsed, .. }) => assert!(parsed < html.len()),
+            other => panic!("expected a timeout, got {:?}", other.map(|d| d.len())),
+        }
+        let doc = parse_fragment_with("<b>x</b>", Ns::Html, "div", Options::default()).unwrap();
+        assert_eq!(doc.inner_html(doc.root()), "<b>x</b>");
+        let huge = "x".repeat(crate::MAX_INPUT + 1);
+        assert_eq!(
+            parse_fragment_with(&huge, Ns::Html, "div", Options::default()).map(|d| d.len()),
+            Err(ParseError::TooLarge { len: huge.len() })
+        );
+    }
+
     #[test]
     fn a_budget_too_big_for_the_clock_is_no_limit() {
         let endless = Options {
