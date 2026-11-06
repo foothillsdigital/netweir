@@ -134,23 +134,37 @@ impl Document {
     }
 
     /// Sets an attribute, replacing one of the same name. HTML elements'
-    /// attribute names are lowercased, as `setAttribute` does.
+    /// attribute names are lowercased, as `setAttribute` does; SVG's and
+    /// MathML's keep the case they're given.
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
         let Some(e) = self.element(id) else { return };
-        // As the parser stores them: lowercase outside XML, with SVG's
-        // and MathML's case put back when written.
-        let name = if e.ns == Ns::Xml {
-            name.to_string()
+        let ns = e.ns;
+        let given = name;
+        // Stored as the parser stores them: an HTML name lowercased, and a
+        // foreign name whose case the writer puts back (viewBox,
+        // definitionURL) lowercased too. Any other foreign name, and an XML
+        // one, as given.
+        let lower = given.to_ascii_lowercase();
+        let restored = match ns {
+            Ns::Svg => crate::tree::svg_attr_name(&lower) == Some(given),
+            Ns::MathMl => lower == "definitionurl" && given == "definitionURL",
+            _ => false,
+        };
+        let name = if ns == Ns::Html || restored {
+            lower
         } else {
-            name.to_ascii_lowercase()
+            given.to_string()
         };
         let value = self.push_stable(value);
         let name_span = self.push_stable(&name);
         self.rewrite_attrs(id, |doc, attrs| {
-            match attrs
-                .iter_mut()
-                .find(|a| a.ns == AttrNs::None && doc.str(a.name) == name)
-            {
+            // By the name as written, so viewBox finds a parsed viewBox, or
+            // as stored, so no two attributes are ever written alike.
+            match attrs.iter_mut().find(|a| {
+                a.ns == AttrNs::None
+                    && (doc.str(a.name) == name
+                        || (ns != Ns::Html && doc.written_name(ns, a) == given))
+            }) {
                 Some(a) => a.value = value,
                 None => attrs.push(Attr {
                     ns: AttrNs::None,
@@ -336,6 +350,44 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn set_attr_keeps_the_case_of_foreign_names() {
+        let mut doc = parse_fragment(
+            "<svg viewBox=\"0 0 1 1\"></svg><math definitionURL=\"a\"></math><p></p>",
+            Ns::Html,
+            "div",
+            false,
+        );
+        let kids: Vec<_> = doc.children(doc.root()).collect();
+        let (svg, math, p) = (kids[0], kids[1], kids[2]);
+        doc.set_attr(svg, "dataFoo", "x");
+        doc.set_attr(svg, "viewBox", "0 0 2 2");
+        doc.set_attr(math, "mathVariant", "bold");
+        doc.set_attr(math, "definitionURL", "b");
+        doc.set_attr(p, "DATA-X", "y");
+        assert_eq!(
+            doc.outer_html(svg),
+            "<svg viewBox=\"0 0 2 2\" dataFoo=\"x\"></svg>"
+        );
+        assert_eq!(
+            doc.outer_html(math),
+            "<math definitionURL=\"b\" mathVariant=\"bold\"></math>"
+        );
+        assert_eq!(doc.outer_html(p), "<p data-x=\"y\"></p>");
+        // A lowercase viewbox finds the same attribute: never two written alike.
+        doc.set_attr(svg, "viewbox", "0 0 3 3");
+        assert_eq!(
+            doc.outer_html(svg),
+            "<svg viewBox=\"0 0 3 3\" dataFoo=\"x\"></svg>"
+        );
+        // And it's set again, not added, when the case matches what was given.
+        doc.set_attr(svg, "dataFoo", "z");
+        assert_eq!(
+            doc.outer_html(svg),
+            "<svg viewBox=\"0 0 3 3\" dataFoo=\"z\"></svg>"
+        );
     }
 
     #[test]
