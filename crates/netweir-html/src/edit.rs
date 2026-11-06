@@ -233,6 +233,15 @@ impl Document {
             Ns::Xml => (Tag::Other, Name::Span(self.push_stable(name))),
             _ => {
                 let tag = Tag::from_name(&lower);
+                // SVG's mixed-case names, written as the spec writes them, are
+                // stored as the parser stores them, so lower_name and the
+                // markup agree with a parsed element's.
+                if ns == Ns::Svg
+                    && let Some(i) = crate::tree::svg_tag_name(&lower)
+                    && crate::tree::SVG_TAG_NAMES[i as usize].1 == name
+                {
+                    return (tag, Name::Svg(i));
+                }
                 let name = if tag != Tag::Other && tag.name() == name {
                     Name::Tag
                 } else {
@@ -336,6 +345,24 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn a_created_svg_element_is_named_as_a_parsed_one() {
+        let parsed = parse_fragment("<svg><linearGradient/></svg>", Ns::Html, "div", false);
+        let svg = parsed.children(parsed.root()).next().unwrap();
+        let parsed_gradient = parsed.children(svg).next().unwrap();
+        let mut doc = parse_fragment("", Ns::Html, "div", false);
+        let made = doc.create_element(Ns::Svg, "linearGradient");
+        assert_eq!(doc.lower_name(made), Some("lineargradient"));
+        assert_eq!(doc.lower_name(made), parsed.lower_name(parsed_gradient));
+        assert_eq!(doc.outer_html(made), parsed.outer_html(parsed_gradient));
+        // Another case is another element, kept as written.
+        let shouting = doc.create_element(Ns::Svg, "LINEARGRADIENT");
+        assert_eq!(
+            doc.outer_html(shouting),
+            "<LINEARGRADIENT></LINEARGRADIENT>"
+        );
     }
 
     #[test]

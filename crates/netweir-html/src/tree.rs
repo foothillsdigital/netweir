@@ -345,7 +345,7 @@ pub(crate) static SVG_TAG_NAMES: [(&str, &str); 37] = [
     ("textpath", "textPath"),
 ];
 
-fn svg_tag_name(name: &str) -> Option<u8> {
+pub(crate) fn svg_tag_name(name: &str) -> Option<u8> {
     SVG_TAG_NAMES
         .iter()
         .position(|(lower, _)| *lower == name)

@@ -467,8 +467,10 @@ impl Document {
     }
 
     /// An element's name lowercased, without allocating: SVG's
-    /// `foreignObject` gives `foreignobject`. An XML element's name as
-    /// written.
+    /// `foreignObject` gives `foreignobject`, whether it was parsed or made
+    /// with [`Document::create_element`]. An XML element's name as written,
+    /// and so is a foreign element made under a name in another case
+    /// (`LINEARGRADIENT`), which the DOM treats as a different element.
     pub fn lower_name(&self, id: NodeId) -> Option<&str> {
         let e = self.element(id)?;
         Some(match e.name {
@@ -478,8 +480,10 @@ impl Document {
         })
     }
 
-    /// The parser's number for an HTML element's tag, the same for every
-    /// element of that name: what [`crate::tag_number`] gives for it.
+    /// The parser's number for an element's tag, from its lowercase name:
+    /// what [`crate::tag_number`] gives for that name. HTML, SVG and MathML
+    /// elements alike get one, so an SVG `<title>` shares HTML `title`'s;
+    /// an XML element never does.
     pub fn known_tag(&self, id: NodeId) -> Option<u8> {
         self.element(id)
             .filter(|e| e.tag != Tag::Other && e.ns != Ns::Xml)
