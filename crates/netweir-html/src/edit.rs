@@ -140,31 +140,16 @@ impl Document {
         let Some(e) = self.element(id) else { return };
         let ns = e.ns;
         let given = name;
-        // Stored as the parser stores them: an HTML name lowercased, and a
-        // foreign name whose case the writer puts back (viewBox,
-        // definitionURL) lowercased too. Any other foreign name, and an XML
-        // one, as given.
-        let lower = given.to_ascii_lowercase();
-        let restored = match ns {
-            Ns::Svg => crate::tree::svg_attr_name(&lower) == Some(given),
-            Ns::MathMl => lower == "definitionurl" && given == "definitionURL",
-            _ => false,
-        };
-        let name = if ns == Ns::Html || restored {
-            lower
-        } else {
-            given.to_string()
-        };
+        let name = stored_attr_name(ns, given);
         let value = self.push_stable(value);
         let name_span = self.push_stable(&name);
         self.rewrite_attrs(id, |doc, attrs| {
             // By the name as written, so viewBox finds a parsed viewBox, or
             // as stored, so no two attributes are ever written alike.
-            match attrs.iter_mut().find(|a| {
-                a.ns == AttrNs::None
-                    && (doc.str(a.name) == name
-                        || (ns != Ns::Html && doc.written_name(ns, a) == given))
-            }) {
+            match attrs
+                .iter_mut()
+                .find(|a| a.ns == AttrNs::None && doc.is_attr(ns, a, &name, given))
+            {
                 Some(a) => a.value = value,
                 None => attrs.push(Attr {
                     ns: AttrNs::None,
@@ -287,18 +272,21 @@ impl Document {
         let Some(e) = self.element(id) else {
             return false;
         };
-        // As the parser stores them: lowercase outside XML, with SVG's
-        // and MathML's case put back when written.
-        let name = if e.ns == Ns::Xml {
-            name.to_string()
-        } else {
-            name.to_ascii_lowercase()
-        };
+        let (ns, given) = (e.ns, name);
+        let name = stored_attr_name(ns, given);
         self.rewrite_attrs(id, |doc, attrs| {
             let before = attrs.len();
-            attrs.retain(|a| doc.str(a.name) != name);
+            attrs.retain(|a| !doc.is_attr(ns, a, &name, given));
             attrs.len() != before
         })
+    }
+
+    /// Whether `a`, on an element in `ns`, is the attribute code calls
+    /// `given`, stored as `stored`: by the name as stored, or on a foreign
+    /// element by the name as written, so viewBox finds a parsed viewBox
+    /// and no two attributes are ever written alike.
+    fn is_attr(&self, ns: Ns, a: &Attr, stored: &str, given: &str) -> bool {
+        self.str(a.name) == stored || (ns != Ns::Html && self.written_name(ns, a) == given)
     }
 
     /// Changes an element's attributes through a copy at the end of the
@@ -324,6 +312,22 @@ impl Document {
         }
         true
     }
+}
+
+/// An attribute name set from code, as the parser would store it: on an
+/// HTML element lowercased, as `setAttribute` does. On SVG and MathML a
+/// name whose case the writer puts back (viewBox, definitionURL) is
+/// lowercased too, and any other keeps the case it's given, as does an XML
+/// one.
+fn stored_attr_name(ns: Ns, given: &str) -> String {
+    let lower = given.to_ascii_lowercase();
+    let restored = match ns {
+        Ns::Html => true,
+        Ns::Svg => crate::tree::svg_attr_name(&lower) == Some(given),
+        Ns::MathMl => lower == "definitionurl" && given == "definitionURL",
+        Ns::Xml => false,
+    };
+    if restored { lower } else { given.to_string() }
 }
 
 #[cfg(test)]
@@ -388,6 +392,13 @@ mod tests {
             doc.outer_html(svg),
             "<svg viewBox=\"0 0 3 3\" dataFoo=\"z\"></svg>"
         );
+        // What set_attr sets, remove_attr finds by the same name.
+        assert!(doc.remove_attr(svg, "dataFoo"));
+        assert!(doc.remove_attr(svg, "viewBox"));
+        assert!(doc.remove_attr(math, "mathVariant"));
+        assert!(!doc.remove_attr(svg, "dataFoo"));
+        assert_eq!(doc.outer_html(svg), "<svg></svg>");
+        assert_eq!(doc.outer_html(math), "<math definitionURL=\"b\"></math>");
     }
 
     #[test]
