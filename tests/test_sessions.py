@@ -142,6 +142,22 @@ async def test_a_cookie_chrome_would_refuse_is_refused_and_a_saved_state_loads_t
         assert client.cookies.all() == []
         with pytest.raises(ValueError, match="'='"):
             client.cookies.set("", "a=b", domain="127.0.0.1")
+        # Each refusal names the cookie, or the type that wasn't a cookie.
+        sid = {"name": "sid", "value": "s3cret"}
+        with pytest.raises(ValueError, match='^the cookie "sid" needs a "domain"$') as raised:
+            client.cookies.add([good, sid])
+        assert "s3cret" not in str(raised.value)
+        with pytest.raises(ValueError, match='^a cookie needs a "name"$'):
+            client.cookies.add([{"value": "1", "domain": "127.0.0.1"}])
+        with pytest.raises(
+            ValueError,
+            match="""^the cookie "sid": expires is seconds since the epoch, not 'tomorrow'$""",
+        ):
+            client.cookies.add([{**sid, "domain": "127.0.0.1", "expires": "tomorrow"}])
+        with pytest.raises(TypeError, match="^each cookie must be a dict, not str$") as raised:
+            client.cookies.add(["sid=s3cret"])
+        assert "s3cret" not in str(raised.value)
+        assert client.cookies.all() == []
     state = {"cookies": [good, bad, {**good, "name": "tab", "value": "a\tb"}], "origins": []}
     async with netweir.Client(storage_state=state) as client:
         assert [c["name"] for c in client.cookies.all()] == ["ok"]
