@@ -212,6 +212,7 @@ impl Document {
         let options = html::Options {
             scripting: false,
             budget: (budget != Duration::MAX).then_some(budget),
+            ..html::Options::default()
         };
         let mut tree = match html::parse_with(html, options) {
             Ok(tree) => tree,
