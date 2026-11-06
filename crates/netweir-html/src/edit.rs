@@ -15,6 +15,9 @@ pub enum EditError {
     NotAParent,
     /// `before` isn't a child of the parent.
     NotAChild,
+    /// The node is a document or a fragment, such as the root or a
+    /// template's contents, which is never anyone's child.
+    NotInsertable,
 }
 
 impl std::fmt::Display for EditError {
@@ -23,6 +26,9 @@ impl std::fmt::Display for EditError {
             EditError::Cycle => "a node can't be inserted into itself or its descendants",
             EditError::NotAParent => "only an element, a document or a fragment can have children",
             EditError::NotAChild => "the node to insert before isn't a child of the parent",
+            EditError::NotInsertable => {
+                "a document or a fragment can't be inserted, only its children"
+            }
         })
     }
 }
@@ -88,6 +94,14 @@ impl Document {
             Data::Element(_) | Data::Document | Data::Fragment
         ) {
             return Err(EditError::NotAParent);
+        }
+        // As the DOM's pre-insertion check: the root, or a template's
+        // contents, would otherwise end up under a detached element.
+        if matches!(
+            self.nodes[child as usize].data,
+            Data::Document | Data::Fragment
+        ) {
+            return Err(EditError::NotInsertable);
         }
         if let Some(b) = before
             && self.parent(b) != Some(parent)
@@ -315,7 +329,7 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::EditError;
-    use crate::{Ns, parse_fragment};
+    use crate::{NodeId, Ns, parse, parse_fragment};
 
     #[test]
     fn nodes_can_be_made_moved_and_removed() {
@@ -336,6 +350,29 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn a_document_or_fragment_is_never_inserted() {
+        let mut doc = parse("<template><b>x</b></template><p>y</p>", false);
+        let root = doc.root();
+        let contents = (0..doc.len() as NodeId)
+            .find_map(|n| doc.template_contents(n))
+            .unwrap();
+        let loose = doc.create_element(Ns::Html, "div");
+        let before = doc.inner_html(root);
+        assert_eq!(doc.append(loose, root), Err(EditError::NotInsertable));
+        assert_eq!(doc.append(loose, contents), Err(EditError::NotInsertable));
+        assert_eq!(
+            doc.insert_before(loose, root, None),
+            Err(EditError::NotInsertable)
+        );
+        assert_eq!(doc.inner_html(root), before);
+        assert_eq!(doc.inner_html(loose), "");
+        // Their children still go anywhere.
+        let b = doc.first_child(contents).unwrap();
+        assert_eq!(doc.append(loose, b), Ok(()));
+        assert_eq!(doc.inner_html(loose), "<b>x</b>");
     }
 
     #[test]
