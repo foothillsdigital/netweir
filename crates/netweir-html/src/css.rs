@@ -130,6 +130,8 @@ enum Pseudo {
     ReadWrite,
     ReadOnly,
     PlaceholderShown,
+    Default,
+    Indeterminate,
     /// A state no static page is in: `:hover`, `:focus`, `:visited`...
     Never,
 }
@@ -581,6 +583,8 @@ impl<'a> Parser<'a> {
             "read-write" => Pseudo::ReadWrite,
             "read-only" => Pseudo::ReadOnly,
             "placeholder-shown" => Pseudo::PlaceholderShown,
+            "default" => Pseudo::Default,
+            "indeterminate" => Pseudo::Indeterminate,
             "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
             | "target" | "target-within" | "local-link" | "user-invalid" | "user-valid" => {
                 Pseudo::Never
@@ -1002,6 +1006,110 @@ impl Cx<'_> {
         }
     }
 
+    /// Whether `el` is an `<input>` whose type, in any case, is one of `types`.
+    fn input_type(&self, el: NodeId, types: &[&str]) -> bool {
+        self.attr(el, "type")
+            .is_some_and(|t| types.iter().any(|w| t.eq_ignore_ascii_case(w)))
+    }
+
+    fn html_tag(&self, n: NodeId, tag: Tag) -> bool {
+        self.doc
+            .element(n)
+            .is_some_and(|e| e.ns == Ns::Html && e.tag == tag)
+    }
+
+    fn html_named(&self, n: NodeId, name: &str) -> bool {
+        self.doc.element(n).is_some_and(|e| e.ns == Ns::Html)
+            && self.doc.lower_name(n) == Some(name)
+    }
+
+    /// `el`'s tree in tree order, from its root.
+    // shortcut: walked afresh for each control matched, so :default or
+    // :indeterminate over a page of n radio buttons is O(n^2); keep a
+    // per-select index of forms and radio groups if pages ever have
+    // thousands.
+    fn tree_of(&self, el: NodeId) -> Vec<NodeId> {
+        let mut root = el;
+        while let Some(p) = self.doc.parent(root) {
+            root = p;
+        }
+        let (mut out, mut stack) = (Vec::new(), vec![root]);
+        while let Some(n) = stack.pop() {
+            out.push(n);
+            let at = stack.len();
+            stack.extend(self.doc.children(n));
+            stack[at..].reverse();
+        }
+        out
+    }
+
+    /// The form a control belongs to: the one its `form` attribute names,
+    /// or with no such attribute the nearest form around it.
+    fn form_owner(&self, el: NodeId) -> Option<NodeId> {
+        if let Some(id) = self.attr(el, "form") {
+            return self
+                .tree_of(el)
+                .into_iter()
+                .find(|&n| self.doc.element(n).is_some() && self.attr(n, "id") == Some(id))
+                .filter(|&f| self.html_tag(f, Tag::Form));
+        }
+        let mut at = self.parent_element(el);
+        while let Some(p) = at {
+            if self.html_tag(p, Tag::Form) {
+                return Some(p);
+            }
+            at = self.parent_element(p);
+        }
+        None
+    }
+
+    fn submit_button(&self, el: NodeId, tag: Tag) -> bool {
+        match tag {
+            // A button's type is submit unless it says reset or button.
+            Tag::Button => self.attr(el, "type").is_none_or(|t| {
+                !t.eq_ignore_ascii_case("reset") && !t.eq_ignore_ascii_case("button")
+            }),
+            Tag::Input => self.input_type(el, &["submit", "image"]),
+            _ => false,
+        }
+    }
+
+    /// Whether `el` is its form's default button: the first submit button
+    /// in tree order that belongs to the same form.
+    fn default_button(&self, el: NodeId, tag: Tag) -> bool {
+        if !self.submit_button(el, tag) {
+            return false;
+        }
+        let Some(form) = self.form_owner(el) else {
+            return false;
+        };
+        self.tree_of(el).into_iter().find(|&n| {
+            self.doc.element(n).is_some_and(|e| {
+                e.ns == Ns::Html && self.submit_button(n, e.tag) && self.form_owner(n) == Some(form)
+            })
+        }) == Some(el)
+    }
+
+    /// Whether no radio button in `el`'s group is checked: the radio
+    /// buttons with its name and form, in its tree. With no name it's a
+    /// group of one.
+    fn radio_group_unchecked(&self, el: NodeId) -> bool {
+        if self.attr(el, "checked").is_some() {
+            return false;
+        }
+        let Some(name) = self.attr(el, "name").filter(|n| !n.is_empty()) else {
+            return true;
+        };
+        let form = self.form_owner(el);
+        !self.tree_of(el).into_iter().any(|n| {
+            self.html_tag(n, Tag::Input)
+                && self.input_type(n, &["radio"])
+                && self.attr(n, "name") == Some(name)
+                && self.attr(n, "checked").is_some()
+                && self.form_owner(n) == form
+        })
+    }
+
     fn attr(&self, el: NodeId, name: &str) -> Option<&str> {
         self.doc
             .attrs(el)
@@ -1160,6 +1268,19 @@ impl Cx<'_> {
                 }
                 Tag::Option => self.attr(el, "selected").is_some(),
                 _ => false,
+            },
+            Pseudo::Default => match tag {
+                Tag::Input if self.input_type(el, &["checkbox", "radio"]) => {
+                    self.attr(el, "checked").is_some()
+                }
+                Tag::Option => self.attr(el, "selected").is_some(),
+                Tag::Button | Tag::Input => self.default_button(el, tag),
+                _ => false,
+            },
+            Pseudo::Indeterminate => match tag {
+                Tag::Input if self.input_type(el, &["radio"]) => self.radio_group_unchecked(el),
+                // A checkbox is only indeterminate when a script says so.
+                _ => self.html_named(el, "progress") && self.attr(el, "value").is_none(),
             },
             Pseudo::Disabled => self.disabled(el, tag),
             Pseudo::Enabled => self.form_control(tag) && !self.disabled(el, tag),

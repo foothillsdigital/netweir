@@ -295,3 +295,35 @@ fn selectors_read_as_css_reads_them() {
     assert!(SelectorList::parse(":has(a):has(b)").is_ok());
     assert!(SelectorList::parse(":is(:has(a))").is_ok());
 }
+
+#[test]
+fn default_and_indeterminate_follow_the_markup() {
+    let html = r#"<form id="f">
+<input type="text" name="t"><button id="first" type="button">no</button>
+<button id="go">go</button><input type="submit" id="second">
+<input type="checkbox" id="c1" checked><input type="checkbox" id="c2">
+<input type="radio" id="a1" name="a"><input type="radio" id="a2" name="a" checked>
+<input type="radio" id="b1" name="b"><input type="radio" id="b2" name="b">
+<input type="radio" id="alone">
+<select><option id="o1">x</option><option id="o2" selected>y</option></select>
+</form>
+<form id="g"></form><input type="submit" id="outside" form="g">
+<input type="radio" id="b3" name="b" checked>
+<progress id="busy"></progress><progress id="half" value="0.5"></progress>"#;
+    assert_eq!(
+        select(html, ":default"),
+        [
+            "button#go",
+            "input#c1",
+            "input#a2",
+            "option#o2",
+            "input#outside",
+            "input#b3"
+        ]
+    );
+    // b3 is checked, but outside the form, so form f's group b has none.
+    assert_eq!(
+        select(html, ":indeterminate"),
+        ["input#b1", "input#b2", "input#alone", "progress#busy"]
+    );
+}
