@@ -727,10 +727,15 @@ fn float_number(v: &str) -> Option<f64> {
         *i > at
     };
     let whole = digits(&mut i);
-    let fraction = b.get(i) == Some(&b'.') && {
+    // A point needs digits after it: 1. isn't a number.
+    let point = b.get(i) == Some(&b'.');
+    if point {
         i += 1;
-        digits(&mut i)
-    };
+    }
+    let fraction = point && digits(&mut i);
+    if point && !fraction {
+        return None;
+    }
     if !whole && !fraction {
         return None;
     }

@@ -342,12 +342,21 @@ fn in_range_and_out_of_range_follow_min_max_and_the_value() {
 <input id="w2" type="week" min="2020-W53" value="2020-W53">
 <input id="t1" type="time" min="22:00" max="06:00" value="23:30"><input id="t2" type="time" min="22:00" max="06:00" value="12:00">
 <input id="dt" type="datetime-local" max="2024-01-01T12:00" value="2024-01-01 12:00:01">
-<input id="text" type="text" min="1" value="0">"#;
+<input id="text" type="text" min="1" value="0"><input id="dot" type="number" min="1." value="0">
+<input id="n10" type="number" min="1" value="1.">"#;
     assert_eq!(
         select(html, ":in-range"),
         [
-            "input#n1", "input#n4", "input#n5", "input#r1", "input#r2", "input#d1", "input#d3",
-            "input#w2", "input#t1"
+            "input#n1",
+            "input#n4",
+            "input#n5",
+            "input#r1",
+            "input#r2",
+            "input#d1",
+            "input#d3",
+            "input#w2",
+            "input#t1",
+            "input#n10"
         ]
     );
     assert_eq!(
