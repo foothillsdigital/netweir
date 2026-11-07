@@ -295,3 +295,44 @@ fn selectors_read_as_css_reads_them() {
     assert!(SelectorList::parse(":has(a):has(b)").is_ok());
     assert!(SelectorList::parse(":is(:has(a))").is_ok());
 }
+
+#[test]
+fn select_iter_finds_matches_lazily_and_select_first_stops_at_one() {
+    let doc = parse(PAGE, false);
+    let list = SelectorList::parse("li, a").unwrap();
+    let all = list.select(&doc, doc.root());
+    assert_eq!(list.select_iter(&doc, doc.root()).collect::<Vec<_>>(), all);
+    assert_eq!(list.select_first(&doc, doc.root()), all.first().copied());
+    assert_eq!(
+        list.select_iter(&doc, doc.root()).nth(2),
+        all.get(2).copied()
+    );
+    let none = SelectorList::parse("table").unwrap();
+    assert_eq!(none.select_first(&doc, doc.root()), None);
+    // Scoped, it stays inside the scope.
+    let ul = SelectorList::parse("ul")
+        .unwrap()
+        .select_first(&doc, doc.root())
+        .unwrap();
+    let first_li = SelectorList::parse("li")
+        .unwrap()
+        .select_first(&doc, ul)
+        .unwrap();
+    assert_eq!(names(&doc, &[first_li]), ["li#17"]);
+}
+
+#[test]
+fn specificity_counts_as_selectors_4_does() {
+    let spec = |s: &str| SelectorList::parse(s).unwrap().specificity();
+    assert_eq!(spec("*"), (0, 0, 0));
+    assert_eq!(spec("li"), (0, 0, 1));
+    assert_eq!(spec("ul li.item[data-id]"), (0, 2, 2));
+    assert_eq!(spec("#main > a:hover"), (1, 1, 1));
+    assert_eq!(spec("a, #x, .y"), (1, 0, 0));
+    assert_eq!(spec(":is(#x, .y) p"), (1, 0, 1));
+    assert_eq!(spec(":where(#x, .y) p"), (0, 0, 1));
+    assert_eq!(spec("p:not(.a, #b)"), (1, 0, 1));
+    assert_eq!(spec("li:has(> a.x)"), (0, 1, 2));
+    assert_eq!(spec("li:nth-child(2n of .item)"), (0, 2, 1));
+    assert_eq!(spec("li:nth-child(odd)"), (0, 1, 1));
+}

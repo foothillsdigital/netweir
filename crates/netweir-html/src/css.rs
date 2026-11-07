@@ -107,6 +107,8 @@ enum Case {
 enum Pseudo {
     Not(SelectorList),
     Is(SelectorList),
+    /// Matches as `:is()` does, with no specificity.
+    Where(SelectorList),
     Has(SelectorList),
     Nth {
         a: i32,
@@ -602,7 +604,8 @@ impl<'a> Parser<'a> {
     fn pseudo_function_body(&mut self, name: &str) -> Result<Pseudo, SelectorError> {
         Ok(match name {
             "not" => Pseudo::Not(self.selector_list(false)?),
-            "is" | "where" | "matches" => Pseudo::Is(self.selector_list(true)?),
+            "is" | "matches" => Pseudo::Is(self.selector_list(true)?),
+            "where" => Pseudo::Where(self.selector_list(true)?),
             "has" => {
                 if self.in_has {
                     return error(":has() can't go inside :has()");
@@ -782,26 +785,97 @@ impl SelectorList {
     /// browser, combinators look past `scope`: `article .price` run on an
     /// article matches the prices inside it.
     pub fn select(&self, doc: &Document, scope: NodeId) -> Vec<NodeId> {
-        let cx = Cx {
-            doc,
-            scope: Some(scope),
-        };
-        let mut out = Vec::new();
+        self.select_iter(doc, scope).collect()
+    }
+
+    /// The matches [`SelectorList::select`] gives, found one at a time as
+    /// the iterator is read, so stopping early walks only that far.
+    pub fn select_iter<'a>(&'a self, doc: &'a Document, scope: NodeId) -> Select<'a> {
+        Select {
+            list: self,
+            cx: Cx {
+                doc,
+                scope: Some(scope),
+            },
+            scope,
+            at: doc.first_child(scope),
+        }
+    }
+
+    /// The first match in document order, without looking further.
+    pub fn select_first(&self, doc: &Document, scope: NodeId) -> Option<NodeId> {
+        self.select_iter(doc, scope).next()
+    }
+
+    /// Selectors 4's specificity, (IDs, classes, types), of the most
+    /// specific selector in the list, which is how `:is()` counts one.
+    /// `:is()`, `:not()` and `:has()` count as their most specific
+    /// argument, `:nth-child(An+B of S)` as a class plus S, and `:where()`
+    /// as nothing. (`|x`, which matches nothing, counts a class too much.)
+    pub fn specificity(&self) -> (u32, u32, u32) {
+        self.0
+            .iter()
+            .map(Complex::specificity)
+            .max()
+            .unwrap_or((0, 0, 0))
+    }
+}
+
+impl Complex {
+    fn specificity(&self) -> (u32, u32, u32) {
+        self.parts.iter().fold((0, 0, 0), |sum, (compound, _)| {
+            compound.0.iter().fold(sum, |(a, b, c), simple| {
+                let (x, y, z) = simple.specificity();
+                (a + x, b + y, c + z)
+            })
+        })
+    }
+}
+
+impl Simple {
+    fn specificity(&self) -> (u32, u32, u32) {
+        match self {
+            Simple::Id(_) => (1, 0, 0),
+            Simple::Class(_) | Simple::Attr(_) => (0, 1, 0),
+            Simple::Type { .. } => (0, 0, 1),
+            Simple::Anchor => (0, 0, 0),
+            Simple::Pseudo(p) => match p {
+                Pseudo::Is(list) | Pseudo::Not(list) | Pseudo::Has(list) => list.specificity(),
+                Pseudo::Where(_) => (0, 0, 0),
+                Pseudo::Nth { of: Some(list), .. } => {
+                    let (a, b, c) = list.specificity();
+                    (a, b + 1, c)
+                }
+                _ => (0, 1, 0),
+            },
+        }
+    }
+}
+
+/// The matches of [`SelectorList::select_iter`], in document order.
+pub struct Select<'a> {
+    list: &'a SelectorList,
+    cx: Cx<'a>,
+    scope: NodeId,
+    at: Option<NodeId>,
+}
+
+impl Iterator for Select<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        let doc = self.cx.doc;
         // A walk by the tree's own links, in document order: down to the
         // first child, else along to the next sibling, else back up.
-        let mut at = doc.first_child(scope);
-        while let Some(n) = at {
+        while let Some(n) = self.at {
             let element = doc.element(n).is_some();
-            if element && self.0.iter().any(|c| cx.complex(c, 0, n, n)) {
-                out.push(n);
-            }
-            at = match doc.first_child(n).filter(|_| element) {
+            self.at = match doc.first_child(n).filter(|_| element) {
                 Some(child) => Some(child),
                 None => {
                     let mut up = Some(n);
                     let mut next = None;
                     while let Some(u) = up {
-                        if u == scope {
+                        if u == self.scope {
                             break;
                         }
                         if let Some(s) = doc.next_sibling(u) {
@@ -813,8 +887,11 @@ impl SelectorList {
                     next
                 }
             };
+            if element && self.list.0.iter().any(|c| self.cx.complex(c, 0, n, n)) {
+                return Some(n);
+            }
         }
-        out
+        None
     }
 }
 
@@ -1071,7 +1148,9 @@ impl Cx<'_> {
         let tag = if html { e.tag } else { Tag::Other };
         match p {
             Pseudo::Not(list) => !list.0.iter().any(|c| self.complex(c, 0, el, anchor)),
-            Pseudo::Is(list) => list.0.iter().any(|c| self.complex(c, 0, el, anchor)),
+            Pseudo::Is(list) | Pseudo::Where(list) => {
+                list.0.iter().any(|c| self.complex(c, 0, el, anchor))
+            }
             Pseudo::Has(list) => list.0.iter().any(|c| self.has(c, el)),
             Pseudo::Nth {
                 a,
