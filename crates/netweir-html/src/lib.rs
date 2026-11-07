@@ -5,6 +5,7 @@ pub mod css;
 mod dom;
 mod edit;
 mod entities;
+mod pattern;
 mod serialize;
 mod tags;
 pub mod tokenizer;
