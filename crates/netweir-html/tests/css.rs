@@ -366,3 +366,62 @@ fn in_range_and_out_of_range_follow_min_max_and_the_value() {
         ]
     );
 }
+
+#[test]
+fn valid_and_invalid_follow_the_constraints_the_markup_sets() {
+    let html = r#"<form id="f">
+<input id="req" required><input id="req-ok" required value="x"><input id="plain">
+<input id="mail" type="email" value="a@b.example"><input id="bad-mail" type="email" value="a@-b">
+<input id="mails" type="email" multiple value=" a@b.example , c@d.example "><input id="url" type="url" value="https://x.test/">
+<input id="bad-url" type="url" value="not a url"><input id="num" type="number" min="1" max="10" step="2" value="5">
+<input id="off-step" type="number" min="1" step="2" value="4"><input id="over" type="number" max="3" value="4">
+<input id="any" type="number" min="0" step="any" value="0.5"><input id="wk" type="week" min="2020-W53" step="2" value="2021-W02">
+<input id="box" type="checkbox" required><input id="file" type="file" required>
+<input id="r1" type="radio" name="g" required><input id="r2" type="radio" name="g">
+<textarea id="ta" required></textarea>
+<select id="sel" required><option value="">Pick</option><option>A</option></select>
+<select id="sel-ok" required><option value="">Pick</option><option selected>A</option></select>
+<input id="ro" required readonly><input id="off" required disabled><input id="hid" type="hidden" required>
+<button id="go">go</button><button id="nope" type="button">x</button>
+</form>
+<form id="g"><input id="fine" value="x"></form>
+<fieldset id="fs"><input id="in-fs" type="email" value="x"></fieldset>"#;
+    assert_eq!(
+        select(html, "input:invalid, textarea:invalid, select:invalid"),
+        [
+            "input#req",
+            "input#bad-mail",
+            "input#bad-url",
+            "input#off-step",
+            "input#over",
+            "input#box",
+            "input#file",
+            "input#r1",
+            "input#r2",
+            "textarea#ta",
+            "select#sel",
+            "input#in-fs"
+        ]
+    );
+    assert_eq!(
+        select(html, "input:valid, select:valid, button:valid"),
+        [
+            "input#req-ok",
+            "input#plain",
+            "input#mail",
+            "input#mails",
+            "input#url",
+            "input#num",
+            "input#any",
+            "input#wk",
+            "select#sel-ok",
+            "button#go",
+            "input#fine"
+        ]
+    );
+    assert_eq!(
+        select(html, "form:invalid, fieldset:invalid"),
+        ["form#f", "fieldset#fs"]
+    );
+    assert_eq!(select(html, "form:valid"), ["form#g"]);
+}

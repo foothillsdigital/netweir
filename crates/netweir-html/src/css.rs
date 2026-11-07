@@ -134,6 +134,8 @@ enum Pseudo {
     Indeterminate,
     InRange,
     OutOfRange,
+    Valid,
+    Invalid,
     /// A state no static page is in: `:hover`, `:focus`, `:visited`...
     Never,
 }
@@ -589,6 +591,8 @@ impl<'a> Parser<'a> {
             "indeterminate" => Pseudo::Indeterminate,
             "in-range" => Pseudo::InRange,
             "out-of-range" => Pseudo::OutOfRange,
+            "valid" => Pseudo::Valid,
+            "invalid" => Pseudo::Invalid,
             "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
             | "target" | "target-within" | "local-link" | "user-invalid" | "user-valid" => {
                 Pseudo::Never
@@ -687,6 +691,108 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// An `<input>`'s type as the HTML Standard reads it: a known type in any
+/// case, anything else (or none) text.
+fn input_type_state(typ: Option<&str>) -> &'static str {
+    const TYPES: [&str; 22] = [
+        "hidden",
+        "text",
+        "search",
+        "tel",
+        "url",
+        "email",
+        "password",
+        "date",
+        "month",
+        "week",
+        "time",
+        "datetime-local",
+        "number",
+        "range",
+        "color",
+        "checkbox",
+        "radio",
+        "file",
+        "submit",
+        "image",
+        "reset",
+        "button",
+    ];
+    typ.and_then(|t| TYPES.iter().find(|k| k.eq_ignore_ascii_case(t)))
+        .copied()
+        .unwrap_or("text")
+}
+
+fn readonly_applies(typ: &str) -> bool {
+    matches!(
+        typ,
+        "text"
+            | "search"
+            | "url"
+            | "tel"
+            | "email"
+            | "password"
+            | "date"
+            | "month"
+            | "week"
+            | "time"
+            | "datetime-local"
+            | "number"
+    )
+}
+
+/// The value sanitization algorithm for the types validation reads: line
+/// breaks out, url and email trimmed, an email list trimmed item by item, and
+/// a date, time or number that isn't valid gone.
+fn sanitized(typ: &str, value: &str, multiple: bool) -> String {
+    let no_breaks: String = value.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    let trim = |s: &str| {
+        s.trim_matches(|c: char| c.is_ascii_whitespace())
+            .to_string()
+    };
+    match typ {
+        "url" => trim(&no_breaks),
+        "email" if multiple => value.split(',').map(trim).collect::<Vec<_>>().join(","),
+        "email" => trim(&no_breaks),
+        "number" | "date" | "month" | "week" | "time" | "datetime-local" => {
+            if input_number(typ, value).is_some() {
+                value.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => no_breaks,
+    }
+}
+
+/// The HTML Standard's valid email address: a local part of letters,
+/// digits and ``.!#$%&'*+/=?^_`{|}~-``, then `@` and dot-separated labels
+/// of up to 63 letters, digits and hyphens that don't start or end with one.
+fn valid_email(address: &str) -> bool {
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+    let local_ok = !local.is_empty()
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".!#$%&'*+/=?^_`{|}~-".contains(c));
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    local_ok && domain.split('.').all(label_ok)
+}
+
+/// The day the Monday of the year's first ISO week falls on.
+fn monday_of_week_1(y: i64) -> i64 {
+    let jan4 = days(y, 1, 4);
+    let weekday = (jan4 - 1) % 7; // 1 January of year 1 was a Monday: 0
+    jan4 - weekday
+}
+
 /// An `<input>` value of `typ` as a number that orders as the values do:
 /// the number, or for dates and times a count of days, months, weeks or
 /// milliseconds. None when it isn't a valid value of that type.
@@ -702,7 +808,9 @@ fn input_number(typ: &str, v: &str) -> Option<f64> {
         "week" => {
             let (y, w) = v.split_once("-W")?;
             let (y, w) = (year(y)?, two_digits(w)?);
-            (1..=weeks_in(y)).contains(&w).then(|| (y * 53 + w) as f64)
+            (1..=weeks_in(y))
+                .contains(&w)
+                .then(|| (monday_of_week_1(y) + (w - 1) * 7) as f64)
         }
         "time" => time_ms(v),
         "datetime-local" => {
@@ -1315,6 +1423,200 @@ impl Cx<'_> {
         })
     }
 
+    /// For `:valid` and `:invalid`: whether `el` satisfies its constraints,
+    /// or for a form or fieldset whether everything in it does; None for an
+    /// element that doesn't take part in validation.
+    fn valid(&self, el: NodeId, tag: Tag) -> Option<bool> {
+        match tag {
+            Tag::Form => Some(!self.tree_of(el).into_iter().any(|n| {
+                self.doc.element(n).is_some_and(|e| e.ns == Ns::Html)
+                    && self.form_owner(n) == Some(el)
+                    && self.control_valid(n) == Some(false)
+            })),
+            Tag::Fieldset => {
+                let mut stack: Vec<NodeId> = self.doc.children(el).collect();
+                while let Some(n) = stack.pop() {
+                    if self.control_valid(n) == Some(false) {
+                        return Some(false);
+                    }
+                    stack.extend(self.doc.children(n));
+                }
+                Some(true)
+            }
+            _ => self.control_valid(el),
+        }
+    }
+
+    /// Whether a form control satisfies its constraints, None when it's
+    /// barred from validation. The static document's value is the `value`
+    /// attribute, or a textarea's text. Only what the markup decides is
+    /// checked: not `pattern` (no JavaScript-compatible regular
+    /// expressions here yet), nor too long, too short or bad input, which
+    /// only someone typing can cause.
+    fn control_valid(&self, el: NodeId) -> Option<bool> {
+        let e = self.doc.element(el)?;
+        if e.ns != Ns::Html || self.disabled(el, e.tag) || self.in_datalist(el) {
+            return None;
+        }
+        let required = self.attr(el, "required").is_some();
+        match e.tag {
+            Tag::Input => {
+                let typ = input_type_state(self.attr(el, "type"));
+                if matches!(typ, "hidden" | "reset" | "button")
+                    || (readonly_applies(typ) && self.attr(el, "readonly").is_some())
+                {
+                    return None;
+                }
+                Some(self.input_valid(el, typ, required))
+            }
+            Tag::Textarea => {
+                if self.attr(el, "readonly").is_some() {
+                    return None;
+                }
+                Some(!required || !self.doc.text(el).is_empty())
+            }
+            Tag::Select => Some(!required || self.select_has_value(el)),
+            Tag::Button => self.submit_button(el, Tag::Button).then_some(true),
+            _ => None,
+        }
+    }
+
+    fn input_valid(&self, el: NodeId, typ: &str, required: bool) -> bool {
+        match typ {
+            "checkbox" => !required || self.attr(el, "checked").is_some(),
+            "radio" => !self.radio_value_missing(el),
+            // A static page has no files chosen.
+            "file" => !required,
+            "submit" | "image" | "color" | "range" => true,
+            _ => {
+                let value = sanitized(
+                    typ,
+                    self.attr(el, "value").unwrap_or(""),
+                    self.attr(el, "multiple").is_some(),
+                );
+                if value.is_empty() {
+                    return !required;
+                }
+                match typ {
+                    "email" => value.split(',').all(valid_email),
+                    "url" => url::Url::parse(&value).is_ok(),
+                    "number" | "date" | "month" | "week" | "time" | "datetime-local" => {
+                        self.in_range(el) != Some(false) && self.step_fits(el, typ, &value)
+                    }
+                    _ => true,
+                }
+            }
+        }
+    }
+
+    /// Whether the value lands on a step from `min`. With no valid `min` the
+    /// step base is the value itself, so any value fits.
+    fn step_fits(&self, el: NodeId, typ: &str, value: &str) -> bool {
+        let (default, scale) = match typ {
+            "week" => (1.0, 7.0),
+            "time" | "datetime-local" => (60.0, 1000.0),
+            _ => (1.0, 1.0),
+        };
+        let step = match self.attr(el, "step") {
+            Some(s) if s.eq_ignore_ascii_case("any") => return true,
+            Some(s) => float_number(s).filter(|&s| s > 0.0).unwrap_or(default),
+            None => default,
+        };
+        let (Some(value), Some(base)) = (
+            input_number(typ, value),
+            self.attr(el, "min").and_then(|m| input_number(typ, m)),
+        ) else {
+            return true;
+        };
+        let steps = (value - base) / (step * scale);
+        (steps - steps.round()).abs() < 1e-9
+    }
+
+    /// Whether `el`'s radio group is required and has nothing checked.
+    fn radio_value_missing(&self, el: NodeId) -> bool {
+        let Some(name) = self.attr(el, "name").filter(|n| !n.is_empty()) else {
+            return self.attr(el, "required").is_some() && self.attr(el, "checked").is_none();
+        };
+        let form = self.form_owner(el);
+        let group: Vec<NodeId> = self
+            .tree_of(el)
+            .into_iter()
+            .filter(|&n| {
+                self.html_tag(n, Tag::Input)
+                    && self.input_type(n, &["radio"])
+                    && self.attr(n, "name") == Some(name)
+                    && self.form_owner(n) == form
+            })
+            .collect();
+        group.iter().any(|&n| self.attr(n, "required").is_some())
+            && group.iter().all(|&n| self.attr(n, "checked").is_none())
+    }
+
+    /// Whether a select has a value to submit: an option selected, and in a
+    /// one-line single select not the placeholder (a first child option
+    /// whose value is empty).
+    fn select_has_value(&self, el: NodeId) -> bool {
+        let mut options = Vec::new();
+        let mut stack: Vec<NodeId> = self.doc.children(el).collect();
+        stack.reverse();
+        while let Some(n) = stack.pop() {
+            if self.html_tag(n, Tag::Option) {
+                options.push(n);
+            } else if self.html_tag(n, Tag::Optgroup) {
+                let at = stack.len();
+                stack.extend(self.doc.children(n));
+                stack[at..].reverse();
+            }
+        }
+        let marked = |n: &&NodeId| self.attr(**n, "selected").is_some();
+        let multiple = self.attr(el, "multiple").is_some();
+        let size = self
+            .attr(el, "size")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(if multiple { 4 } else { 1 });
+        if multiple {
+            return options.iter().any(|n| marked(&n));
+        }
+        // The last one marked selected wins, else the first that isn't disabled.
+        let selected = options.iter().rev().find(marked).or_else(|| {
+            options
+                .iter()
+                .find(|&&n| self.attr(n, "disabled").is_none() && !self.disabled(n, Tag::Option))
+        });
+        let Some(&selected) = selected else {
+            return false;
+        };
+        let placeholder = size == 1
+            && options.first() == Some(&selected)
+            && self.doc.parent(selected) == Some(el)
+            && self.option_value(selected).is_empty();
+        !placeholder
+    }
+
+    fn option_value(&self, el: NodeId) -> String {
+        match self.attr(el, "value") {
+            Some(v) => v.to_string(),
+            None => self
+                .doc
+                .text(el)
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    fn in_datalist(&self, el: NodeId) -> bool {
+        let mut at = self.parent_element(el);
+        while let Some(p) = at {
+            if self.html_named(p, "datalist") {
+                return true;
+            }
+            at = self.parent_element(p);
+        }
+        false
+    }
+
     fn attr(&self, el: NodeId, name: &str) -> Option<&str> {
         self.doc
             .attrs(el)
@@ -1489,6 +1791,8 @@ impl Cx<'_> {
             },
             Pseudo::InRange => tag == Tag::Input && self.in_range(el) == Some(true),
             Pseudo::OutOfRange => tag == Tag::Input && self.in_range(el) == Some(false),
+            Pseudo::Valid => self.valid(el, tag) == Some(true),
+            Pseudo::Invalid => self.valid(el, tag) == Some(false),
             Pseudo::Disabled => self.disabled(el, tag),
             Pseudo::Enabled => self.form_control(tag) && !self.disabled(el, tag),
             Pseudo::Required => {
