@@ -765,6 +765,59 @@ fn sanitized(typ: &str, value: &str, multiple: bool) -> String {
     }
 }
 
+/// The rules for parsing floating-point number values: leading whitespace
+/// skipped, an optional sign, then as much of a number as there is.
+fn parse_float_value(s: &str) -> Option<f64> {
+    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'-' | b'+')));
+    let digits = |i: &mut usize| {
+        let at = *i;
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+        *i > at
+    };
+    let mut end;
+    let whole = digits(&mut i);
+    end = i;
+    if b.get(i) == Some(&b'.') {
+        let mut j = i + 1;
+        if digits(&mut j) {
+            i = j;
+            end = i;
+        } else if !whole {
+            return None;
+        }
+    }
+    if !whole && end == usize::from(matches!(b.first(), Some(b'-' | b'+'))) {
+        return None;
+    }
+    if matches!(b.get(end), Some(b'e' | b'E')) {
+        let mut j = end + 1;
+        if matches!(b.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        if digits(&mut j) {
+            end = j;
+        }
+    }
+    s[..end]
+        .trim_start_matches('+')
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+}
+
+/// The rules for parsing non-negative integers: leading whitespace and a
+/// `+` skipped, then the digits up to the first that isn't one.
+fn parse_non_negative(s: &str) -> Option<u32> {
+    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
+}
+
 /// The HTML Standard's valid email address: a local part of letters,
 /// digits and ``.!#$%&'*+/=?^_`{|}~-``, then `@` and dot-separated labels
 /// of up to 63 letters, digits and hyphens that don't start or end with one.
@@ -1498,7 +1551,10 @@ impl Cx<'_> {
                     return !required;
                 }
                 match typ {
-                    "email" => value.split(',').all(valid_email),
+                    "email" if self.attr(el, "multiple").is_some() => {
+                        value.split(',').all(valid_email)
+                    }
+                    "email" => valid_email(&value),
                     "url" => url::Url::parse(&value).is_ok(),
                     "number" | "date" | "month" | "week" | "time" | "datetime-local" => {
                         self.in_range(el) != Some(false) && self.step_fits(el, typ, &value)
@@ -1519,7 +1575,7 @@ impl Cx<'_> {
         };
         let step = match self.attr(el, "step") {
             Some(s) if s.eq_ignore_ascii_case("any") => return true,
-            Some(s) => float_number(s).filter(|&s| s > 0.0).unwrap_or(default),
+            Some(s) => parse_float_value(s).filter(|&s| s > 0.0).unwrap_or(default),
             None => default,
         };
         let (Some(value), Some(base)) = (
@@ -1572,16 +1628,19 @@ impl Cx<'_> {
         let multiple = self.attr(el, "multiple").is_some();
         let size = self
             .attr(el, "size")
-            .and_then(|s| s.trim().parse::<u32>().ok())
+            .and_then(parse_non_negative)
             .filter(|&s| s > 0)
             .unwrap_or(if multiple { 4 } else { 1 });
         if multiple {
             return options.iter().any(|n| marked(&n));
         }
         // The last one marked selected wins, else the first that isn't disabled.
+        // The last one marked selected wins. With none, a one-line select
+        // shows its first option that isn't disabled; a list box shows none.
         let selected = options.iter().rev().find(marked).or_else(|| {
             options
                 .iter()
+                .filter(|_| size == 1)
                 .find(|&&n| self.attr(n, "disabled").is_none() && !self.disabled(n, Tag::Option))
         });
         let Some(&selected) = selected else {

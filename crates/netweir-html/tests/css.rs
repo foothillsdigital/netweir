@@ -425,3 +425,21 @@ fn valid_and_invalid_follow_the_constraints_the_markup_sets() {
     );
     assert_eq!(select(html, "form:valid"), ["form#g"]);
 }
+
+#[test]
+fn valid_reads_attributes_as_the_standard_parses_them() {
+    let html = r#"<input id="one-mail" type="email" value="a@b.example,c@d.example">
+<input id="two-mails" type="email" multiple value="a@b.example,c@d.example">
+<select id="list" required size="3"><option>A</option></select>
+<input id="step-ws" type="number" min="0" step=" 2 " value="3">
+<input id="step-unit" type="number" min="0" step="2px" value="4">
+<select id="px" required size="2px"><option value="" selected>None</option><option>A</option></select>"#;
+    assert_eq!(
+        select(html, ":invalid"),
+        ["input#one-mail", "select#list", "input#step-ws"]
+    );
+    assert_eq!(
+        select(html, ":valid"),
+        ["input#two-mails", "input#step-unit", "select#px"]
+    );
+}
