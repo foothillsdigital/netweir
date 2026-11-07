@@ -1,7 +1,7 @@
 //! CSS selectors: every feature Netweir's own tests use, the rest of what
 //! lexbor offered, and where browsers and lexbor part ways, the browsers.
 
-use netweir_html::css::SelectorList;
+use netweir_html::css::{MatchOptions, SelectorList};
 use netweir_html::{Document, Kind, NodeId, parse};
 
 const PAGE: &str = r#"<!DOCTYPE html><html><head><title>Shop</title></head><body>
@@ -335,4 +335,62 @@ fn specificity_counts_as_selectors_4_does() {
     assert_eq!(spec("li:has(> a.x)"), (0, 1, 2));
     assert_eq!(spec("li:nth-child(2n of .item)"), (0, 2, 1));
     assert_eq!(spec("li:nth-child(odd)"), (0, 1, 1));
+}
+
+fn select_at(html: &str, css: &str, url: &str) -> Vec<String> {
+    let doc = parse(html, false);
+    let list = SelectorList::parse(css).unwrap_or_else(|e| panic!("{css}: {e}"));
+    names(
+        &doc,
+        &list.select_with(&doc, doc.root(), &MatchOptions { url: Some(url) }),
+    )
+}
+
+#[test]
+fn target_is_the_element_the_fragment_indicates() {
+    let html = r#"<div id="outer"><p id="sec">a</p><a name="sec" id="named">b</a><a name="old" id="anchor">c</a></div>
+<p id="top">t</p><p id="café">d</p>"#;
+    assert_eq!(select_at(html, ":target", "https://x.test/#sec"), ["p#sec"]);
+    assert_eq!(select_at(html, ":target", "https://x.test/#old"), ["a#old"]);
+    assert_eq!(select_at(html, ":target", "https://x.test/#top"), ["p#top"]);
+    assert_eq!(
+        select_at(html, ":target", "https://x.test/#caf%C3%A9"),
+        ["p#café"]
+    );
+    assert_eq!(
+        select_at(html, ":target", "https://x.test/#"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        select_at(html, ":target", "https://x.test/#gone"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        select_at(html, ":target-within", "https://x.test/#sec"),
+        ["html", "body", "div#outer", "p#sec"]
+    );
+    // Without a URL, as before.
+    assert_eq!(select(html, ":target"), Vec::<String>::new());
+    assert_eq!(
+        select_at("<p id=top>t</p>", ":target", "https://x.test/#TOP"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn local_link_resolves_against_the_document_url() {
+    let html = r##"<a id="frag" href="#other">1</a><a id="rel" href="b?q">2</a><a id="path" href="b">3</a>
+<a id="abs" href="/a/b?q#x">4</a><a id="host" href="//X.TEST:443/a/b?q">5</a><a id="elsewhere" href="https://y.test/a/b?q">6</a>
+<a id="nohref">7</a><area id="area" href="?q">"##;
+    assert_eq!(
+        select_at(html, ":local-link", "https://x.test/a/b?q#sec"),
+        ["a#frag", "a#rel", "a#abs", "a#host", "area#area"]
+    );
+    // A <base> moves where relative links point.
+    let based = r#"<base href="/c/"><a id="here" href="d">1</a><a id="there" href="b">2</a>"#;
+    assert_eq!(
+        select_at(based, ":local-link", "https://x.test/c/d"),
+        ["a#here"]
+    );
+    assert_eq!(select(html, ":local-link"), Vec::<String>::new());
 }

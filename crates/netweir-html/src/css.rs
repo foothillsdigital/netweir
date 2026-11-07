@@ -132,6 +132,9 @@ enum Pseudo {
     ReadWrite,
     ReadOnly,
     PlaceholderShown,
+    Target,
+    TargetWithin,
+    LocalLink,
     /// A state no static page is in: `:hover`, `:focus`, `:visited`...
     Never,
 }
@@ -583,10 +586,11 @@ impl<'a> Parser<'a> {
             "read-write" => Pseudo::ReadWrite,
             "read-only" => Pseudo::ReadOnly,
             "placeholder-shown" => Pseudo::PlaceholderShown,
+            "target" => Pseudo::Target,
+            "target-within" => Pseudo::TargetWithin,
+            "local-link" => Pseudo::LocalLink,
             "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
-            | "target" | "target-within" | "local-link" | "user-invalid" | "user-valid" => {
-                Pseudo::Never
-            }
+            | "user-invalid" | "user-valid" => Pseudo::Never,
             _ => return error(format!(":{name} isn't supported")),
         })
     }
@@ -777,8 +781,53 @@ impl SelectorList {
     /// Whether `el` matches, with `scope` as `:scope` (the root element
     /// when `None`).
     pub fn matches(&self, doc: &Document, el: NodeId, scope: Option<NodeId>) -> bool {
-        let cx = Cx { doc, scope };
+        self.matches_with(doc, el, scope, &MatchOptions::default())
+    }
+
+    /// [`SelectorList::matches`] with what the document alone can't say,
+    /// such as its URL.
+    pub fn matches_with(
+        &self,
+        doc: &Document,
+        el: NodeId,
+        scope: Option<NodeId>,
+        options: &MatchOptions<'_>,
+    ) -> bool {
+        let cx = Cx {
+            doc,
+            scope,
+            page: Page::new(doc, options.url),
+        };
         self.0.iter().any(|c| cx.complex(c, 0, el, el))
+    }
+
+    /// [`SelectorList::select`] with what the document alone can't say,
+    /// such as its URL.
+    pub fn select_with(
+        &self,
+        doc: &Document,
+        scope: NodeId,
+        options: &MatchOptions<'_>,
+    ) -> Vec<NodeId> {
+        self.iter_with(doc, scope, options).collect()
+    }
+
+    fn iter_with<'a>(
+        &'a self,
+        doc: &'a Document,
+        scope: NodeId,
+        options: &MatchOptions<'_>,
+    ) -> Select<'a> {
+        Select {
+            list: self,
+            cx: Cx {
+                doc,
+                scope: Some(scope),
+                page: Page::new(doc, options.url),
+            },
+            scope,
+            at: doc.first_child(scope),
+        }
     }
 
     /// The elements under `scope` that match, in document order. As in a
@@ -791,15 +840,7 @@ impl SelectorList {
     /// The matches [`SelectorList::select`] gives, found one at a time as
     /// the iterator is read, so stopping early walks only that far.
     pub fn select_iter<'a>(&'a self, doc: &'a Document, scope: NodeId) -> Select<'a> {
-        Select {
-            list: self,
-            cx: Cx {
-                doc,
-                scope: Some(scope),
-            },
-            scope,
-            at: doc.first_child(scope),
-        }
+        self.iter_with(doc, scope, &MatchOptions::default())
     }
 
     /// The first match in document order, without looking further.
@@ -903,9 +944,114 @@ fn push_children_reversed(doc: &Document, n: NodeId, stack: &mut Vec<NodeId>) {
 
 // ---- matching --------------------------------------------------------------
 
+/// What matching needs that a document doesn't carry. The default has
+/// none of it, so `:target` and `:local-link` match nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MatchOptions<'a> {
+    /// The document's URL, for `:target`, `:target-within` and `:local-link`.
+    pub url: Option<&'a str>,
+}
+
+/// The document's URL worked out once per query.
+struct Page {
+    /// Without its fragment.
+    url: url::Url,
+    /// What links resolve against: a `<base href>`, else the URL.
+    base: url::Url,
+    /// The element the fragment indicates.
+    target: Option<NodeId>,
+}
+
+impl Page {
+    // Parsec's own WHATWG URL parser (#26) takes the url crate's place when it lands.
+    fn new(doc: &Document, url: Option<&str>) -> Option<Page> {
+        let mut url = url::Url::parse(url?).ok()?;
+        let fragment = url.fragment().map(str::to_string);
+        url.set_fragment(None);
+        let elements = tree_elements(doc);
+        let base = elements
+            .iter()
+            .find(|&&n| html_element_named(doc, n, "base") && attr_of(doc, n, "href").is_some())
+            .and_then(|&n| url.join(attr_of(doc, n, "href")?).ok())
+            .unwrap_or_else(|| url.clone());
+        let target = fragment.and_then(|f| indicated(doc, &elements, &f));
+        Some(Page { url, base, target })
+    }
+}
+
+/// The document's elements in tree order.
+fn tree_elements(doc: &Document) -> Vec<NodeId> {
+    let (mut out, mut stack) = (Vec::new(), vec![doc.root()]);
+    while let Some(n) = stack.pop() {
+        if doc.element(n).is_some() {
+            out.push(n);
+        }
+        push_children_reversed(doc, n, &mut stack);
+    }
+    out
+}
+
+fn html_element_named(doc: &Document, n: NodeId, name: &str) -> bool {
+    doc.element(n).is_some_and(|e| e.ns == Ns::Html) && doc.lower_name(n) == Some(name)
+}
+
+fn attr_of<'a>(doc: &'a Document, n: NodeId, name: &str) -> Option<&'a str> {
+    doc.attrs(n)
+        .find(|(ns, a, _)| *ns == AttrNs::None && *a == name)
+        .map(|(_, _, v)| v)
+}
+
+/// The HTML Standard's indicated part: the first element whose `id` is
+/// the fragment, else the first `<a>` with that `name`; tried as given,
+/// then percent-decoded. An empty fragment, or `top` with no element of
+/// that name, indicates the top of the document, which is no element.
+fn indicated(doc: &Document, elements: &[NodeId], fragment: &str) -> Option<NodeId> {
+    if fragment.is_empty() {
+        return None;
+    }
+    let find = |f: &str| {
+        elements
+            .iter()
+            .copied()
+            .find(|&n| attr_of(doc, n, "id") == Some(f))
+            .or_else(|| {
+                elements.iter().copied().find(|&n| {
+                    html_element_named(doc, n, "a") && attr_of(doc, n, "name") == Some(f)
+                })
+            })
+    };
+    find(fragment).or_else(|| find(&percent_decode(fragment)))
+}
+
+/// %XX escapes as bytes, read as UTF-8 with any bad sequence replaced.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).and_then(|&c| hex(c)),
+            b.get(i + 2).and_then(|&c| hex(c)),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 struct Cx<'a> {
     doc: &'a Document,
     scope: Option<NodeId>,
+    page: Option<Page>,
 }
 
 /// HTML attributes whose values selectors compare without case, unless the
@@ -1230,6 +1376,28 @@ impl Cx<'_> {
                     .is_some_and(|p| matches!(doc.nodes[p as usize].data, Data::Document)),
             },
             Pseudo::AnyLink => matches!(tag, Tag::A | Tag::Area) && self.attr(el, "href").is_some(),
+            Pseudo::Target => self.page.as_ref().is_some_and(|p| p.target == Some(el)),
+            Pseudo::TargetWithin => self.page.as_ref().and_then(|p| p.target).is_some_and(|t| {
+                let mut at = Some(t);
+                while let Some(n) = at {
+                    if n == el {
+                        return true;
+                    }
+                    at = self.doc.parent(n);
+                }
+                false
+            }),
+            Pseudo::LocalLink => {
+                matches!(tag, Tag::A | Tag::Area)
+                    && self.page.as_ref().is_some_and(|p| {
+                        self.attr(el, "href")
+                            .and_then(|href| p.base.join(href).ok())
+                            .is_some_and(|mut link| {
+                                link.set_fragment(None);
+                                link == p.url
+                            })
+                    })
+            }
             Pseudo::Checked => match tag {
                 Tag::Input => {
                     self.attr(el, "checked").is_some()
