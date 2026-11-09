@@ -57,7 +57,7 @@ error; take the `--project` off and restart instead.
 
 | option | what it does |
 |---|---|
-| `--project NAME=PATH` | serve a spider file or directory as project NAME; give it once per project. A bare `PATH` is named after the file or directory |
+| `--project NAME=PATH` | serve a spider file or directory as project NAME; give it once per project. A bare `PATH` is named after the file (without its extension) or the directory, so `.` takes the current directory's name |
 | `--bind ADDRESS` | the address to listen on (default `127.0.0.1`, this machine only) |
 | `--port N` | the port (default `6800`, scrapyd's) |
 | `--dir DIR` | where the job table, logs, items and stats go (default `netweir-serve`) |
