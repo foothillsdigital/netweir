@@ -12,6 +12,23 @@ use std::collections::{BTreeSet, HashMap};
 /// backtrack hard can't hang a query. A match that runs out doesn't match.
 const STEP_LIMIT: u32 = 1_000_000;
 
+/// Steps every match in one select may take together, so a page with many
+/// inputs carrying a hard pattern can't multiply the cost. Once it's spent,
+/// the rest of the matches in that select give up the same way.
+pub(crate) const SELECT_STEP_LIMIT: u32 = 10 * STEP_LIMIT;
+
+/// How deep groups and classes may nest. Deeper doesn't compile, so a page
+/// can't overflow the stack with `((((...`.
+const MAX_DEPTH: u32 = 32;
+
+/// How much stack one match may use. Matching recurses: each character a
+/// repeat consumes goes deeper, unless the repeat is of one character, which
+/// loops. A match that would go past this gives up, so a long value against
+/// `(ab)*` can't overflow a small thread stack. It's measured in bytes
+/// rather than levels because a level's frames are several times bigger in
+/// a debug build than in a release one.
+const MATCH_STACK_LIMIT: usize = 64 * 1024;
+
 const MAX_CHAR: u32 = 0x10FFFF;
 
 pub(crate) struct Pattern {
@@ -30,6 +47,7 @@ impl Pattern {
             names,
             next_group: 0,
             backrefs: Vec::new(),
+            depth: 0,
         };
         let node = p.disjunction()?;
         if p.pos != chars.len() {
@@ -41,12 +59,15 @@ impl Pattern {
         Some(Pattern { node, groups })
     }
 
-    /// Whether the whole of `value` matches.
-    pub(crate) fn matches(&self, value: &str) -> bool {
+    /// Whether the whole of `value` matches, taking steps from `budget`,
+    /// which a select shares across its matches.
+    pub(crate) fn matches(&self, value: &str, budget: &Cell<u32>) -> bool {
         let text: Vec<u32> = value.chars().map(u32::from).collect();
         let m = Matcher {
             text: &text,
             steps: Cell::new(0),
+            budget,
+            stack_top: stack_address(),
         };
         let mut caps = vec![None; self.groups + 1];
         m.run(&self.node, 0, &mut caps, &mut |end, _| end == text.len())
@@ -59,7 +80,8 @@ enum Node {
     Char(u32),
     /// `.`: anything but a line terminator.
     Any,
-    Class(Box<Set>),
+    /// A class, with its `\q{}` strings longest first, sorted once here.
+    Class(Box<Set>, Vec<Vec<u32>>),
     Start,
     End,
     WordBoundary(bool),
@@ -175,6 +197,12 @@ impl Set {
     }
 }
 
+fn class_node(set: Set) -> Node {
+    let mut strings: Vec<Vec<u32>> = set.strings.iter().cloned().collect();
+    strings.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    Node::Class(Box::new(set), strings)
+}
+
 fn digit_set() -> Set {
     Set::of(&[(0x30, 0x39)])
 }
@@ -247,9 +275,21 @@ struct Parser<'a> {
     names: HashMap<Vec<u32>, usize>,
     next_group: usize,
     backrefs: Vec<usize>,
+    depth: u32,
 }
 
 impl Parser<'_> {
+    /// Runs `f` one nesting level deeper, or fails past MAX_DEPTH.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
+    }
+
     fn peek(&self) -> Option<u32> {
         self.src.get(self.pos).copied()
     }
@@ -375,8 +415,8 @@ impl Parser<'_> {
             '^' => (Node::Start, false),
             '$' => (Node::End, false),
             '.' => (Node::Any, true),
-            '[' => (self.class()?, true),
-            '(' => self.group()?,
+            '[' => (self.nested(Self::class)?, true),
+            '(' => self.nested(Self::group)?,
             '\\' => self.atom_escape()?,
             '*' | '+' | '?' | '{' | '}' | ']' => return None,
             _ => (Node::Char(c), true),
@@ -459,7 +499,7 @@ impl Parser<'_> {
             }
             _ => {
                 if let Some(set) = self.class_escape()? {
-                    return Some((Node::Class(Box::new(set)), true));
+                    return Some((class_node(set), true));
                 }
                 Some((Node::Char(self.char_escape(false)?), true))
             }
@@ -560,9 +600,9 @@ impl Parser<'_> {
         let negated = self.eat('^');
         let set = self.class_contents()?;
         if negated {
-            return Some(Node::Class(Box::new(set.complement()?)));
+            return Some(class_node(set.complement()?));
         }
-        Some(Node::Class(Box::new(set)))
+        Some(class_node(set))
     }
 
     /// The v flag's ClassContents: a union with ranges, or operands joined
@@ -637,7 +677,7 @@ impl Parser<'_> {
         match char::from_u32(c)? {
             '[' => {
                 let negated = self.eat('^');
-                let set = self.class_contents()?;
+                let set = self.nested(Self::class_contents)?;
                 Some(Operand::Set(if negated { set.complement()? } else { set }))
             }
             '\\' => {
@@ -722,6 +762,17 @@ type Caps = Vec<Option<(usize, usize)>>;
 struct Matcher<'a> {
     text: &'a [u32],
     steps: Cell<u32>,
+    budget: &'a Cell<u32>,
+    /// Where the stack was when the match began.
+    stack_top: usize,
+}
+
+/// The address of a local in the caller's frame, to see how far the stack
+/// has grown between two calls. Either direction of growth works.
+#[inline(always)]
+fn stack_address() -> usize {
+    let here = 0u8;
+    std::hint::black_box(std::ptr::addr_of!(here)) as usize
 }
 
 impl Matcher<'_> {
@@ -733,20 +784,38 @@ impl Matcher<'_> {
         caps: &mut Caps,
         k: &mut dyn FnMut(usize, &mut Caps) -> bool,
     ) -> bool {
-        let steps = self.steps.get() + 1;
-        self.steps.set(steps);
-        if steps > STEP_LIMIT {
+        if !self.step() || self.stack_top.abs_diff(stack_address()) > MATCH_STACK_LIMIT {
             return false;
         }
+        self.run_node(node, pos, caps, k)
+    }
+
+    /// Takes one step from this match's limit and the select's budget.
+    fn step(&self) -> bool {
+        let steps = self.steps.get() + 1;
+        self.steps.set(steps);
+        let left = self.budget.get();
+        if steps > STEP_LIMIT || left == 0 {
+            return false;
+        }
+        self.budget.set(left - 1);
+        true
+    }
+
+    fn run_node(
+        &self,
+        node: &Node,
+        pos: usize,
+        caps: &mut Caps,
+        k: &mut dyn FnMut(usize, &mut Caps) -> bool,
+    ) -> bool {
         let text = self.text;
         match node {
             Node::Empty => k(pos, caps),
             Node::Char(c) => text.get(pos) == Some(c) && k(pos + 1, caps),
             Node::Any => text.get(pos).is_some_and(|&c| !is_line_terminator(c)) && k(pos + 1, caps),
-            Node::Class(set) => {
+            Node::Class(set, strings) => {
                 // Strings first, longest first, then one code point.
-                let mut strings: Vec<&Vec<u32>> = set.strings.iter().collect();
-                strings.sort_by_key(|s| std::cmp::Reverse(s.len()));
                 for s in strings {
                     if text[pos..].starts_with(s) && k(pos + s.len(), caps) {
                         return true;
@@ -784,7 +853,10 @@ impl Matcher<'_> {
                 max,
                 greedy,
                 groups,
-            } => self.repeat(node, *min, *max, *greedy, *groups, 0, pos, caps, k),
+            } => match one_char(node) {
+                Some(fits) => self.repeat_chars(&fits, *min, *max, *greedy, pos, caps, k),
+                None => self.repeat(node, *min, *max, *greedy, *groups, 0, pos, caps, k),
+            },
             Node::Look {
                 node,
                 ahead,
@@ -844,6 +916,40 @@ impl Matcher<'_> {
         }
     }
 
+    /// A repeat of something that matches exactly one character, as a loop:
+    /// it can't capture or match empty, so trying each count from the most
+    /// (or, lazily, the fewest) is the same as recursing, without a stack
+    /// frame per character.
+    #[allow(clippy::too_many_arguments)]
+    fn repeat_chars(
+        &self,
+        fits: &dyn Fn(u32) -> bool,
+        min: u32,
+        max: Option<u32>,
+        greedy: bool,
+        pos: usize,
+        caps: &mut Caps,
+        k: &mut dyn FnMut(usize, &mut Caps) -> bool,
+    ) -> bool {
+        let limit = max.map_or(usize::MAX, |m| m as usize);
+        let mut most = 0;
+        while most < limit && self.text.get(pos + most).is_some_and(|&c| fits(c)) {
+            if !self.step() {
+                return false;
+            }
+            most += 1;
+        }
+        let min = min as usize;
+        if most < min {
+            return false;
+        }
+        if greedy {
+            (min..=most).rev().any(|n| self.step() && k(pos + n, caps))
+        } else {
+            (min..=most).any(|n| self.step() && k(pos + n, caps))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn repeat(
         &self,
@@ -892,14 +998,27 @@ impl Matcher<'_> {
     }
 }
 
+/// What a node that always matches exactly one character accepts, or None
+/// for any other node.
+fn one_char(node: &Node) -> Option<Box<dyn Fn(u32) -> bool + '_>> {
+    match node {
+        Node::Char(c) => Some(Box::new(move |x| x == *c)),
+        Node::Any => Some(Box::new(|x| !is_line_terminator(x))),
+        Node::Class(set, strings) if strings.is_empty() => Some(Box::new(move |x| set.contains(x))),
+        Node::Group(inner, None) => one_char(inner),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Pattern;
 
     fn m(pattern: &str, value: &str) -> bool {
+        let budget = std::cell::Cell::new(super::SELECT_STEP_LIMIT);
         Pattern::compile(pattern)
             .unwrap_or_else(|| panic!("{pattern} doesn't compile"))
-            .matches(value)
+            .matches(value, &budget)
     }
 
     #[test]
@@ -996,6 +1115,67 @@ mod tests {
     #[test]
     fn runaway_backtracking_gives_up() {
         let p = Pattern::compile("(a+)+b").unwrap();
-        assert!(!p.matches(&"a".repeat(40)));
+        let budget = std::cell::Cell::new(super::SELECT_STEP_LIMIT);
+        assert!(!p.matches(&"a".repeat(40), &budget));
+    }
+
+    /// Runs `f` on a thread with a small stack, as a Python worker's can
+    /// be, so a frame per character or per nesting level fails here rather
+    /// than passing by luck on a big main-thread stack.
+    fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn deep_nesting_doesnt_compile() {
+        on_small_stack(|| {
+            assert!(
+                Pattern::compile(&format!("{}a{}", "(".repeat(10_000), ")".repeat(10_000)))
+                    .is_none()
+            );
+            assert!(
+                Pattern::compile(&format!("{}a{}", "[".repeat(10_000), "]".repeat(10_000)))
+                    .is_none()
+            );
+            // 32 deep still compiles.
+            assert!(m(&format!("{}a{}", "(".repeat(32), ")".repeat(32)), "a"));
+            assert!(m(&format!("{}a{}", "[".repeat(32), "]".repeat(32)), "a"));
+        });
+    }
+
+    #[test]
+    fn long_values_dont_recurse_per_character() {
+        on_small_stack(|| {
+            let long = "a".repeat(100_000);
+            assert!(m("a*", &long));
+            assert!(m("[a-z]+", &long));
+            assert!(m(".*?", &long));
+            assert!(m("(?:a)*", &long));
+            assert!(!m("a*b", &long));
+            assert!(m("a{3,5}b", "aaaab"));
+            assert!(!m("a{3,5}", "aaaaaa"));
+            // A repeat that captures recurses, and gives up past the stack
+            // limit instead of overflowing.
+            assert!(!m("(a)*", &long));
+            assert!(m("(a)*", "aaaa"));
+        });
+    }
+
+    #[test]
+    fn a_select_shares_one_budget() {
+        let p = Pattern::compile("(a+)+b").unwrap();
+        let budget = std::cell::Cell::new(super::SELECT_STEP_LIMIT);
+        let value = "a".repeat(40);
+        for _ in 0..20 {
+            assert!(!p.matches(&value, &budget));
+        }
+        assert_eq!(budget.get(), 0);
+        // Once it's spent, even an easy match gives up.
+        assert!(!Pattern::compile("a").unwrap().matches("a", &budget));
     }
 }

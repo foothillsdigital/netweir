@@ -6,6 +6,8 @@
 //! element a query runs from, and ids and classes compare exactly except
 //! in a quirks-mode document.
 
+use std::cell::Cell;
+
 use crate::dom::{AttrNs, Data, Document, NodeId, Ns, Quirks};
 use crate::pattern::Pattern;
 use crate::tags::Tag;
@@ -1095,7 +1097,7 @@ impl SelectorList {
     /// Whether `el` matches, with `scope` as `:scope` (the root element
     /// when `None`).
     pub fn matches(&self, doc: &Document, el: NodeId, scope: Option<NodeId>) -> bool {
-        let cx = Cx { doc, scope };
+        let cx = Cx::new(doc, scope);
         self.0.iter().any(|c| cx.complex(c, 0, el, el))
     }
 
@@ -1103,10 +1105,7 @@ impl SelectorList {
     /// browser, combinators look past `scope`: `article .price` run on an
     /// article matches the prices inside it.
     pub fn select(&self, doc: &Document, scope: NodeId) -> Vec<NodeId> {
-        let cx = Cx {
-            doc,
-            scope: Some(scope),
-        };
+        let cx = Cx::new(doc, Some(scope));
         let mut out = Vec::new();
         // A walk by the tree's own links, in document order: down to the
         // first child, else along to the next sibling, else back up.
@@ -1150,6 +1149,8 @@ fn push_children_reversed(doc: &Document, n: NodeId, stack: &mut Vec<NodeId>) {
 struct Cx<'a> {
     doc: &'a Document,
     scope: Option<NodeId>,
+    /// Steps left for `pattern` matches in this query, shared by all of them.
+    pattern_budget: Cell<u32>,
 }
 
 /// HTML attributes whose values selectors compare without case, unless the
@@ -1210,7 +1211,15 @@ fn is_space_char(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C')
 }
 
-impl Cx<'_> {
+impl<'a> Cx<'a> {
+    fn new(doc: &'a Document, scope: Option<NodeId>) -> Self {
+        Cx {
+            doc,
+            scope,
+            pattern_budget: Cell::new(crate::pattern::SELECT_STEP_LIMIT),
+        }
+    }
+
     fn parent_element(&self, n: NodeId) -> Option<NodeId> {
         self.doc
             .parent(n)
@@ -1583,9 +1592,11 @@ impl Cx<'_> {
             return true;
         };
         if multiple {
-            value.split(',').all(|v| pattern.matches(v))
+            value
+                .split(',')
+                .all(|v| pattern.matches(v, &self.pattern_budget))
         } else {
-            pattern.matches(value)
+            pattern.matches(value, &self.pattern_budget)
         }
     }
 
