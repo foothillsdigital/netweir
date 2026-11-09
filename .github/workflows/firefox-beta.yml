@@ -1,0 +1,78 @@
+name: firefox-beta
+
+# Netweir starts Firefox through a path Mozilla calls experimental: the
+# remote.experimental prefs, the container and the start at runtime. Each
+# week this runs the Firefox tests against the newest Beta, so a change
+# there shows about four weeks before it reaches the release Netweir pins,
+# and the pin moves only when this passes.
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  firefox-beta:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      NETWEIR_TEST_ENGINE: firefox
+      NETWEIR_REQUIRE_FIREFOX: "1"
+      RUSTFLAGS: --cfg pyo3_disable_reference_pool
+    steps:
+      # As in ci.yml's test job.
+      - if: runner.os == 'macOS'
+        run: sudo mdutil -i off / /System/Volumes/Data
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.14"
+      - run: uv sync
+      - run: uv run maturin develop --uv
+      # The Beta's checksums come from its SHA256SUMS, which must carry a
+      # good signature from Mozilla's release key, pinned here by its
+      # fingerprint. The installer then checks the download against them
+      # as it does the pinned release.
+      - name: Install the newest Firefox Beta
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          version=$(curl -fsS https://product-details.mozilla.org/1.0/firefox_versions.json | jq -r .LATEST_FIREFOX_DEVEL_VERSION)
+          base=https://archive.mozilla.org/pub/firefox/releases
+          for f in SHA256SUMS SHA256SUMS.asc KEY; do curl -fsSO "$base/$version/$f"; done
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          gpg --batch --quiet --import KEY
+          gpg --batch --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS > verified 2>/dev/null
+          grep -Eq '^\[GNUPG:\] VALIDSIG .* 14F26682D0916CDD81E37B6D61B7B526D98F0353$' verified
+          case "$RUNNER_OS" in
+            Linux) platform=linux-x86_64 file="firefox-$version.tar.xz" ;;
+            macOS) platform=mac file="Firefox $version.dmg" ;;
+            Windows) platform=win64 file="Firefox Setup $version.exe" ;;
+          esac
+          sum=$(awk -v p="$platform/en-US/$file" 'substr($0, 67) == p { print $1 }' SHA256SUMS)
+          [ ${#sum} = 64 ]
+          exe=$(uv run python -c 'import sys; from netweir._native import install_firefox; print(install_firefox(sys.argv[1], None, sys.argv[2], [(sys.argv[3], sys.argv[4])])[1])' "$base" "$version" "$platform" "$sum")
+          echo "NETWEIR_FIREFOX=$exe" >> "$GITHUB_ENV"
+          echo "Firefox $version, SHA-256 $sum" >> "$GITHUB_STEP_SUMMARY"
+      # A display on Linux, for the headed Firefox the stealth test
+      # compares; the other systems' runners have one.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends xvfb
+      - run: ${{ runner.os == 'Linux' && 'xvfb-run -a ' || '' }}cargo test --no-fail-fast -p netweir-browser --test firefox --test stealth_firefox --test actions --test page --test events --test steps --test network --test storage
+        timeout-minutes: 30

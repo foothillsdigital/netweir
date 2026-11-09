@@ -6,7 +6,10 @@
 //! element a query runs from, and ids and classes compare exactly except
 //! in a quirks-mode document.
 
+use std::cell::Cell;
+
 use crate::dom::{AttrNs, Data, Document, NodeId, Ns, Quirks};
+use crate::pattern::Pattern;
 use crate::tags::Tag;
 
 /// A selector that couldn't be parsed, and why.
@@ -130,6 +133,8 @@ enum Pseudo {
     ReadWrite,
     ReadOnly,
     PlaceholderShown,
+    /// `:lang()`'s language ranges, lowercased.
+    Lang(Vec<String>),
     Default,
     Indeterminate,
     InRange,
@@ -647,6 +652,26 @@ impl<'a> Parser<'a> {
                     of,
                 }
             }
+            "lang" => {
+                let mut ranges = Vec::new();
+                loop {
+                    self.skip_space();
+                    // A wildcard such as *-CH can't be a name, so it's quoted.
+                    let range = match self.peek() {
+                        Some(q @ ('"' | '\'')) => {
+                            self.pos += 1;
+                            self.string(q)?
+                        }
+                        _ => self.ident()?,
+                    };
+                    ranges.push(range.to_ascii_lowercase());
+                    self.skip_space();
+                    if !self.eat(',') {
+                        break;
+                    }
+                }
+                Pseudo::Lang(ranges)
+            }
             _ => return error(format!(":{name}() isn't supported")),
         })
     }
@@ -689,6 +714,37 @@ impl<'a> Parser<'a> {
         }
         b.len()
     }
+}
+
+/// Whether a language `tag` matches a `range`, both lowercase, by RFC 4647's
+/// extended filtering as Selectors 4 uses it: `de` matches `de-CH`, `de-CH`
+/// matches `de-Latn-CH`, and `*` stands for any subtag. Subtags the range
+/// leaves out match anything, but never past a one-letter one such as `x`.
+fn lang_matches(range: &str, tag: &str) -> bool {
+    if range.is_empty() || tag.is_empty() {
+        return range == tag;
+    }
+    let r: Vec<&str> = range.split('-').collect();
+    let t: Vec<&str> = tag.split('-').collect();
+    if r[0] != "*" && r[0] != t[0] {
+        return false;
+    }
+    let (mut i, mut j) = (1, 1);
+    while i < r.len() {
+        if r[i] == "*" {
+            i += 1;
+        } else if j >= t.len() {
+            return false;
+        } else if r[i] == t[j] {
+            i += 1;
+            j += 1;
+        } else if t[j].len() == 1 {
+            return false;
+        } else {
+            j += 1;
+        }
+    }
+    true
 }
 
 /// An `<input>`'s type as the HTML Standard reads it: a known type in any
@@ -1094,7 +1150,7 @@ impl SelectorList {
     /// Whether `el` matches, with `scope` as `:scope` (the root element
     /// when `None`).
     pub fn matches(&self, doc: &Document, el: NodeId, scope: Option<NodeId>) -> bool {
-        let cx = Cx { doc, scope };
+        let cx = Cx::new(doc, scope);
         self.0.iter().any(|c| cx.complex(c, 0, el, el))
     }
 
@@ -1102,10 +1158,7 @@ impl SelectorList {
     /// browser, combinators look past `scope`: `article .price` run on an
     /// article matches the prices inside it.
     pub fn select(&self, doc: &Document, scope: NodeId) -> Vec<NodeId> {
-        let cx = Cx {
-            doc,
-            scope: Some(scope),
-        };
+        let cx = Cx::new(doc, Some(scope));
         let mut out = Vec::new();
         // A walk by the tree's own links, in document order: down to the
         // first child, else along to the next sibling, else back up.
@@ -1149,6 +1202,8 @@ fn push_children_reversed(doc: &Document, n: NodeId, stack: &mut Vec<NodeId>) {
 struct Cx<'a> {
     doc: &'a Document,
     scope: Option<NodeId>,
+    /// Steps left for `pattern` matches in this query, shared by all of them.
+    pattern_budget: Cell<u32>,
 }
 
 /// HTML attributes whose values selectors compare without case, unless the
@@ -1209,7 +1264,15 @@ fn is_space_char(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C')
 }
 
-impl Cx<'_> {
+impl<'a> Cx<'a> {
+    fn new(doc: &'a Document, scope: Option<NodeId>) -> Self {
+        Cx {
+            doc,
+            scope,
+            pattern_budget: Cell::new(crate::pattern::SELECT_STEP_LIMIT),
+        }
+    }
+
     fn parent_element(&self, n: NodeId) -> Option<NodeId> {
         self.doc
             .parent(n)
@@ -1320,6 +1383,27 @@ impl Cx<'_> {
         } else {
             a == b
         }
+    }
+
+    /// The element's language: the nearest `xml:lang` or `lang` on it or
+    /// an ancestor, `xml:lang` first, as HTML has it. None when nothing says.
+    fn lang(&self, el: NodeId) -> Option<&str> {
+        let mut at = Some(el);
+        while let Some(n) = at {
+            let mut plain = None;
+            for (ns, name, value) in self.doc.attrs(n) {
+                match (ns, name) {
+                    (AttrNs::Xml, "lang") => return Some(value),
+                    (AttrNs::None, "lang") => plain = Some(value),
+                    _ => {}
+                }
+            }
+            if plain.is_some() {
+                return plain;
+            }
+            at = self.doc.parent(n);
+        }
+        None
     }
 
     /// Whether `el` is an `<input>` whose type, in any case, is one of `types`.
@@ -1503,9 +1587,8 @@ impl Cx<'_> {
     /// Whether a form control satisfies its constraints, None when it's
     /// barred from validation. The static document's value is the `value`
     /// attribute, or a textarea's text. Only what the markup decides is
-    /// checked: not `pattern` (no JavaScript-compatible regular
-    /// expressions here yet), nor too long, too short or bad input, which
-    /// only someone typing can cause.
+    /// checked: not too long, too short or bad input, which only someone
+    /// typing can cause.
     fn control_valid(&self, el: NodeId) -> Option<bool> {
         let e = self.doc.element(el)?;
         if e.ns != Ns::Html || self.disabled(el, e.tag) || self.in_datalist(el) {
@@ -1550,6 +1633,10 @@ impl Cx<'_> {
                 if value.is_empty() {
                     return !required;
                 }
+                let multiple = typ == "email" && self.attr(el, "multiple").is_some();
+                if !self.pattern_fits(el, typ, &value, multiple) {
+                    return false;
+                }
                 match typ {
                     "email" if self.attr(el, "multiple").is_some() => {
                         value.split(',').all(valid_email)
@@ -1562,6 +1649,28 @@ impl Cx<'_> {
                     _ => true,
                 }
             }
+        }
+    }
+
+    /// Whether the value matches `pattern`, for the types it applies to:
+    /// each value of a multiple email. A pattern that doesn't compile counts
+    /// as none, as the standard says.
+    fn pattern_fits(&self, el: NodeId, typ: &str, value: &str, multiple: bool) -> bool {
+        if !matches!(
+            typ,
+            "text" | "search" | "tel" | "url" | "email" | "password"
+        ) {
+            return true;
+        }
+        let Some(pattern) = self.attr(el, "pattern").and_then(Pattern::compile) else {
+            return true;
+        };
+        if multiple {
+            value
+                .split(',')
+                .all(|v| pattern.matches(v, &self.pattern_budget))
+        } else {
+            pattern.matches(value, &self.pattern_budget)
         }
     }
 
@@ -1872,6 +1981,10 @@ impl Cx<'_> {
                 Tag::Textarea => self.attr(el, "placeholder").is_some() && doc.text(el).is_empty(),
                 _ => false,
             },
+            Pseudo::Lang(ranges) => self.lang(el).is_some_and(|tag| {
+                let tag = tag.to_ascii_lowercase();
+                ranges.iter().any(|range| lang_matches(range, &tag))
+            }),
             Pseudo::Never => false,
         }
     }

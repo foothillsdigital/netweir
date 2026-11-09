@@ -4296,6 +4296,10 @@ async fn content(page: &netweir_browser::Page) -> Result<String, FetchError> {
 /// proxy for all its pages, so rotation stops at its door.
 fn browser_launch(shared: &Shared) -> LaunchOptions {
     let mut launch = shared.settings.browser_launch.clone();
+    if launch.engine == netweir_browser::Engine::Firefox {
+        // Firefox takes no proxy here, and has no client hints to brand.
+        return launch;
+    }
     let mut state = shared.lock();
     if launch.proxy.is_none() {
         launch.proxy = match shared.settings.proxy_rotation {
@@ -4379,10 +4383,10 @@ fn browser_error(e: netweir_browser::Error) -> FetchError {
     }
 }
 
-/// Gives the host an HTTP session holding the cookies Chrome earned, so
-/// its next requests don't need Chrome. A site may tie those cookies to
+/// Gives the host an HTTP session holding the cookies the browser earned,
+/// so its next requests don't need it. A site may tie those cookies to
 /// the browser they were issued to, so the session looks like the same
-/// Chrome when netweir has its profile. When it doesn't, the session keeps
+/// Chrome or Firefox when netweir has its profile. When it doesn't, the session keeps
 /// the crawl's profile and a warning (returned, once) says so.
 fn hand_back(
     shared: &Shared,
@@ -4392,20 +4396,18 @@ fn hand_back(
     version: &str,
     said: &[(String, String)],
 ) -> Option<String> {
-    let major = version
-        .trim_start_matches("Chrome/")
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    // "Chrome/154.0.8037.98" or "Firefox/159.0.1".
+    let (family, number) = version.split_once('/').unwrap_or(("Chrome", version));
+    let family = family.to_ascii_lowercase();
+    let major = number.split('.').next().unwrap_or_default();
     let mut options = shared.options.clone();
     let mut warning = None;
     if !options
         .profile
         .name
-        .starts_with(&format!("chrome-{major}-"))
+        .starts_with(&format!("{family}-{major}-"))
     {
-        match Profile::for_chrome(&major) {
+        match Profile::for_browser(&family, major) {
             Some(profile) => options.profile = profile,
             None if !state.warned_profile => {
                 state.warned_profile = true;

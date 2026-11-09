@@ -192,6 +192,28 @@ class FakeChrome:
         return FakeTab("<html><body><main><h1>Café</h1><p>Crème brûlée, à la carte.</p></main>")
 
 
+def test_the_browser_is_the_engine_asked_for(monkeypatch):
+    asked = []
+    monkeypatch.setattr(FakeChrome, "started", 0)
+
+    async def browser(**kwargs):
+        asked.append(kwargs["engine"])
+        return FakeChrome(dies=False)
+
+    monkeypatch.setattr(netweir, "browser", browser)
+
+    async def go(engine):
+        async with Client(_mcp.server(engine=engine)) as client:
+            return await client.call_tool("read_page", {"url": "https://e.com/", "browser": True})
+
+    assert not asyncio.run(go("firefox")).is_error
+    assert asked == ["firefox"]
+    with pytest.raises(ValueError, match="a proxy can't go with Firefox"):
+        _mcp.server(proxy="http://127.0.0.1:1", engine="firefox")
+    with pytest.raises(ValueError, match='engine must be "chrome" or "firefox"'):
+        _mcp.server(engine="safari")
+
+
 def test_chrome_pages_read_as_utf8_and_a_dead_chrome_is_replaced(monkeypatch):
     async def browser(**kwargs):
         return FakeChrome(dies=FakeChrome.started == 0)

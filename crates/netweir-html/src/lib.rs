@@ -5,6 +5,7 @@ pub mod css;
 mod dom;
 mod edit;
 mod entities;
+mod pattern;
 mod serialize;
 mod tags;
 pub mod tokenizer;
@@ -12,7 +13,7 @@ mod tree;
 
 pub use dom::{AttrNs, Document, Kind, MAX_INPUT, NodeId, Ns, Quirks};
 pub use edit::EditError;
-pub use tree::{Options, ParseError, parse, parse_fragment, parse_with};
+pub use tree::{Options, ParseError, parse, parse_fragment, parse_fragment_with, parse_with};
 
 // A parsed document and a parsed selector can be read from many threads at
 // once (writing takes `&mut`, so one at a time). This fails the build if a

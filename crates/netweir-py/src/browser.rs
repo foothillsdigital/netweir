@@ -1,5 +1,5 @@
-//! Bindings for netweir-browser. Every method that talks to Chrome returns
-//! an awaitable.
+//! Bindings for netweir-browser. Every method that talks to the browser
+//! returns an awaitable.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -65,9 +65,9 @@ fn seconds(name: &str, value: Option<f64>) -> PyResult<Option<Duration>> {
     }
 }
 
-/// Starts Chrome. Resolves to a Browser.
+/// Starts Chrome, or Firefox (`engine="firefox"`). Resolves to a Browser.
 #[pyfunction]
-#[pyo3(signature = (executable=None, headless=true, args=Vec::new(), timeout=30.0, proxy=None, connect=None, user_data_dir=None, dialog_pause=(0.5, 1.5), environment=None, worker_header_order=false))]
+#[pyo3(signature = (executable=None, headless=true, args=Vec::new(), timeout=30.0, proxy=None, connect=None, user_data_dir=None, dialog_pause=(0.5, 1.5), environment=None, worker_header_order=false, engine="chrome", stealth=true))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch<'py>(
     py: Python<'py>,
@@ -81,7 +81,18 @@ pub(crate) fn launch<'py>(
     dialog_pause: (f64, f64),
     environment: Option<Bound<'py, PyDict>>,
     worker_header_order: bool,
+    engine: &str,
+    stealth: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let engine = match engine {
+        "chrome" => netweir_browser::Engine::Chrome,
+        "firefox" => netweir_browser::Engine::Firefox,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "engine must be \"chrome\" or \"firefox\", not {other:?}"
+            )));
+        }
+    };
     let environment = crate::environment::environment_from(environment.as_ref())?;
     let (least, most) = dialog_pause;
     let dialog_pause = match (
@@ -115,16 +126,17 @@ pub(crate) fn launch<'py>(
     }
     let timeout = seconds("timeout", Some(timeout))?.expect("checked above");
     let options = LaunchOptions {
-        // Python asks for Firefox once its engine is complete.
-        engine: netweir_browser::Engine::Chrome,
-        stealth: true,
+        engine,
+        stealth,
         executable,
         headless,
         args,
         timeout,
         proxy,
         // Chrome for Testing presents itself as Google Chrome would.
-        brands: Some(Arc::new(netweir_core::Profile::chrome_brands)),
+        // Firefox sends no client hints, so has no brands.
+        brands: (engine == netweir_browser::Engine::Chrome)
+            .then(|| Arc::new(netweir_core::Profile::chrome_brands) as _),
         user_data_dir,
         dialog_pause,
         environment,
@@ -140,7 +152,7 @@ pub(crate) fn launch<'py>(
     })
 }
 
-/// A running Chrome. Closing it closes every page.
+/// A running Chrome or Firefox. Closing it closes every page.
 #[pyclass(frozen, module = "netweir")]
 pub struct Browser {
     inner: CoreBrowser,
@@ -148,10 +160,27 @@ pub struct Browser {
 
 #[pymethods]
 impl Browser {
-    /// Chrome's version, such as "Chrome/154.0.8037.98".
+    /// The browser's version, such as "Chrome/154.0.8037.98" or
+    /// "Firefox/159.0.1".
     #[getter]
     fn version(&self) -> String {
         self.inner.version().to_string()
+    }
+
+    /// Which browser this is: "chrome" or "firefox".
+    #[getter]
+    fn engine(&self) -> &'static str {
+        match self.inner.engine_info().engine {
+            netweir_browser::Engine::Chrome => "chrome",
+            netweir_browser::Engine::Firefox => "firefox",
+        }
+    }
+
+    /// Whether pages can't tell the browser is driven: false only for a
+    /// Firefox launched with `stealth=False`, in automation mode.
+    #[getter]
+    fn stealth(&self) -> bool {
+        self.inner.engine_info().stealth
     }
 
     #[getter]

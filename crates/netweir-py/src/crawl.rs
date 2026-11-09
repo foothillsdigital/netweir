@@ -1058,7 +1058,7 @@ impl Crawler {
         http_auth=None, saved_logins=Vec::new(),
         xml_recover=false, parse_timeout=Some(10.0),
         browser_environment=None, browser_worker_header_order=false, browser_steps=None,
-        browser_steps_max=Some(120.0),
+        browser_steps_max=Some(120.0), browser_engine="chrome",
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1116,6 +1116,7 @@ impl Crawler {
         browser_worker_header_order: bool,
         browser_steps: Option<&str>,
         browser_steps_max: Option<f64>,
+        browser_engine: &str,
         py: Python<'_>,
     ) -> PyResult<Crawler> {
         let environment = crate::environment::environment_from(browser_environment.as_ref())?;
@@ -1180,7 +1181,7 @@ impl Crawler {
             Some(s) => Some(seconds("cache_expiry", s)?),
             None => None,
         };
-        let settings = CrawlSettings {
+        let mut settings = CrawlSettings {
             concurrency,
             per_domain,
             obey_robots,
@@ -1247,6 +1248,30 @@ impl Crawler {
             max_redirects,
         )?;
         options.max_body = max_response_size;
+        // "match" goes by the HTTP profile, so the browser a site sees is
+        // the one the crawl's requests look like.
+        let firefox = match browser_engine {
+            "chrome" => false,
+            "firefox" => true,
+            "match" => options.profile.name.starts_with("firefox-"),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "browser_engine must be \"chrome\", \"firefox\" or \"match\", not \
+                     {browser_engine:?}"
+                )));
+            }
+        };
+        if firefox {
+            // Asked for by any request with browser=True, whatever
+            // `browser` says.
+            if options.proxy.is_some() || !settings.proxies.is_empty() {
+                return Err(PyValueError::new_err(
+                    "Firefox can't go through a proxy in a crawl yet, so a crawl with a proxy or \
+                     proxies uses browser_engine=\"chrome\"",
+                ));
+            }
+            settings.browser_launch.engine = netweir_browser::Engine::Firefox;
+        }
         // The scheduler runs on the shared runtime.
         let core = match queue {
             Some(url) => {

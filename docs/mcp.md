@@ -39,7 +39,9 @@ or run it as `python -m netweir mcp` with the right Python.
 
 `--profile` picks the browser the requests look like (`chrome` by
 default), `--proxy` sends them through a proxy, and `--timeout` sets how
-long each one may take, in seconds (30 by default).
+long each one may take, in seconds (30 by default). `--engine firefox`
+loads the pages a tool asks for with `browser=true` in Firefox instead of
+Chrome; it can't go with `--proxy` yet.
 
 ## The tools
 

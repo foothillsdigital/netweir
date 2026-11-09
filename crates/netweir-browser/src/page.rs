@@ -3420,7 +3420,7 @@ impl Page {
     /// The request headers the page sends whose values its environment
     /// sets: its user agent and client hints, where it changes them, and
     /// its Accept-Language. For an HTTP client that's to look like the
-    /// same Chrome, as a crawl's does when Chrome hands it a site's
+    /// same browser, as a crawl's does when the browser hands it a site's
     /// cookies.
     pub fn request_headers(&self) -> Vec<(String, String)> {
         let e = lock_env(&self.inner.env);
@@ -3436,6 +3436,11 @@ impl Page {
                 "sec-ch-ua-platform".into(),
                 format!("\"{}\"", m["platform"].as_str().unwrap_or_default()),
             ));
+        } else if self.is_firefox()
+            && let Some(user_agent) = &e.env.user_agent
+        {
+            // Firefox has no client hints: its user agent is all of it.
+            out.push(("User-Agent".to_string(), user_agent.clone()));
         }
         if !e.languages.is_empty() {
             out.push((

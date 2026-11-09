@@ -297,6 +297,30 @@ fn selectors_read_as_css_reads_them() {
 }
 
 #[test]
+fn lang_matches_the_nearest_language_by_extended_filtering() {
+    let html = r#"<div id="ch" lang="de-CH"><p id="in">x</p></div>
+<p id="latn" lang="de-Latn-CH">a</p><p id="en" lang="EN-gb">b</p><p id="fr" lang="fr">c</p>
+<p id="none">d</p><p id="private" lang="de-x-CH">e</p>
+<div id="outer" lang="de"><p id="inner" lang="en">f</p></div>
+<svg id="svg" xml:lang="fr" lang="de"></svg>"#;
+    assert_eq!(
+        select(html, ":lang(de)"),
+        ["div#ch", "p#in", "p#latn", "p#private", "div#outer"]
+    );
+    assert_eq!(select(html, ":lang(de-CH)"), ["div#ch", "p#in", "p#latn"]);
+    assert_eq!(select(html, ":lang('*-CH')"), ["div#ch", "p#in", "p#latn"]);
+    assert_eq!(
+        select(html, ":lang(en, fr)"),
+        ["p#en", "p#fr", "p#inner", "svg#svg"]
+    );
+    assert_eq!(select(html, ":lang(EN-GB)"), ["p#en"]);
+    assert_eq!(select(html, "p:lang(e)"), Vec::<String>::new());
+    // xml:lang wins over lang on the same element.
+    assert_eq!(select(html, "svg:lang(de)"), Vec::<String>::new());
+    assert!(SelectorList::parse(":lang()").is_err());
+}
+
+#[test]
 fn default_and_indeterminate_follow_the_markup() {
     let html = r#"<form id="f">
 <input type="text" name="t"><button id="first" type="button">no</button>
@@ -424,6 +448,46 @@ fn valid_and_invalid_follow_the_constraints_the_markup_sets() {
         ["form#f", "fieldset#fs"]
     );
     assert_eq!(select(html, "form:valid"), ["form#g"]);
+}
+
+#[test]
+fn valid_checks_pattern_as_javascript_reads_it() {
+    let html = r#"<input id="three" pattern="\d{3}" value="123"><input id="four" pattern="\d{3}" value="1234">
+<input id="upper" pattern="[a-z]+" value="abC"><input id="arabic" pattern="\d+" value="٣">
+<input id="minus" pattern="[\w--\d]+" value="ab_"><input id="minus-bad" pattern="[\w--\d]+" value="a1">
+<input id="and" pattern="[[a-z]&&[^aeiou]]+" value="bcd"><input id="and-bad" pattern="[[a-z]&&[^aeiou]]+" value="bad">
+<input id="alt" pattern="ab|cd" value="abcd">
+<input id="mails" type="email" multiple pattern=".+@x\.test" value="a@x.test, b@x.test">
+<input id="mails-bad" type="email" multiple pattern=".+@x\.test" value="a@x.test,b@y.test">
+<input id="broken" pattern="[" value="anything"><input id="prop" pattern="\p{L}+" value="123">
+<input id="redos" pattern="(a+)+b" value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">
+<input id="num" type="number" pattern="x" value="5"><input id="empty" pattern="x">"#;
+    assert_eq!(
+        select(html, ":invalid"),
+        [
+            "input#four",
+            "input#upper",
+            "input#arabic",
+            "input#minus-bad",
+            "input#and-bad",
+            "input#alt",
+            "input#mails-bad",
+            "input#redos"
+        ]
+    );
+    assert_eq!(
+        select(html, ":valid"),
+        [
+            "input#three",
+            "input#minus",
+            "input#and",
+            "input#mails",
+            "input#broken",
+            "input#prop",
+            "input#num",
+            "input#empty"
+        ]
+    );
 }
 
 #[test]

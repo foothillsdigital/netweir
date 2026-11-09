@@ -478,6 +478,7 @@ class Crawler:
         browser_worker_header_order: bool = False,
         browser_steps: str | None = None,
         browser_steps_max: float | None = 120.0,
+        browser_engine: Literal["chrome", "firefox", "match"] = "chrome",
     ) -> None: ...
     def add_rule(
         self,
@@ -758,6 +759,8 @@ def launch(
     dialog_pause: tuple[float, float] = (0.5, 1.5),
     environment: Environment | None = None,
     worker_header_order: bool = False,
+    engine: Literal["chrome", "firefox"] = "chrome",
+    stealth: bool = True,
 ) -> Awaitable[Browser]: ...
 def find_chrome() -> str: ...
 
@@ -805,6 +808,10 @@ def install_firefox(
 class Browser:
     @property
     def version(self) -> str: ...
+    @property
+    def engine(self) -> Literal["chrome", "firefox"]: ...
+    @property
+    def stealth(self) -> bool: ...
     @property
     def closed(self) -> bool: ...
     def start_tracing(

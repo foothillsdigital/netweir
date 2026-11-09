@@ -410,13 +410,44 @@ async fn no_firefox_for_a_platform_netweir_has_no_sum_for() {
 async fn a_firefox_version_that_isnt_one_isnt_made_a_folder() {
     let (base, hits) = serve("none", vec![]);
     let home = std::env::temp_dir().join(format!("netweir-install-ffbad-{}", std::process::id()));
-    let bad = FirefoxRelease {
-        version: "../../escaped",
-        sums: &[],
-    };
-    let err = install_firefox(&base, &home, &bad).await.unwrap_err();
-    assert!(err.contains("escaped"), "{err}");
+    for version in [
+        "../../escaped",
+        "",
+        "160.0b",
+        "160.0b5b1",
+        "160.b5.0",
+        "162.0a1",
+        "160.0b/5",
+    ] {
+        let bad = FirefoxRelease { version, sums: &[] };
+        let err = install_firefox(&base, &home, &bad).await.unwrap_err();
+        assert!(
+            err.contains("isn't a Firefox release version"),
+            "{version}: {err}"
+        );
+    }
     assert!(hits.lock().unwrap().is_empty());
+    assert!(!home.exists());
+}
+
+#[tokio::test]
+async fn a_firefox_beta_is_a_version() {
+    let Some(platform) = netweir_browser::firefox_platform() else {
+        return;
+    };
+    let (base, hits) = serve("none", vec![]);
+    let home = std::env::temp_dir().join(format!("netweir-install-ffbeta-{}", std::process::id()));
+    let beta = FirefoxRelease {
+        version: "160.0b5",
+        sums: &[("elsewhere", "00")],
+    };
+    // Past the version check, to the checksum this platform hasn't got.
+    let err = install_firefox(&base, &home, &beta).await.unwrap_err();
+    assert!(
+        err.contains(&format!("Firefox 160.0b5 on {platform}")),
+        "{err}"
+    );
+    assert!(hits.lock().unwrap().is_empty(), "nothing fetched");
     assert!(!home.exists());
 }
 
