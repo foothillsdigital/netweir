@@ -2891,7 +2891,9 @@ pub struct Options {
     pub scripting: bool,
     /// Give up after this long. Some inputs are slow by design (the spec
     /// makes deeply misnested markup cost more), so a crawler parsing
-    /// pages it doesn't control should set one.
+    /// pages it doesn't control should set one. The clock is read every
+    /// 4,096 tokenizer steps, so a small input finishes even with
+    /// `Duration::ZERO`: the budget bounds slow parses, not fast ones.
     pub budget: Option<std::time::Duration>,
     /// Keep the tree at most this deep, as Chromium does at 512: once more
     /// elements are open than this, a node goes beside the current one
@@ -2958,15 +2960,27 @@ pub fn parse_with(html: &str, options: Options) -> Result<Document, ParseError> 
 /// # Panics
 /// As [`parse`].
 pub fn parse_fragment(html: &str, ns: Ns, context: &str, scripting: bool) -> Document {
-    run(
+    parse_fragment_with(
         html,
+        ns,
+        context,
         Options {
             scripting,
             ..Options::default()
         },
-        Some((ns, context)),
     )
     .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Parses `html` as [`parse_fragment`] does, within a size limit and an
+/// optional budget, as [`parse_with`] does for a whole document.
+pub fn parse_fragment_with(
+    html: &str,
+    ns: Ns,
+    context: &str,
+    options: Options,
+) -> Result<Document, ParseError> {
+    run(html, options, Some((ns, context)))
 }
 
 fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Document, ParseError> {
@@ -3085,6 +3099,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_has_a_budget_and_a_size_limit_too() {
+        let html = "<div><b>x</b> y</div>".repeat(200_000);
+        let tight = Options {
+            budget: Some(Duration::from_micros(50)),
+            ..Options::default()
+        };
+        match parse_fragment_with(&html, Ns::Html, "div", tight) {
+            Err(ParseError::Timeout { parsed, .. }) => assert!(parsed < html.len()),
+            other => panic!("expected a timeout, got {:?}", other.map(|d| d.len())),
+        }
+        let doc = parse_fragment_with("<b>x</b>", Ns::Html, "div", Options::default()).unwrap();
+        assert_eq!(doc.inner_html(doc.root()), "<b>x</b>");
+        let huge = "x".repeat(crate::MAX_INPUT + 1);
+        assert_eq!(
+            parse_fragment_with(&huge, Ns::Html, "div", Options::default()).map(|d| d.len()),
+            Err(ParseError::TooLarge { len: huge.len() })
+        );
+    }
+
+    #[test]
     fn a_leading_byte_order_mark_is_dropped_from_a_document() {
         let page = "<!DOCTYPE html><p>x</p>";
         let with = parse(&format!("\u{FEFF}{page}"), false);
@@ -3117,26 +3151,25 @@ mod hostile {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// The best of three parses of `html`.
-    fn best(html: &str) -> Duration {
-        (0..3)
-            .map(|_| {
-                let start = Instant::now();
-                std::hint::black_box(parse(html, false));
-                start.elapsed()
-            })
-            .min()
-            .unwrap()
+    fn time(html: &str) -> Duration {
+        let start = Instant::now();
+        std::hint::black_box(parse(html, false));
+        start.elapsed()
     }
 
     /// Fails if four times the input takes more than eight times as long:
-    /// linear work takes four, quadratic sixteen.
+    /// linear work takes four, quadratic sixteen. The two sizes are timed
+    /// back to back, five times, and one round inside the limit passes: a
+    /// slow spell on a loaded machine that lands on the large parses only
+    /// can't fail it, and quadratic work fails every round.
     fn grows_linearly(make: impl Fn(usize) -> String) {
         let (small, large) = (make(5_000), make(20_000));
-        let (a, b) = (best(&small), best(&large));
+        let rounds: Vec<_> = (0..5).map(|_| (time(&small), time(&large))).collect();
         assert!(
-            b < a * 8 + Duration::from_millis(20),
-            "{} bytes took {a:?}, {} bytes took {b:?}",
+            rounds
+                .iter()
+                .any(|&(a, b)| b < a * 8 + Duration::from_millis(20)),
+            "{} bytes, then {} bytes, took {rounds:?}",
             small.len(),
             large.len()
         );

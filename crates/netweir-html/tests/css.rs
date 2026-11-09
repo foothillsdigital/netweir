@@ -297,6 +297,30 @@ fn selectors_read_as_css_reads_them() {
 }
 
 #[test]
+fn lang_matches_the_nearest_language_by_extended_filtering() {
+    let html = r#"<div id="ch" lang="de-CH"><p id="in">x</p></div>
+<p id="latn" lang="de-Latn-CH">a</p><p id="en" lang="EN-gb">b</p><p id="fr" lang="fr">c</p>
+<p id="none">d</p><p id="private" lang="de-x-CH">e</p>
+<div id="outer" lang="de"><p id="inner" lang="en">f</p></div>
+<svg id="svg" xml:lang="fr" lang="de"></svg>"#;
+    assert_eq!(
+        select(html, ":lang(de)"),
+        ["div#ch", "p#in", "p#latn", "p#private", "div#outer"]
+    );
+    assert_eq!(select(html, ":lang(de-CH)"), ["div#ch", "p#in", "p#latn"]);
+    assert_eq!(select(html, ":lang('*-CH')"), ["div#ch", "p#in", "p#latn"]);
+    assert_eq!(
+        select(html, ":lang(en, fr)"),
+        ["p#en", "p#fr", "p#inner", "svg#svg"]
+    );
+    assert_eq!(select(html, ":lang(EN-GB)"), ["p#en"]);
+    assert_eq!(select(html, "p:lang(e)"), Vec::<String>::new());
+    // xml:lang wins over lang on the same element.
+    assert_eq!(select(html, "svg:lang(de)"), Vec::<String>::new());
+    assert!(SelectorList::parse(":lang()").is_err());
+}
+
+#[test]
 fn default_and_indeterminate_follow_the_markup() {
     let html = r#"<form id="f">
 <input type="text" name="t"><button id="first" type="button">no</button>

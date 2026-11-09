@@ -2231,6 +2231,7 @@ pub(super) async fn close(page: &Page) -> Result<()> {
         let _ = browser
             .call("", "browser.removeUserContext", json!({"userContext": id}))
             .await;
+        browser.downloads.remove(Some(id));
     }
     match closed {
         Ok(_) | Err(Error::Closed) | Err(Error::Protocol { .. }) => Ok(()),

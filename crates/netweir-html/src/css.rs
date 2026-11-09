@@ -130,6 +130,8 @@ enum Pseudo {
     ReadWrite,
     ReadOnly,
     PlaceholderShown,
+    /// `:lang()`'s language ranges, lowercased.
+    Lang(Vec<String>),
     Default,
     Indeterminate,
     InRange,
@@ -647,6 +649,26 @@ impl<'a> Parser<'a> {
                     of,
                 }
             }
+            "lang" => {
+                let mut ranges = Vec::new();
+                loop {
+                    self.skip_space();
+                    // A wildcard such as *-CH can't be a name, so it's quoted.
+                    let range = match self.peek() {
+                        Some(q @ ('"' | '\'')) => {
+                            self.pos += 1;
+                            self.string(q)?
+                        }
+                        _ => self.ident()?,
+                    };
+                    ranges.push(range.to_ascii_lowercase());
+                    self.skip_space();
+                    if !self.eat(',') {
+                        break;
+                    }
+                }
+                Pseudo::Lang(ranges)
+            }
             _ => return error(format!(":{name}() isn't supported")),
         })
     }
@@ -689,6 +711,37 @@ impl<'a> Parser<'a> {
         }
         b.len()
     }
+}
+
+/// Whether a language `tag` matches a `range`, both lowercase, by RFC 4647's
+/// extended filtering as Selectors 4 uses it: `de` matches `de-CH`, `de-CH`
+/// matches `de-Latn-CH`, and `*` stands for any subtag. Subtags the range
+/// leaves out match anything, but never past a one-letter one such as `x`.
+fn lang_matches(range: &str, tag: &str) -> bool {
+    if range.is_empty() || tag.is_empty() {
+        return range == tag;
+    }
+    let r: Vec<&str> = range.split('-').collect();
+    let t: Vec<&str> = tag.split('-').collect();
+    if r[0] != "*" && r[0] != t[0] {
+        return false;
+    }
+    let (mut i, mut j) = (1, 1);
+    while i < r.len() {
+        if r[i] == "*" {
+            i += 1;
+        } else if j >= t.len() {
+            return false;
+        } else if r[i] == t[j] {
+            i += 1;
+            j += 1;
+        } else if t[j].len() == 1 {
+            return false;
+        } else {
+            j += 1;
+        }
+    }
+    true
 }
 
 /// An `<input>`'s type as the HTML Standard reads it: a known type in any
@@ -1322,6 +1375,27 @@ impl Cx<'_> {
         }
     }
 
+    /// The element's language: the nearest `xml:lang` or `lang` on it or
+    /// an ancestor, `xml:lang` first, as HTML has it. None when nothing says.
+    fn lang(&self, el: NodeId) -> Option<&str> {
+        let mut at = Some(el);
+        while let Some(n) = at {
+            let mut plain = None;
+            for (ns, name, value) in self.doc.attrs(n) {
+                match (ns, name) {
+                    (AttrNs::Xml, "lang") => return Some(value),
+                    (AttrNs::None, "lang") => plain = Some(value),
+                    _ => {}
+                }
+            }
+            if plain.is_some() {
+                return plain;
+            }
+            at = self.doc.parent(n);
+        }
+        None
+    }
+
     /// Whether `el` is an `<input>` whose type, in any case, is one of `types`.
     fn input_type(&self, el: NodeId, types: &[&str]) -> bool {
         self.attr(el, "type")
@@ -1872,6 +1946,10 @@ impl Cx<'_> {
                 Tag::Textarea => self.attr(el, "placeholder").is_some() && doc.text(el).is_empty(),
                 _ => false,
             },
+            Pseudo::Lang(ranges) => self.lang(el).is_some_and(|tag| {
+                let tag = tag.to_ascii_lowercase();
+                ranges.iter().any(|range| lang_matches(range, &tag))
+            }),
             Pseudo::Never => false,
         }
     }
