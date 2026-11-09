@@ -308,7 +308,8 @@ netweir.jmespath("props.items[].id", page.js_data("__STATE__"))
   what `js_data()` returned.
 
 They return plain Python values: dicts, lists, strings, numbers, None.
-Text that isn't JSON raises `ValueError`. For JavaScript objects that
+Text that isn't JSON raises `ValueError`; on a selection it names the result,
+such as `result 1 isn't JSON ('var x=1;': ...)`. For JavaScript objects that
 aren't strict JSON, read them with `js_data()` first and pass the result
 to `netweir.jmespath()`.
 
