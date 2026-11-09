@@ -204,14 +204,32 @@ impl Document {
     }
 
     /// Renames the element: lowercased for HTML, as given for the rest.
+    /// An element renamed to `template` gets empty contents, as a new one
+    /// does. A template renamed to anything else gives its contents up as
+    /// ordinary children, ahead of any it has, so its markup stays the same
+    /// and nothing in them is lost.
     pub fn rename(&mut self, id: NodeId, name: &str) {
         let Some(e) = self.element(id).copied() else {
             return;
         };
         let (tag, new) = self.name_element(e.ns, name);
+        let template = e.ns == Ns::Html && tag == Tag::Template;
+        let contents = if template && e.contents == NONE {
+            self.add(Data::Fragment)
+        } else if !template && e.contents != NONE {
+            let first = self.first_child(id).unwrap_or(NONE);
+            while let Some(child) = self.first_child(e.contents) {
+                self.detach(child);
+                self.insert(id, child, first);
+            }
+            NONE
+        } else {
+            e.contents
+        };
         if let Data::Element(e) = &mut self.nodes[id as usize].data {
             e.tag = tag;
             e.name = new;
+            e.contents = contents;
         }
     }
 
@@ -336,6 +354,29 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn renaming_to_or_from_template_adds_or_gives_up_its_contents() {
+        let mut doc = parse_fragment("<template><b>x</b>y</template>", Ns::Html, "div", false);
+        let t = doc.first_child(doc.root()).unwrap();
+        doc.rename(t, "div");
+        assert_eq!(doc.template_contents(t), None);
+        assert_eq!(doc.outer_html(t), "<div><b>x</b>y</div>");
+        doc.rename(t, "template");
+        let contents = doc.template_contents(t).expect("new contents");
+        assert_eq!(doc.first_child(contents), None);
+        assert_eq!(doc.outer_html(t), "<template><b>x</b>y</template>");
+        // Contents go ahead of children a template already has, as written.
+        let p = doc.create_element(Ns::Html, "p");
+        doc.append(contents, p).unwrap();
+        doc.rename(t, "section");
+        assert_eq!(doc.outer_html(t), "<section><p></p><b>x</b>y</section>");
+        // Renaming a template to template leaves its contents be.
+        let u = doc.create_element(Ns::Html, "template");
+        let kept = doc.template_contents(u);
+        doc.rename(u, "TEMPLATE");
+        assert_eq!(doc.template_contents(u), kept);
     }
 
     #[test]

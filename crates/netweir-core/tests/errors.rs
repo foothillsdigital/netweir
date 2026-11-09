@@ -10,12 +10,12 @@ fn fetcher() -> Fetcher {
 
 #[tokio::test]
 async fn a_refused_connection_is_a_connect_error() {
-    // Bind and drop to find a port nothing is listening on.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A privileged port nothing listens on, which no test's server can be
+    // given. (A port bound and let go was taken by another test's server
+    // on CI, which reset the connection during the TLS handshake. A port
+    // held bound but not listening isn't refused on macOS: the connection
+    // waits out the timeout.)
+    let port = 1;
     let err = fetcher()
         .get(&format!("https://127.0.0.1:{port}/"), &[])
         .await

@@ -397,6 +397,9 @@ pub(crate) struct State {
     /// are open now.
     prompts: u64,
     open_prompts: u64,
+    /// How many of the page's sessions (a service worker's, say) are
+    /// being let go: such a worker reads as attached until it's done.
+    letting_go: usize,
     /// Frames Chrome runs in processes of their own (from other sites),
     /// each with a session: (session, frame id), in the order they came.
     pub(crate) children: Vec<(String, String)>,
@@ -766,6 +769,7 @@ impl Page {
             login: browser.proxy_login.is_some(),
             fetching: tokio::sync::Mutex::new(false),
             intercept: Mutex::new(None),
+            collector: browser.collector.clone(),
             refused: Default::default(),
             tidy: {
                 let e = lock_env(&env);
@@ -2869,6 +2873,8 @@ impl Watch {
                 // left first stays held. Left at all, because Chrome keeps
                 // a service worker alive while anything is attached to it.
                 let (conn, parent) = (self.conn.clone(), parent.to_string());
+                let shared = self.shared.clone();
+                lock_state(&shared).letting_go += 1;
                 self.intercept.decider.runtime.spawn(async move {
                     let _ = conn
                         .call(&session, "Runtime.runIfWaitingForDebugger", json!({}))
@@ -2880,6 +2886,8 @@ impl Watch {
                             json!({"sessionId": session}),
                         )
                         .await;
+                    lock_state(&shared).letting_go -= 1;
+                    shared.changed.notify_waiters();
                 });
                 return;
             }
@@ -3336,6 +3344,15 @@ impl Page {
             // The browser's own context, whose id netweir doesn't keep.
             None => !made.iter().any(|m| m == id),
         };
+        // One still being let go reads as attached, and would be passed
+        // over: on Windows CI, a worker stayed online.
+        loop {
+            let changed = self.inner.shared.changed.notified();
+            if lock_state(&self.inner.shared).letting_go == 0 {
+                break;
+            }
+            changed.await;
+        }
         let targets = browser.call("", "Target.getTargets", json!({})).await?;
         for t in targets["targetInfos"].as_array().into_iter().flatten() {
             if t["type"] != "service_worker"
