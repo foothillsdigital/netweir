@@ -2913,7 +2913,8 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parses a whole document.
+/// Parses a whole document. A leading byte order mark (U+FEFF) is dropped,
+/// as decoding the page would have.
 ///
 /// # Panics
 /// On input over [`crate::MAX_INPUT`] bytes; [`parse_with`] returns an
@@ -2952,6 +2953,12 @@ pub fn parse_fragment(html: &str, ns: Ns, context: &str, scripting: bool) -> Doc
 }
 
 fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Document, ParseError> {
+    // Decoding a document drops a byte order mark, so a string that still
+    // starts with one gets the same tree. A fragment, as innerHTML, keeps it.
+    let html = match fragment {
+        None => html.strip_prefix('\u{FEFF}').unwrap_or(html),
+        Some(_) => html,
+    };
     if html.len() > crate::MAX_INPUT {
         return Err(ParseError::TooLarge { len: html.len() });
     }
@@ -3020,6 +3027,24 @@ mod tests {
         };
         assert!(parse_with(&html, roomy).is_ok());
     }
+    #[test]
+    fn a_leading_byte_order_mark_is_dropped_from_a_document() {
+        let page = "<!DOCTYPE html><p>x</p>";
+        let with = parse(&format!("\u{FEFF}{page}"), false);
+        let without = parse(page, false);
+        assert_eq!(with.quirks(), crate::Quirks::No);
+        assert_eq!(
+            with.inner_html(with.root()),
+            without.inner_html(without.root())
+        );
+        // Only the first one goes; one later on is text like any other.
+        let twice = parse("\u{FEFF}\u{FEFF}<p>x</p>", false);
+        assert!(twice.inner_html(twice.root()).contains('\u{FEFF}'));
+        // innerHTML doesn't decode, so a fragment keeps it.
+        let fragment = parse_fragment("\u{FEFF}x", Ns::Html, "div", false);
+        assert!(fragment.inner_html(fragment.root()).contains('\u{FEFF}'));
+    }
+
     #[test]
     fn a_budget_too_big_for_the_clock_is_no_limit() {
         let endless = Options {
