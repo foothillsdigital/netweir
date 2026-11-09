@@ -352,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     mcp.add_argument("--profile", help="the browser to look like (default chrome)")
     mcp.add_argument("--proxy", help="send requests, and Chrome, through this proxy")
     mcp.add_argument("--timeout", type=float, default=30.0, help="seconds (default 30)")
+    _engine_option(mcp, "the browser tools load pages in with browser=true (default chrome)")
     _project_commands(commands)
     args = parser.parse_args(argv)
     if args.command in ("startproject", "genspider", "list", "check", "parse", "version"):
@@ -699,6 +700,19 @@ def _fetch_options(parser: argparse.ArgumentParser, browser: bool) -> None:
         parser.add_argument(
             "--browser", action="store_true", help="load the page in Chrome and take its HTML"
         )
+        _engine_option(
+            parser, "load the page in this browser: chrome or firefox (implies --browser)"
+        )
+
+
+def _engine_option(parser: argparse.ArgumentParser, help: str) -> None:
+    parser.add_argument("--engine", choices=["chrome", "firefox"], help=help)
+
+
+def _no_proxy_for_firefox(args) -> None:
+    """Refuses --proxy with Firefox, which Netweir can't send through one yet."""
+    if args.engine == "firefox" and args.proxy:
+        raise _Usage("--proxy can't go with --engine firefox yet: Firefox takes no proxy")
 
 
 def _page_command(args) -> int:
@@ -804,7 +818,8 @@ class _Session:
         from netweir._native import Fetcher
 
         self.args = args
-        self.browser = getattr(args, "browser", False)
+        self.engine = getattr(args, "engine", None)
+        self.browser = getattr(args, "browser", False) or self.engine is not None
         self.headers = []
         for header in args.header:
             name, sep, value = header.partition(":")
@@ -812,7 +827,11 @@ class _Session:
                 raise _Usage(f"a header is 'Name: value', not {header!r}")
             self.headers.append((name.strip(), value.strip()))
         if self.browser and (args.profile or self.headers):
-            raise _Usage("--browser fetches as Chrome itself: --profile and --header don't apply")
+            raise _Usage(
+                "--browser fetches as the browser itself: --profile and --header don't apply"
+            )
+        if self.browser:
+            _no_proxy_for_firefox(args)
         # Made now, so a bad profile or timeout is a command-line mistake.
         self.fetcher = Fetcher(args.profile or "chrome", args.proxy, args.timeout)
 
@@ -878,7 +897,9 @@ class _Session:
         import netweir
         from netweir._native import _response
 
-        async with netweir.browser(proxy=self.args.proxy, timeout=self.args.timeout) as browser:
+        async with netweir.browser(
+            proxy=self.args.proxy, timeout=self.args.timeout, engine=self.engine or "chrome"
+        ) as browser:
             tab = await browser.new_page()
             response = await tab.goto(url)
             content = (await tab.content()).encode()

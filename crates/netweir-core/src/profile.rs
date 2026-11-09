@@ -240,7 +240,13 @@ impl Profile {
     /// The built-in profile of Chrome `major` (such as "154"), if there is
     /// one.
     pub fn for_chrome(major: &str) -> Option<Profile> {
-        let prefix = format!("chrome-{major}-");
+        Profile::for_browser("chrome", major)
+    }
+
+    /// The built-in profile of `browser` ("chrome" or "firefox") version
+    /// `major`, if there is one.
+    pub fn for_browser(browser: &str, major: &str) -> Option<Profile> {
+        let prefix = format!("{browser}-{major}-");
         BUILT_IN
             .iter()
             .find(|(n, _)| n.starts_with(&prefix))

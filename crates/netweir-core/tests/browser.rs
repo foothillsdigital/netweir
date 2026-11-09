@@ -1301,6 +1301,9 @@ async fn a_step_that_leads_to_a_block_hands_the_block_on() {
     c.submit(CrawlRequest {
         steps: Some(own(serde_json::json!([
             {"action": "click", "selector": "#go"},
+            // The gate is showing when the next step fails, however long
+            // the click's navigation takes on a busy runner.
+            {"action": "wait_for_navigation"},
             {"action": "wait_for", "selector": "#prize", "timeout": 0.5},
         ]))),
         ..request(1, site.url("/"), true)
@@ -1323,7 +1326,7 @@ async fn a_step_that_leads_to_a_block_hands_the_block_on() {
     assert_eq!(blocked.len(), 2, "{events:?}");
     let (_, after) = blocked.iter().find(|(id, _)| *id == 1).unwrap();
     assert!(after.url.ends_with("/gate"), "{}", after.url);
-    assert_eq!(after.steps[1].status.as_str(), "failed");
+    assert_eq!(after.steps[2].status.as_str(), "failed");
     let (_, before) = blocked.iter().find(|(id, _)| *id == 2).unwrap();
     assert_eq!(before.steps[0].status.as_str(), "skipped");
     assert_eq!(

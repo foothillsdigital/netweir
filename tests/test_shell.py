@@ -244,6 +244,41 @@ def test_browser_with_profile_or_header_is_a_mistake(capsys):
     assert _cli.main(["view", "--browser", "--header", "A: b", "http://example.com/"]) == 2
 
 
+def test_engine_picks_the_browser_and_is_a_browser_fetch(monkeypatch, capsys):
+    asked = []
+
+    class Started(Exception):
+        pass
+
+    def browser(**kwargs):
+        asked.append(kwargs["engine"])
+        raise Started
+
+    monkeypatch.setattr(netweir, "browser", browser)
+    for argv in (
+        ["fetch", "--browser", "http://example.com/"],
+        ["fetch", "--engine", "firefox", "http://example.com/"],
+        ["view", "--browser", "--engine", "chrome", "http://example.com/"],
+    ):
+        with pytest.raises(Started):
+            _cli.main(argv)
+    assert asked == ["chrome", "firefox", "chrome"]
+    argv = ["fetch", "--engine", "firefox", "--proxy", "http://127.0.0.1:1", "http://example.com/"]
+    assert _cli.main(argv) == 2
+    assert "--proxy can't go with --engine firefox" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        _cli.main(["fetch", "--engine", "safari", "http://example.com/"])
+
+
+def test_fetch_in_firefox_gives_the_html_after_scripts(base, capsysbinary):
+    status = _cli.main(["fetch", "--engine", "firefox", f"{base}/scripted"])
+    out = capsysbinary.readouterr()
+    if status == 1 and b"no Firefox" in out.err and not os.environ.get("NETWEIR_REQUIRE_FIREFOX"):
+        pytest.skip(out.err.decode())
+    assert status == 0, out.err
+    assert "<li>café</li>" in out.out.decode()
+
+
 # --- view ------------------------------------------------------------------
 
 

@@ -220,6 +220,13 @@ class Settings:
     #: with ``browser=True``), "on_block" (also any still blocked after its
     #: retries, once) or "always".
     browser: str = "off"
+    #: Which browser those requests are fetched in: "chrome", "firefox"
+    #: (the one ``netweir install firefox`` installed), or "match", which
+    #: is Firefox when ``profile`` is a Firefox one and Chrome otherwise,
+    #: so a site sees the same browser the crawl's requests look like.
+    #: Firefox can't go through the crawl's proxy yet, so it can't be
+    #: chosen with one.
+    browser_engine: str = "chrome"
     #: Chrome pages open at once.
     browser_pages: int = 4
     #: Resource types the crawl's Chrome pages never fetch, such as
@@ -351,6 +358,11 @@ class Settings:
             raise ValueError("track_threshold must be above 0 and at most 1")
         if self.browser not in ("off", "on_block", "always"):
             raise ValueError(f'browser must be "off", "on_block" or "always", not {self.browser!r}')
+        if self.browser_engine not in ("chrome", "firefox", "match"):
+            raise ValueError(
+                'browser_engine must be "chrome", "firefox" or "match", '
+                f"not {self.browser_engine!r}"
+            )
         if self.browser_pages < 1:
             raise ValueError("browser_pages must be at least 1")
         if isinstance(self.browser_block, str):
@@ -505,6 +517,7 @@ class Settings:
             browser_worker_header_order=self.browser_worker_header_order,
             browser_steps=steps_json(list(self.browser_steps), str) if self.browser_steps else None,
             browser_steps_max=self.browser_steps_max,
+            browser_engine=self.browser_engine,
             cache=None if self.cache is None else os.path.join(self.cache, "cache.sqlite3"),
             cache_expiry=self.cache_expiry,
             deltafetch=None

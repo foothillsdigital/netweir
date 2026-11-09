@@ -1,5 +1,8 @@
 """The browser driver from Python. Skipped without Chrome, unless
-NETWEIR_REQUIRE_CHROME is set."""
+NETWEIR_REQUIRE_CHROME is set. With NETWEIR_TEST_ENGINE=firefox, the
+tests that use the ``browser`` fixture drive Firefox instead (skipped
+without it, unless NETWEIR_REQUIRE_FIREFOX is set), and those that are
+Chrome's alone say why in their skip."""
 
 import asyncio
 import base64
@@ -17,6 +20,26 @@ import pytest
 from local_server import serve, socket_state
 
 import netweir
+
+ENGINE = os.environ.get("NETWEIR_TEST_ENGINE", "chrome")
+assert ENGINE in ("chrome", "firefox"), f"NETWEIR_TEST_ENGINE is {ENGINE!r}"
+
+
+def chrome_only(why):
+    """Skips a test on Firefox, saying why."""
+    return pytest.mark.skipif(ENGINE == "firefox", reason=f"Chrome only: {why}")
+
+
+def skip_if_missing(e):
+    """Skips the test when the engine under test isn't installed, unless
+    it's required."""
+    missing, required = {
+        "chrome": ("no Chrome found", "NETWEIR_REQUIRE_CHROME"),
+        "firefox": ("no Firefox", "NETWEIR_REQUIRE_FIREFOX"),
+    }[ENGINE]
+    if missing in str(e) and not os.environ.get(required):
+        pytest.skip(str(e))
+
 
 PAGES = {
     "/": b"""<!DOCTYPE html><title>shop</title>
@@ -230,10 +253,9 @@ def base():
 @pytest.fixture
 async def browser():
     try:
-        b = await netweir.browser(timeout=30)
+        b = await netweir.browser(timeout=30, engine=ENGINE)
     except netweir.BrowserError as e:
-        if "no Chrome found" in str(e) and not os.environ.get("NETWEIR_REQUIRE_CHROME"):
-            pytest.skip(str(e))
+        skip_if_missing(e)
         raise
     yield b
     await b.close()
@@ -298,6 +320,7 @@ async def test_press_holds_the_modifiers_named_before_the_key(browser, base):
             await page.press("Hyper+a")
 
 
+@chrome_only("HTML5 drag and drop, which Firefox doesn't begin from WebDriver's mouse")
 async def test_drag_drops_one_element_onto_another(browser, base):
     async with await browser.new_page() as page:
         await page.goto(base + "/")
@@ -397,8 +420,12 @@ def _entry(url, text="", status=200, method="GET", posted=None, encoding=None, h
 
 
 async def test_a_har_file_answers_requests_and_nothing_reaches_the_network(browser, tmp_path):
-    # Nothing listens at this address: only the file can answer.
-    site = "http://127.0.0.1:9"
+    # Nothing listens at this address: only the file can answer. (Not a
+    # port browsers refuse outright, such as 9, which Firefox does before
+    # any route sees the request.)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        site = f"http://127.0.0.1:{s.getsockname()[1]}"
     html = """<title>From the file</title><script>
       globalThis.go = async (url, init) => {
         try {
@@ -480,6 +507,7 @@ async def test_a_file_that_isnt_a_har_says_so(browser, tmp_path):
         await page.route_from_har(path, not_found="maybe")
 
 
+@chrome_only("tracing, which is Chrome's DevTools format")
 async def test_a_trace_goes_to_a_file_and_is_chromes_json(browser, base, tmp_path):
     page = await browser.new_page()
     await browser.start_tracing(screenshots=True)
@@ -493,12 +521,12 @@ async def test_a_trace_goes_to_a_file_and_is_chromes_json(browser, base, tmp_pat
 
 async def test_the_browser_can_be_awaited_or_used_as_a_context_manager():
     try:
-        async with netweir.browser() as b:
-            assert b.version.startswith("Chrome/")
+        async with netweir.browser(engine=ENGINE) as b:
+            assert b.version.startswith({"chrome": "Chrome/", "firefox": "Firefox/"}[ENGINE])
+            assert (b.engine, b.stealth) == (ENGINE, True)
             page = await b.new_page()
     except netweir.BrowserError as e:
-        if "no Chrome found" in str(e) and not os.environ.get("NETWEIR_REQUIRE_CHROME"):
-            pytest.skip(str(e))
+        skip_if_missing(e)
         raise
     assert b.closed
     with pytest.raises(netweir.BrowserError):
@@ -510,6 +538,18 @@ async def test_the_browser_can_be_awaited_or_used_as_a_context_manager():
     )
 
 
+async def test_the_engine_is_chosen_by_name_and_firefox_refuses_what_it_lacks():
+    with pytest.raises(ValueError, match='engine must be "chrome" or "firefox"'):
+        await netweir.browser(engine="safari")
+    with pytest.raises(ValueError, match="stealth: false is for Firefox"):
+        await netweir.browser(stealth=False)
+    with pytest.raises(netweir.BrowserError, match="proxy isn't available on Firefox"):
+        await netweir.browser(engine="firefox", proxy="http://127.0.0.1:1")
+    with pytest.raises(netweir.BrowserError, match="connect isn't available on Firefox"):
+        await netweir.browser(engine="firefox", connect="ws://127.0.0.1:1/")
+
+
+@chrome_only("a proxy, which Netweir doesn't give Firefox yet")
 async def test_a_proxy_with_a_login_carries_the_pages():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -531,6 +571,7 @@ async def test_a_proxy_with_a_login_carries_the_pages():
         server.server_close()
 
 
+@chrome_only("connecting to a running browser, which Netweir does only with Chrome")
 async def test_a_running_chrome_can_be_driven_and_is_left_running(base, tmp_path):
     from netweir._native import find_chrome
 
@@ -703,10 +744,9 @@ async def test_a_profile_given_to_the_browser_keeps_its_cookies_and_stays(base, 
     profile = tmp_path / "profile"
     for visit in range(2):
         try:
-            b = await netweir.browser(user_data_dir=profile)
+            b = await netweir.browser(user_data_dir=profile, engine=ENGINE)
         except netweir.BrowserError as e:
-            if "no Chrome found" in str(e) and not os.environ.get("NETWEIR_REQUIRE_CHROME"):
-                pytest.skip(str(e))
+            skip_if_missing(e)
             raise
         async with b:
             page = await b.new_page()
@@ -721,6 +761,7 @@ async def test_a_profile_given_to_the_browser_keeps_its_cookies_and_stays(base, 
         await netweir.browser(connect="ws://127.0.0.1:1/", user_data_dir=profile)
 
 
+@chrome_only("it starts the Chrome find_chrome() finds")
 async def test_a_profile_under_home_is_found_there(tmp_path, monkeypatch):
     from netweir._native import find_chrome
 
@@ -796,10 +837,9 @@ async def test_the_pause_before_a_dialog_is_answered_can_be_set(base):
     # trips around a 50 ms pause alone took over 500 ms.
     pause = 2.0
     try:
-        browser = await netweir.browser(dialog_pause=(pause, pause + 0.01))
+        browser = await netweir.browser(dialog_pause=(pause, pause + 0.01), engine=ENGINE)
     except netweir.BrowserError as e:
-        if "no Chrome found" in str(e) and not os.environ.get("NETWEIR_REQUIRE_CHROME"):
-            pytest.skip(str(e))
+        skip_if_missing(e)
         raise
     async with browser:
         page = await browser.new_page()
@@ -902,6 +942,7 @@ async def test_a_download_is_heard_saved_and_goes_with_its_page(browser, base, t
         await other.wait_for_download(timeout=0.5)
 
 
+@chrome_only("cancelling a download, which Firefox can't")
 async def test_waiting_on_a_stalled_download_gives_up_at_the_timeout(browser, base, tmp_path):
     page = await browser.new_page()
     await page.goto(base + "/opens")
@@ -932,6 +973,7 @@ async def _hung_up(n, timeout=10.0):
     return True
 
 
+@chrome_only("cancelling a download, which Firefox can't")
 async def test_a_download_nobody_listens_for_is_cancelled(browser, base):
     page = await browser.new_page()
     await page.goto(base + "/opens")

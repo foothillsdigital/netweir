@@ -56,10 +56,20 @@ def _module():
     return MCPServer, ToolError
 
 
-def server(profile: str = "chrome", proxy: str | None = None, timeout: float = 30.0):
+def server(
+    profile: str = "chrome",
+    proxy: str | None = None,
+    timeout: float = 30.0,
+    engine: str = "chrome",
+):
     """The MCP server, its tools fetching with a ``netweir.Client`` made
-    from ``profile``, ``proxy`` and ``timeout``, and with one Chrome,
-    started the first time a tool asks for it."""
+    from ``profile``, ``proxy`` and ``timeout``, and with one browser
+    (Chrome, or Firefox with ``engine="firefox"``), started the first time
+    a tool asks for it."""
+    if engine not in ("chrome", "firefox"):
+        raise ValueError(f'engine must be "chrome" or "firefox", not {engine!r}')
+    if engine == "firefox" and proxy:
+        raise ValueError("a proxy can't go with Firefox yet: Firefox takes no proxy")
     import netweir
     from netweir import Blocked, BrowserError, FetchError
     from netweir._cli import _utf8
@@ -72,7 +82,7 @@ def server(profile: str = "chrome", proxy: str | None = None, timeout: float = 3
 
     async def in_chrome(url: str) -> netweir.Page:
         if "browser" not in chrome:
-            chrome["browser"] = await netweir.browser(proxy=proxy, timeout=timeout)
+            chrome["browser"] = await netweir.browser(proxy=proxy, timeout=timeout, engine=engine)
         try:
             tab = await chrome["browser"].new_page()
         except BrowserError:
@@ -227,7 +237,7 @@ def server(profile: str = "chrome", proxy: str | None = None, timeout: float = 3
 def main(args) -> int:
     """Runs the server on stdin and stdout until its client goes."""
     try:
-        mcp = server(args.profile or "chrome", args.proxy, args.timeout)
+        mcp = server(args.profile or "chrome", args.proxy, args.timeout, args.engine or "chrome")
     except (ImportError, ValueError) as e:
         print(f"netweir: {e}", file=sys.stderr)
         return 2

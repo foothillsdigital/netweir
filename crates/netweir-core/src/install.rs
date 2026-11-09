@@ -236,11 +236,16 @@ pub async fn install_firefox(
     release: &FirefoxRelease<'_>,
 ) -> Result<Installed, String> {
     let version = release.version;
-    if version.is_empty()
-        || !version
-            .split('.')
-            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-    {
+    let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    // A release such as 159.0.1, or a beta such as 160.0b5, which the
+    // weekly Firefox Beta check installs.
+    let mut parts: Vec<&str> = version.split('.').collect();
+    let last = parts.pop().unwrap_or_default();
+    let last_ok = number(last)
+        || last
+            .split_once('b')
+            .is_some_and(|(minor, beta)| number(minor) && number(beta));
+    if !last_ok || !parts.iter().all(|n| number(n)) {
         return Err(format!("{version:?} isn't a Firefox release version"));
     }
     let platform = netweir_browser::firefox_platform().ok_or_else(|| {
