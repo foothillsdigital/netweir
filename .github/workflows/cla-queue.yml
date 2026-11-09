@@ -1,0 +1,18 @@
+name: cla
+
+# The merge queue asks for the cla check too. Every pull request in it
+# has already passed cla.yml's, so here it passes without looking. A file
+# of its own, run only in the queue, so no skipped "cla" ever stands in
+# for the real check on a pull request. It runs the merged code's copy of
+# this file, so it holds no permissions.
+on:
+  merge_group:
+
+permissions: {}
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "The pull request passed the CLA check before it was queued."

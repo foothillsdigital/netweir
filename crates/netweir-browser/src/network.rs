@@ -104,7 +104,7 @@ impl Request {
 impl Request {
     /// From a BiDi `network.RequestData`; `navigation` when it loads a
     /// document. Firefox doesn't put a request's body in its events, so
-    /// `post_data` is None.
+    /// `post_data` is None; a route's request is given it after.
     pub(crate) fn from_bidi(request: &Value, navigation: bool) -> Request {
         Request {
             id: str_of(request, "request"),
@@ -482,6 +482,8 @@ pub(crate) struct Decider {
     pub fetching: tokio::sync::Mutex<bool>,
     /// A Firefox page's intercept, while its rules need one.
     pub intercept: Mutex<Option<String>>,
+    /// The data collector that keeps a Firefox page's request bodies.
+    pub collector: Option<String>,
     /// The requests a Firefox page failed as blocked by netweir, whose
     /// failure Firefox doesn't tell apart from any other.
     pub refused: Refused,
@@ -636,13 +638,29 @@ impl Decider {
 
     /// Decides about a request a Firefox page's intercept paused
     /// (`network.beforeRequestSent` with `isBlocked`), to go on with
-    /// `tidied` headers, if given, instead of its own.
-    pub(crate) fn decide_bidi(&self, params: &Value, tidied: Option<Vec<(String, String)>>) {
+    /// `tidied` headers, if given, instead of its own. One that sent a
+    /// body is decided once Firefox has handed the body over, so routes
+    /// see it as they do on Chrome.
+    pub(crate) fn decide_bidi(
+        self: &Arc<Self>,
+        params: &Value,
+        tidied: Option<Vec<(String, String)>>,
+    ) {
         let navigation = params["navigation"].is_string();
-        let request = Request::from_bidi(&params["request"], navigation);
+        let mut request = Request::from_bidi(&params["request"], navigation);
         let paused = request.id.clone();
         let chrome_type = chrome_type(&request.resource_type).unwrap_or("Other");
         let guarded = navigation && params["context"] == self.frame.as_str();
+        let sent = params["request"]["bodySize"].as_u64().unwrap_or(0) > 0;
+        if let Some(collector) = self.collector.clone().filter(|_| sent) {
+            let decider = self.clone();
+            self.runtime.spawn(async move {
+                request.post_data =
+                    crate::page::bidi::request_body(&decider.conn, &collector, &paused).await;
+                decider.hand_on("", paused, request, chrome_type, guarded, tidied, true);
+            });
+            return;
+        }
         self.hand_on("", paused, request, chrome_type, guarded, tidied, true);
     }
 

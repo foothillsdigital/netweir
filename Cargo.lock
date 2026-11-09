@@ -1284,6 +1284,7 @@ version = "0.7.1"
 dependencies = [
  "memchr",
  "serde_json",
+ "url",
 ]
 
 [[package]]
