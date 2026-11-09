@@ -17,8 +17,9 @@ Each one fetches the way `netweir.get` does: the same browser profile on
 the wire and the same redirect handling. Give any of them a file instead
 of a URL (a path, or a `file:` URL) to look at a page you saved. A host
 without a scheme, such as `example.com` or `localhost:8000`, gets
-`https://`; a name that ends like a file, such as `page.html`, is taken
-for a file and has to exist. They take
+`https://`, even when its path ends like a file, as in
+`localhost:8000/index.html`. A bare name that ends like a file, such as
+`page.html`, is taken for a file and has to exist. They take
 the same options:
 
 | option | what it does |

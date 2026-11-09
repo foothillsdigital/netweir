@@ -33,6 +33,10 @@ doc.css("a::attr(title), .price::text").getall()
 - `::attr(name)` gives an attribute's value.
 - With neither, `get()` gives the element's HTML, the way Chrome's
   `outerHTML` writes it.
+- Form pseudo-classes read the markup as it stands: `:valid` and `:invalid`
+  check `required`, `type="email"` and `"url"`, `min`, `max` and `step`, but
+  not `pattern`, nor the limits only typing can break (`maxlength`,
+  `minlength`). An input with a `pattern` matches as if it had none.
 
 ## XPath
 
