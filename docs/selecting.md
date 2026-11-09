@@ -34,9 +34,12 @@ doc.css("a::attr(title), .price::text").getall()
 - With neither, `get()` gives the element's HTML, the way Chrome's
   `outerHTML` writes it.
 - Form pseudo-classes read the markup as it stands: `:valid` and `:invalid`
-  check `required`, `type="email"` and `"url"`, `min`, `max` and `step`, but
-  not `pattern`, nor the limits only typing can break (`maxlength`,
-  `minlength`). An input with a `pattern` matches as if it had none.
+  check `required`, `type="email"` and `"url"`, `min`, `max`, `step` and
+  `pattern`, but not the limits only typing can break (`maxlength`,
+  `minlength`). A `pattern` is read as JavaScript reads it, with the `v`
+  flag, so `\d` and `\w` are ASCII. One that doesn't compile counts as
+  none, as does one using `\p{...}`, which needs Unicode tables Netweir
+  doesn't carry.
 
 ## XPath
 
