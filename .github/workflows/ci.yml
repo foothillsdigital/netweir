@@ -69,6 +69,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.14", "3.14t"]
+        # The free plan runs five macOS jobs at once, and each run wanted
+        # five, so a pull request (or the merge queue) tests macOS on 3.14
+        # alone. Every push to main runs all three there.
+        exclude: ${{ github.event_name != 'push' && fromJSON('[{"os":"macos-latest","python":"3.11"},{"os":"macos-latest","python":"3.14t"}]') || fromJSON('[]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
