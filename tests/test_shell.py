@@ -404,14 +404,19 @@ def test_shell_reads_a_relative_path_and_a_file_url(tmp_path, monkeypatch, capsy
 def test_a_host_without_a_scheme_gets_https(monkeypatch):
     sent = []
     monkeypatch.setattr(_cli._Session, "send", lambda self, url, *a, **k: sent.append(url))
-    for host in ["example.com/books?page=2", "localhost:8000", "127.0.0.1", "bücher.de"]:
-        assert _cli.main(["shell", host, "-c", "1"]) == 0
-    assert sent == [
-        "https://example.com/books?page=2",
-        "https://localhost:8000",
-        "https://127.0.0.1",
-        "https://bücher.de",
+    hosts = [
+        "example.com/books?page=2",
+        "localhost:8000",
+        "127.0.0.1",
+        "bücher.de",
+        # A file ending after a port or a path is still a page on a host.
+        "localhost:8000/index.html",
+        "example.com/sitemap.xml",
+        "shop.example.com:8443/feed.json",
     ]
+    for host in hosts:
+        assert _cli.main(["shell", host, "-c", "1"]) == 0
+    assert sent == ["https://" + host for host in hosts]
 
 
 @pytest.mark.parametrize(

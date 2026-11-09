@@ -511,20 +511,21 @@ def test_a_malformed_queue_url_is_a_usage_mistake_found_without_connecting(tmp_p
 def test_a_long_backlog_of_pushes_doesnt_starve_the_heartbeat(fake):
     class Many(netweir.Spider):
         def start(self):
-            for n in range(5000):
+            for n in range(7000):
                 yield netweir.Request(f"http://127.0.0.1:1/{n}")
 
     spider = Many()
-    spider.settings = settings(fake.url, queue_lease=2.0, max_pages=1, retries=0)
-    # Five batches at 0.5 s each (under the 0.67 s a call may take): 2.5 s
-    # of pushing, longer than a lease.
+    spider.settings = settings(fake.url, queue_lease=3.0, max_pages=1, retries=0)
+    # Seven batches at 0.5 s each, well under the 1 s a call may take (a
+    # third of a lease; with a 2 s lease, a busy macOS runner went past
+    # the 0.67 s it left): 3.5 s of pushing, longer than a lease.
     fake.push_delay = 0.5
     finishes(spider)
-    assert fake.scripts["-- netweir push"] >= 5
+    assert fake.scripts["-- netweir push"] >= 7
     gaps = [b - a for a, b in itertools.pairwise(fake.times)]
     # A heartbeat every lease/3 or so, between batches: never a lease
     # without one, so no other process would take this one for dead.
-    assert max(gaps) < 2.0, gaps
+    assert max(gaps) < 3.0, gaps
 
 
 def test_a_backlog_whose_every_batch_fails_once_still_gets_through(fake):
