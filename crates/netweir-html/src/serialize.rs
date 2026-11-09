@@ -150,13 +150,15 @@ impl Document {
     }
 
     /// The node alone: an element's start tag, escaped text, a comment
-    /// or a doctype; as `outer_html` writes it, without the children.
+    /// or a doctype; as `outer_html` writes it, without the children. A
+    /// document or a template's contents is nothing but its children, so
+    /// it gives an empty string.
     pub fn html_alone(&self, id: NodeId) -> String {
         let mut out = String::new();
-        if self.element(id).is_some() {
-            self.start_tag(id, &mut out);
-        } else {
-            self.node_html(id, &mut out);
+        match self.kind(id) {
+            Kind::Element { .. } => self.start_tag(id, &mut out),
+            Kind::Document | Kind::Fragment => {}
+            _ => self.node_html(id, &mut out),
         }
         out
     }
@@ -231,6 +233,21 @@ mod tests {
             .unwrap();
         let body = doc.children(html_el).nth(1).unwrap();
         doc.inner_html(body)
+    }
+
+    #[test]
+    fn a_document_or_template_contents_alone_is_empty() {
+        let doc = parse("<!DOCTYPE html><template><b>x</b></template><p>y", false);
+        assert_eq!(doc.html_alone(doc.root()), "");
+        let template = (0..doc.len() as crate::NodeId)
+            .find_map(|n| doc.template_contents(n))
+            .unwrap();
+        assert_eq!(doc.html_alone(template), "");
+        let fragment = parse_fragment("<b>x</b>", Ns::Html, "div", false);
+        assert_eq!(fragment.html_alone(fragment.root()), "");
+        // The rest are as before.
+        let doctype = doc.children(doc.root()).next().unwrap();
+        assert_eq!(doc.html_alone(doctype), "<!DOCTYPE html>");
     }
 
     #[test]
