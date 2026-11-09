@@ -168,6 +168,16 @@ jobs:
       # compares; the other systems' runners have one.
       - run: ${{ runner.os == 'Linux' && 'xvfb-run -a ' || '' }}cargo test --workspace --exclude netweir-py
         timeout-minutes: 30
+        env:
+          # Where a failing headed stealth test saves the screen, kept below.
+          NETWEIR_FAILURE_DIR: ${{ runner.temp }}/netweir-failure
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failure-${{ matrix.os }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/netweir-failure
+          if-no-files-found: ignore
+          retention-days: 7
       # On Windows chrome-headless-shell is a console program, so it shares
       # a `netweir serve` job's console; a serve test cancels a job using it.
       - if: runner.os == 'Windows'

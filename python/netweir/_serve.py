@@ -139,7 +139,10 @@ def _project(text: str) -> tuple[str, Path]:
     """NAME=PATH, or PATH, named after its file or directory."""
     name, sep, path = text.partition("=")
     if not sep:
-        name, path = Path(text).stem, text
+        # A directory is named whole, after it's resolved, so "." is the
+        # current directory; a file drops its extension.
+        given = Path(text)
+        name, path = (given.resolve().name if given.is_dir() else given.stem), text
     if not NAME.fullmatch(name):
         raise ValueError(
             f"--project {name!r}: a project's name is letters, digits, '.', '_' and '-'"

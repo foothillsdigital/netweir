@@ -145,10 +145,10 @@ impl Document {
         let value = self.push_stable(value);
         let name_span = self.push_stable(&name);
         self.rewrite_attrs(id, |doc, attrs| {
-            // By the name as written, so viewBox finds a parsed viewBox, or
-            // as stored, so no two attributes are ever written alike.
             // By qualified name in any namespace, as setAttribute does, so
-            // xlink:href finds a parsed xlink:href and keeps its namespace.
+            // xlink:href finds a parsed xlink:href and keeps its namespace;
+            // on a foreign element by the name as written too, so viewBox
+            // finds a parsed viewBox and no two are ever written alike.
             match attrs.iter_mut().find(|a| doc.is_attr(ns, a, &name, given)) {
                 Some(a) => a.value = value,
                 None => attrs.push(Attr {

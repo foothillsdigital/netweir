@@ -17,10 +17,15 @@ def _module():
     return jmespath
 
 
-def _loads(text: str, what: str) -> Any:
+def _loads(text: str, what: str, show: bool = False) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
+        if show:
+            # The start of the text, so one result among many can be found.
+            start = " ".join(text.split())
+            start = start if len(start) <= 30 else start[:30] + "..."
+            raise ValueError(f"{what} isn't JSON ({start!r}: {e})") from None
         raise ValueError(f"{what} isn't JSON ({e})") from None
 
 
@@ -39,5 +44,7 @@ def search_text(expression: str, text: str, what: str = "the node's text") -> An
 
 def search_texts(expression: str, texts: list[str]) -> list[Any]:
     module = _module()
-    found = (module.search(expression, _loads(t, "a result")) for t in texts)
+    found = (
+        module.search(expression, _loads(t, f"result {i}", show=True)) for i, t in enumerate(texts)
+    )
     return [value for value in found if value is not None]
