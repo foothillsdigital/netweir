@@ -1119,6 +1119,14 @@ impl Browser {
         Ok(id)
     }
 
+    /// Sends `method` to the browser as it is, for tests that look at what
+    /// no page can see, such as Firefox's own window. Not for use outside
+    /// them: nothing keeps netweir's state in step with what it does.
+    #[doc(hidden)]
+    pub async fn call_for_tests(&self, method: &str, params: Value) -> Result<Value> {
+        self.inner.call("", method, params).await
+    }
+
     /// Every CDP method sent so far, for tests that check nothing
     /// detectable was.
     pub fn methods_sent(&self) -> Vec<String> {

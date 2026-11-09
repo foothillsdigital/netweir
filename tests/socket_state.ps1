@@ -20,14 +20,16 @@ $processes = Get-Process
     Sort-Object HandleCount -Descending | Select-Object -First 5 |
     ForEach-Object { "$($_.ProcessName)($($_.Id)) $($_.HandleCount)" }) -join ', ')
 
-# Each browser is the chrome.exe whose parent isn't one: the test process
-# that started it, or one that has already ended.
-$chrome = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'")
-$ids = $chrome | ForEach-Object { $_.ProcessId }
-$browsers = @($chrome | Where-Object { $ids -notcontains $_.ParentProcessId })
-"chrome.exe: $($chrome.Count) processes, $($browsers.Count) browsers"
-foreach ($b in $browsers) {
-    $parent = Get-Process -Id $b.ParentProcessId -ErrorAction SilentlyContinue
-    $by = if ($parent) { "$($parent.ProcessName)($($parent.Id))" } else { "ended($($b.ParentProcessId))" }
-    "  browser $($b.ProcessId) started $($b.CreationDate.ToString('HH:mm:ss')) by $by"
+# Each browser is the chrome.exe (or firefox.exe) whose parent isn't one:
+# the test process that started it, or one that has already ended.
+foreach ($name in 'chrome.exe', 'firefox.exe') {
+    $all = @(Get-CimInstance Win32_Process -Filter "Name = '$name'")
+    $ids = $all | ForEach-Object { $_.ProcessId }
+    $browsers = @($all | Where-Object { $ids -notcontains $_.ParentProcessId })
+    "${name}: $($all.Count) processes, $($browsers.Count) browsers"
+    foreach ($b in $browsers) {
+        $parent = Get-Process -Id $b.ParentProcessId -ErrorAction SilentlyContinue
+        $by = if ($parent) { "$($parent.ProcessName)($($parent.Id))" } else { "ended($($b.ParentProcessId))" }
+        "  browser $($b.ProcessId) started $($b.CreationDate.ToString('HH:mm:ss')) by $by"
+    }
 }

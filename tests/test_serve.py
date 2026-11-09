@@ -489,6 +489,22 @@ def test_insecure_no_auth_starts_with_a_warning(tmp_path, project):
         proc.wait()
 
 
+def test_a_bare_project_path_is_named_after_it(tmp_path, monkeypatch):
+    from netweir._serve import _project
+
+    shop = tmp_path / "myshop"
+    (shop / "sub").mkdir(parents=True)
+    (tmp_path / "my.shop").mkdir()
+    (tmp_path / "spiders.py").write_text("")
+    monkeypatch.chdir(shop / "sub")
+    assert _project(".") == ("sub", shop / "sub")
+    assert _project("./") == ("sub", shop / "sub")
+    assert _project("..") == ("myshop", shop)
+    assert _project("../../my.shop") == ("my.shop", tmp_path / "my.shop")
+    assert _project("../../spiders.py") == ("spiders", tmp_path / "spiders.py")
+    assert _project("books=.") == ("books", shop / "sub")
+
+
 @pytest.mark.parametrize(
     "args, message",
     [

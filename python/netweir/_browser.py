@@ -1,10 +1,10 @@
-"""Driving Chrome: ``netweir.browser()``."""
+"""Driving Chrome or Firefox: ``netweir.browser()``."""
 
 from __future__ import annotations
 
 import os
 from collections.abc import Generator, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from netweir._native import Browser, _devices, launch
 
@@ -19,7 +19,7 @@ devices: dict[str, Environment] = _devices()
 
 
 class browser:
-    """Starts Chrome. Use it either way:
+    """Starts Chrome, or Firefox with ``engine="firefox"``. Use it either way:
 
     .. code-block:: python
 
@@ -62,6 +62,14 @@ class browser:
     otherwise. Given here, a screen, pixel ratio, user agent and language
     are Chrome's own from the start, so even service workers agree.
 
+    ``engine="firefox"`` starts the Firefox ``netweir install firefox``
+    installed (or ``$NETWEIR_FIREFOX``) instead. Pages can't tell it's
+    driven, as with Chrome. ``stealth=False`` drives any Firefox in its
+    automation mode, which pages can tell (``navigator.webdriver`` is
+    true); it's the only way to drive a Firefox Netweir didn't install.
+    Firefox has no ``proxy``, ``connect`` or ``worker_header_order``, and
+    a ``user_data_dir`` must be a profile Netweir made: those raise.
+
     ``worker_header_order=True`` sends each dedicated and shared worker's
     script request with its headers in Chrome's own order, which the user
     agent override every page has otherwise changes (User-Agent comes
@@ -84,6 +92,8 @@ class browser:
         dialog_pause: tuple[float, float] = (0.5, 1.5),
         environment: Environment | None = None,
         worker_header_order: bool = False,
+        engine: Literal["chrome", "firefox"] = "chrome",
+        stealth: bool = True,
     ):
         self._options: dict[str, Any] = {
             "executable": None if executable is None else os.fspath(executable),
@@ -98,6 +108,8 @@ class browser:
             "dialog_pause": tuple(dialog_pause),
             "environment": None if environment is None else dict(environment),
             "worker_header_order": worker_header_order,
+            "engine": engine,
+            "stealth": stealth,
         }
         self._browser: Browser | None = None
 

@@ -281,6 +281,15 @@ fn end(started: Started) {
 }
 
 async fn start_once(options: &LaunchOptions) -> Result<Started> {
+    // A person's profile is refused first, whatever Firefox there is.
+    if let Some(dir) = &options.user_data_dir {
+        if dir.as_os_str().to_string_lossy().trim().is_empty() {
+            return Err(Error::Launch(
+                "the profile folder (user_data_dir) is empty: name a folder".into(),
+            ));
+        }
+        check_profile(dir)?;
+    }
     let executable = match &options.executable {
         Some(path) => path.clone(),
         None => find_firefox()?,
@@ -313,15 +322,7 @@ async fn start_once(options: &LaunchOptions) -> Result<Started> {
     }
 
     let (profile, temp) = match &options.user_data_dir {
-        Some(dir) => {
-            if dir.as_os_str().to_string_lossy().trim().is_empty() {
-                return Err(Error::Launch(
-                    "the profile folder (user_data_dir) is empty: name a folder".into(),
-                ));
-            }
-            check_profile(dir)?;
-            (dir.clone(), None)
-        }
+        Some(dir) => (dir.clone(), None),
         None => {
             let temp = TempProfile::make()
                 .map_err(|e| Error::Launch(format!("can't make a profile directory: {e}")))?;
