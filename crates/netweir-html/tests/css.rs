@@ -295,3 +295,151 @@ fn selectors_read_as_css_reads_them() {
     assert!(SelectorList::parse(":has(a):has(b)").is_ok());
     assert!(SelectorList::parse(":is(:has(a))").is_ok());
 }
+
+#[test]
+fn default_and_indeterminate_follow_the_markup() {
+    let html = r#"<form id="f">
+<input type="text" name="t"><button id="first" type="button">no</button>
+<button id="go">go</button><input type="submit" id="second">
+<input type="checkbox" id="c1" checked><input type="checkbox" id="c2">
+<input type="radio" id="a1" name="a"><input type="radio" id="a2" name="a" checked>
+<input type="radio" id="b1" name="b"><input type="radio" id="b2" name="b">
+<input type="radio" id="alone">
+<select><option id="o1">x</option><option id="o2" selected>y</option></select>
+</form>
+<form id="g"></form><input type="submit" id="outside" form="g">
+<input type="radio" id="b3" name="b" checked>
+<progress id="busy"></progress><progress id="half" value="0.5"></progress>"#;
+    assert_eq!(
+        select(html, ":default"),
+        [
+            "button#go",
+            "input#c1",
+            "input#a2",
+            "option#o2",
+            "input#outside",
+            "input#b3"
+        ]
+    );
+    // b3 is checked, but outside the form, so form f's group b has none.
+    assert_eq!(
+        select(html, ":indeterminate"),
+        ["input#b1", "input#b2", "input#alone", "progress#busy"]
+    );
+}
+
+#[test]
+fn in_range_and_out_of_range_follow_min_max_and_the_value() {
+    let html = r#"<input id="n1" type="number" min="1" max="10" value="5">
+<input id="n2" type="number" min="1" max="10" value="11"><input id="n3" type="number" min="1" value="0.5e0">
+<input id="n4" type="number" min="1" max="10"><input id="n5" type="number" min="1" value="ten">
+<input id="n6" type="number" value="5"><input id="n7" type="number" min="1" value="0" disabled>
+<input id="n8" type="number" min="1" value="0" readonly><datalist><input id="n9" type="number" min="1" value="0"></datalist>
+<input id="r1" type="range" value="500"><input id="r2" type="range" readonly value="-5">
+<input id="d1" type="date" min="2024-01-01" value="2024-02-29"><input id="d2" type="date" max="2023-12-31" value="2024-01-01">
+<input id="d3" type="date" min="2024-01-01" value="2023-02-29">
+<input id="m1" type="month" max="2024-06" value="2024-07"><input id="w1" type="week" min="2025-W53" value="2025-W01">
+<input id="w2" type="week" min="2020-W53" value="2020-W53">
+<input id="t1" type="time" min="22:00" max="06:00" value="23:30"><input id="t2" type="time" min="22:00" max="06:00" value="12:00">
+<input id="dt" type="datetime-local" max="2024-01-01T12:00" value="2024-01-01 12:00:01">
+<input id="text" type="text" min="1" value="0"><input id="dot" type="number" min="1." value="0">
+<input id="n10" type="number" min="1" value="1.">"#;
+    assert_eq!(
+        select(html, ":in-range"),
+        [
+            "input#n1",
+            "input#n4",
+            "input#n5",
+            "input#r1",
+            "input#r2",
+            "input#d1",
+            "input#d3",
+            "input#w2",
+            "input#t1",
+            "input#n10"
+        ]
+    );
+    assert_eq!(
+        select(html, ":out-of-range"),
+        [
+            "input#n2", "input#n3", "input#d2", "input#m1", "input#t2", "input#dt"
+        ]
+    );
+}
+
+#[test]
+fn valid_and_invalid_follow_the_constraints_the_markup_sets() {
+    let html = r#"<form id="f">
+<input id="req" required><input id="req-ok" required value="x"><input id="plain">
+<input id="mail" type="email" value="a@b.example"><input id="bad-mail" type="email" value="a@-b">
+<input id="mails" type="email" multiple value=" a@b.example , c@d.example "><input id="url" type="url" value="https://x.test/">
+<input id="bad-url" type="url" value="not a url"><input id="num" type="number" min="1" max="10" step="2" value="5">
+<input id="off-step" type="number" min="1" step="2" value="4"><input id="over" type="number" max="3" value="4">
+<input id="any" type="number" min="0" step="any" value="0.5"><input id="wk" type="week" min="2020-W53" step="2" value="2021-W02">
+<input id="box" type="checkbox" required><input id="file" type="file" required>
+<input id="r1" type="radio" name="g" required><input id="r2" type="radio" name="g">
+<textarea id="ta" required></textarea>
+<select id="sel" required><option value="">Pick</option><option>A</option></select>
+<select id="sel-ok" required><option value="">Pick</option><option selected>A</option></select>
+<input id="ro" required readonly><input id="off" required disabled><input id="hid" type="hidden" required>
+<button id="go">go</button><button id="nope" type="button">x</button>
+</form>
+<form id="g"><input id="fine" value="x"></form>
+<fieldset id="fs"><input id="in-fs" type="email" value="x"></fieldset>"#;
+    assert_eq!(
+        select(html, "input:invalid, textarea:invalid, select:invalid"),
+        [
+            "input#req",
+            "input#bad-mail",
+            "input#bad-url",
+            "input#off-step",
+            "input#over",
+            "input#box",
+            "input#file",
+            "input#r1",
+            "input#r2",
+            "textarea#ta",
+            "select#sel",
+            "input#in-fs"
+        ]
+    );
+    assert_eq!(
+        select(html, "input:valid, select:valid, button:valid"),
+        [
+            "input#req-ok",
+            "input#plain",
+            "input#mail",
+            "input#mails",
+            "input#url",
+            "input#num",
+            "input#any",
+            "input#wk",
+            "select#sel-ok",
+            "button#go",
+            "input#fine"
+        ]
+    );
+    assert_eq!(
+        select(html, "form:invalid, fieldset:invalid"),
+        ["form#f", "fieldset#fs"]
+    );
+    assert_eq!(select(html, "form:valid"), ["form#g"]);
+}
+
+#[test]
+fn valid_reads_attributes_as_the_standard_parses_them() {
+    let html = r#"<input id="one-mail" type="email" value="a@b.example,c@d.example">
+<input id="two-mails" type="email" multiple value="a@b.example,c@d.example">
+<select id="list" required size="3"><option>A</option></select>
+<input id="step-ws" type="number" min="0" step=" 2 " value="3">
+<input id="step-unit" type="number" min="0" step="2px" value="4">
+<select id="px" required size="2px"><option value="" selected>None</option><option>A</option></select>"#;
+    assert_eq!(
+        select(html, ":invalid"),
+        ["input#one-mail", "select#list", "input#step-ws"]
+    );
+    assert_eq!(
+        select(html, ":valid"),
+        ["input#two-mails", "input#step-unit", "select#px"]
+    );
+}

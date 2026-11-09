@@ -209,6 +209,51 @@ async fn routes_abort_change_and_answer_requests() {
     browser.close().await.unwrap();
 }
 
+/// A route sees what a request sent: text, and bytes that aren't text,
+/// on Firefox too, where its events leave the body out.
+#[tokio::test]
+async fn a_route_reads_the_body_a_request_sent() {
+    let Some(browser) = browser().await else {
+        return;
+    };
+    let server = shop();
+    let page = browser.new_page().await.unwrap();
+    page.goto(&format!("{}/", server.url), WaitUntil::Load, None)
+        .await
+        .unwrap();
+    let mut routes = page.route().await.unwrap();
+    let answering = tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        while let Some(route) = routes.recv().await {
+            if !route.request().url.contains("/sent") {
+                route.continue_(Continue::default()).await.unwrap();
+                continue;
+            }
+            let body = route.request().post_data.clone();
+            route.fulfill(200, &[], b"ok").await.unwrap();
+            bodies.push(body);
+            if bodies.len() == 3 {
+                return bodies;
+            }
+        }
+        bodies
+    });
+    let sent = page
+        .evaluate(
+            "(async () => { for (const body of ['a=1&b=two', new Uint8Array([0, 255, 7])]) \
+             await fetch('/sent', {method: 'POST', body}); \
+             await fetch('/sent'); return true })()",
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent, json!(true));
+    assert_eq!(
+        answering.await.unwrap(),
+        vec![Some(b"a=1&b=two".to_vec()), Some(vec![0, 255, 7]), None]
+    );
+    browser.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_route_nobody_decides_lets_the_request_go_on() {
     let Some(executable) = common::chrome() else {

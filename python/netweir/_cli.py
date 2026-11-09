@@ -830,7 +830,11 @@ class _Session:
             path = None
         elif Path(target).is_file():
             path = Path(target)
-        elif _HOST.fullmatch(target) and not _FILE_ENDING.search(target):
+        elif (host := _HOST.fullmatch(target)) and (
+            # A port or a path after the host means a host, whatever the
+            # ending; only a bare name like page.html could be a file.
+            host[3] or (host[4] or "").startswith("/") or not _FILE_ENDING.search(target)
+        ):
             path, target = None, "https://" + target
         elif _FILE_ENDING.search(target):
             raise _Usage(f"no such file: {target}")

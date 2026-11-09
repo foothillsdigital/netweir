@@ -33,6 +33,10 @@ doc.css("a::attr(title), .price::text").getall()
 - `::attr(name)` gives an attribute's value.
 - With neither, `get()` gives the element's HTML, the way Chrome's
   `outerHTML` writes it.
+- Form pseudo-classes read the markup as it stands: `:valid` and `:invalid`
+  check `required`, `type="email"` and `"url"`, `min`, `max` and `step`, but
+  not `pattern`, nor the limits only typing can break (`maxlength`,
+  `minlength`). An input with a `pattern` matches as if it had none.
 
 ## XPath
 
@@ -304,7 +308,8 @@ netweir.jmespath("props.items[].id", page.js_data("__STATE__"))
   what `js_data()` returned.
 
 They return plain Python values: dicts, lists, strings, numbers, None.
-Text that isn't JSON raises `ValueError`. For JavaScript objects that
+Text that isn't JSON raises `ValueError`; on a selection it names the result,
+such as `result 1 isn't JSON ('var x=1;': ...)`. For JavaScript objects that
 aren't strict JSON, read them with `js_data()` first and pass the result
 to `netweir.jmespath()`.
 
