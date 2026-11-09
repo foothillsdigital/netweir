@@ -135,14 +135,24 @@ pub(super) async fn open(
 /// None of it is anything a page can see. A request paused in a context
 /// no page of netweir's holds goes on unchanged. Returns the collector.
 pub(crate) async fn watch_browser(conn: &crate::conn::Connection) -> Result<String> {
-    let unheld = conn.clone();
+    // Request bodies are kept too, for routes (a HAR file matching a
+    // POST's, say): Firefox doesn't put them in its events.
+    let collected = conn
+        .call(
+            "",
+            "network.addDataCollector",
+            json!({"dataTypes": ["request", "response"], "maxEncodedDataSize": BODY_KEPT}),
+        )
+        .await?;
+    let collector = str_of(&collected, "collector");
+    let (unheld, kept) = (conn.clone(), collector.clone());
     let handler: Handler = Arc::new(move |method, params| {
-        if method == "network.beforeRequestSent" && params["isBlocked"] == true {
-            unheld.send(
-                "",
-                "network.continueRequest",
-                json!({"request": str_of(&params["request"], "request")}),
-            );
+        if method == "network.beforeRequestSent" {
+            let request = str_of(&params["request"], "request");
+            if params["isBlocked"] == true {
+                unheld.send("", "network.continueRequest", json!({"request": request}));
+            }
+            unheld_body(&unheld, &kept, params);
         }
     });
     conn.on("", handler);
@@ -158,14 +168,43 @@ pub(crate) async fn watch_browser(conn: &crate::conn::Connection) -> Result<Stri
         }),
     )
     .await?;
-    let collected = conn
+    Ok(collector)
+}
+
+/// Lets go of the body Firefox kept for a request no route will read
+/// (`params`, its `network.beforeRequestSent`): only a paused one goes to
+/// a route.
+pub(crate) fn unheld_body(conn: &crate::conn::Connection, collector: &str, params: &Value) {
+    if params["isBlocked"] != true && params["request"]["bodySize"].as_u64().unwrap_or(0) > 0 {
+        conn.send(
+            "",
+            "network.disownData",
+            json!({"dataType": "request", "collector": collector, "request": str_of(&params["request"], "request")}),
+        );
+    }
+}
+
+/// The body `request` sent, as `collector` kept it, let go of once read.
+/// None when Firefox has it no longer.
+pub(crate) async fn request_body(
+    conn: &crate::conn::Connection,
+    collector: &str,
+    request: &str,
+) -> Option<Vec<u8>> {
+    let got = conn
         .call(
             "",
-            "network.addDataCollector",
-            json!({"dataTypes": ["response"], "maxEncodedDataSize": BODY_KEPT}),
+            "network.getData",
+            json!({"dataType": "request", "collector": collector, "request": request, "disown": true}),
         )
-        .await?;
-    Ok(str_of(&collected, "collector"))
+        .await
+        .ok()?;
+    let value = got["bytes"]["value"].as_str()?;
+    if got["bytes"]["type"] == "base64" {
+        decoded("network.getData", &json!({"data": value})).ok()
+    } else {
+        Some(value.as_bytes().to_vec())
+    }
 }
 
 /// The first part of `env` a Firefox page can't have, by the name its
@@ -1172,6 +1211,9 @@ pub(super) fn handler(
                 state.unreachable.insert(loader, url);
             }
             "network.beforeRequestSent" => {
+                if let Some(collector) = &decider.collector {
+                    unheld_body(&conn, collector, params);
+                }
                 if state.in_flight.len() >= LOADING {
                     state.in_flight.clear();
                 }

@@ -1232,14 +1232,25 @@ async fn a_firefox_pages_routes_see_only_its_own_requests() {
     let mut routes = routed.route().await.unwrap();
     let other = browser.new_page().await.unwrap();
     other
-        .goto(&server.url, netweir_browser::WaitUntil::NetworkIdle, None)
+        .goto(&server.url, netweir_browser::WaitUntil::Load, None)
         .await
         .unwrap();
+    // The script's fetch may only go out after the load, and later still
+    // on a busy machine: waited for, rather than the network going quiet,
+    // which it can seem to before Firefox has said the fetch began.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !server.paths().contains(&"/api".to_string()) {
+        assert!(
+            Instant::now() < deadline,
+            "another page's request never went on: {:?}",
+            server.paths()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         routes.try_recv().is_err(),
         "another page's request reached the routes"
     );
-    assert!(server.paths().contains(&"/api".to_string()));
     browser.close().await.unwrap();
 }
 
