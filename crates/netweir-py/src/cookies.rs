@@ -33,9 +33,14 @@ pub(crate) fn cookie_list(py: Python<'_>, cookies: &[Cookie]) -> PyResult<Py<PyA
 /// (`httpOnly`, `sameSite`, `partitionKey`). With `defaults`, domain and
 /// path may be left out, for the URL it goes with to fill in.
 pub(crate) fn cookie_from(d: &Bound<'_, PyAny>, defaults: bool) -> PyResult<Cookie> {
-    let d = d
-        .cast::<PyDict>()
-        .map_err(|_| PyTypeError::new_err("each cookie must be a dict"))?;
+    // Only the type, never the object: a string like "sid=2" is the cookie itself.
+    let d = d.cast::<PyDict>().map_err(|_| {
+        let kind = d.get_type().name().map(|n| n.to_string());
+        PyTypeError::new_err(format!(
+            "each cookie must be a dict, not {}",
+            kind.as_deref().unwrap_or("something else")
+        ))
+    })?;
     let text = |keys: &[&str]| -> PyResult<Option<String>> {
         for key in keys {
             if let Some(v) = d.get_item(key)?.filter(|v| !v.is_none()) {
@@ -52,8 +57,14 @@ pub(crate) fn cookie_from(d: &Bound<'_, PyAny>, defaults: bool) -> PyResult<Cook
         }
         Ok(false)
     };
+    // Read first, so every error below can say which cookie it's about.
+    let name = text(&["name"])?;
+    let which = || match &name {
+        Some(name) => format!("the cookie {name:?}"),
+        None => "a cookie".to_string(),
+    };
     let required = |key: &str| -> PyResult<String> {
-        text(&[key])?.ok_or_else(|| PyValueError::new_err(format!("a cookie needs a {key:?}")))
+        text(&[key])?.ok_or_else(|| PyValueError::new_err(format!("{} needs a {key:?}", which())))
     };
     let partition_key = match d.get_item("partitionKey")? {
         // Playwright's, or Chrome's own object.
@@ -74,12 +85,16 @@ pub(crate) fn cookie_from(d: &Bound<'_, PyAny>, defaults: bool) -> PyResult<Cook
             required("domain")?
         },
         path: text(&["path"])?.unwrap_or_else(|| if defaults { "" } else { "/" }.into()),
-        expires: d
-            .get_item("expires")?
-            .filter(|v| !v.is_none())
-            .map(|v| v.extract())
-            .transpose()?
-            .unwrap_or(-1.0),
+        expires: match d.get_item("expires")?.filter(|v| !v.is_none()) {
+            None => -1.0,
+            Some(v) => v.extract().map_err(|_| {
+                let given = v.repr().map(|r| r.to_string()).unwrap_or_default();
+                PyValueError::new_err(format!(
+                    "{}: expires is seconds since the epoch, not {given}",
+                    which()
+                ))
+            })?,
+        },
         http_only: flag(&["http_only", "httpOnly"])?,
         secure: flag(&["secure"])?,
         same_site: text(&["same_site", "sameSite"])?,
