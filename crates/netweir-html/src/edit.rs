@@ -133,9 +133,10 @@ impl Document {
         self.detach(id);
     }
 
-    /// Sets an attribute, replacing one of the same name. HTML elements'
-    /// attribute names are lowercased, as `setAttribute` does; SVG's and
-    /// MathML's keep the case they're given.
+    /// Sets an attribute, replacing the first one of the same qualified name
+    /// in any namespace (`xlink:href`), as `setAttribute` does. HTML
+    /// elements' attribute names are lowercased; SVG's and MathML's keep the
+    /// case they're given.
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
         let Some(e) = self.element(id) else { return };
         let ns = e.ns;
@@ -144,12 +145,11 @@ impl Document {
         let value = self.push_stable(value);
         let name_span = self.push_stable(&name);
         self.rewrite_attrs(id, |doc, attrs| {
-            // By the name as written, so viewBox finds a parsed viewBox, or
-            // as stored, so no two attributes are ever written alike.
-            match attrs
-                .iter_mut()
-                .find(|a| a.ns == AttrNs::None && doc.is_attr(ns, a, &name, given))
-            {
+            // By qualified name in any namespace, as setAttribute does, so
+            // xlink:href finds a parsed xlink:href and keeps its namespace;
+            // on a foreign element by the name as written too, so viewBox
+            // finds a parsed viewBox and no two are ever written alike.
+            match attrs.iter_mut().find(|a| doc.is_attr(ns, a, &name, given)) {
                 Some(a) => a.value = value,
                 None => attrs.push(Attr {
                     ns: AttrNs::None,
@@ -300,11 +300,13 @@ impl Document {
     }
 
     /// Whether `a`, on an element in `ns`, is the attribute code calls
-    /// `given`, stored as `stored`: by the name as stored, or on a foreign
+    /// `given`, stored as `stored`: by the name as stored when it has no
+    /// namespace (a namespaced one stores its local name), or on a foreign
     /// element by the name as written, so viewBox finds a parsed viewBox
     /// and no two attributes are ever written alike.
     fn is_attr(&self, ns: Ns, a: &Attr, stored: &str, given: &str) -> bool {
-        self.str(a.name) == stored || (ns != Ns::Html && self.written_name(ns, a) == given)
+        (a.ns == AttrNs::None && self.str(a.name) == stored)
+            || (ns != Ns::Html && self.written_name(ns, a) == given)
     }
 
     /// Changes an element's attributes through a copy at the end of the
@@ -372,6 +374,36 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn set_attr_replaces_a_namespaced_attribute_of_the_same_name() {
+        let mut doc = parse_fragment(
+            "<svg><use xlink:href=\"#a\"></use></svg>",
+            Ns::Html,
+            "div",
+            false,
+        );
+        let svg = doc.children(doc.root()).next().unwrap();
+        let used = doc.children(svg).next().unwrap();
+        doc.set_attr(used, "xlink:href", "#b");
+        assert_eq!(doc.outer_html(used), "<use xlink:href=\"#b\"></use>");
+        let attrs: Vec<_> = doc.attrs(used).collect();
+        assert_eq!(attrs, [(crate::AttrNs::XLink, "href", "#b")]);
+        // A plain href is another attribute: its qualified name isn't xlink:href.
+        assert!(!doc.remove_attr(used, "href"));
+        doc.set_attr(used, "href", "#c");
+        let attrs: Vec<_> = doc.attrs(used).collect();
+        assert_eq!(
+            attrs,
+            [
+                (crate::AttrNs::XLink, "href", "#b"),
+                (crate::AttrNs::None, "href", "#c")
+            ]
+        );
+        assert!(doc.remove_attr(used, "href"));
+        let attrs: Vec<_> = doc.attrs(used).collect();
+        assert_eq!(attrs, [(crate::AttrNs::XLink, "href", "#b")]);
     }
 
     #[test]

@@ -492,6 +492,46 @@ fn valid_and_invalid_follow_the_constraints_the_markup_sets() {
 }
 
 #[test]
+fn valid_checks_pattern_as_javascript_reads_it() {
+    let html = r#"<input id="three" pattern="\d{3}" value="123"><input id="four" pattern="\d{3}" value="1234">
+<input id="upper" pattern="[a-z]+" value="abC"><input id="arabic" pattern="\d+" value="٣">
+<input id="minus" pattern="[\w--\d]+" value="ab_"><input id="minus-bad" pattern="[\w--\d]+" value="a1">
+<input id="and" pattern="[[a-z]&&[^aeiou]]+" value="bcd"><input id="and-bad" pattern="[[a-z]&&[^aeiou]]+" value="bad">
+<input id="alt" pattern="ab|cd" value="abcd">
+<input id="mails" type="email" multiple pattern=".+@x\.test" value="a@x.test, b@x.test">
+<input id="mails-bad" type="email" multiple pattern=".+@x\.test" value="a@x.test,b@y.test">
+<input id="broken" pattern="[" value="anything"><input id="prop" pattern="\p{L}+" value="123">
+<input id="redos" pattern="(a+)+b" value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">
+<input id="num" type="number" pattern="x" value="5"><input id="empty" pattern="x">"#;
+    assert_eq!(
+        select(html, ":invalid"),
+        [
+            "input#four",
+            "input#upper",
+            "input#arabic",
+            "input#minus-bad",
+            "input#and-bad",
+            "input#alt",
+            "input#mails-bad",
+            "input#redos"
+        ]
+    );
+    assert_eq!(
+        select(html, ":valid"),
+        [
+            "input#three",
+            "input#minus",
+            "input#and",
+            "input#mails",
+            "input#broken",
+            "input#prop",
+            "input#num",
+            "input#empty"
+        ]
+    );
+}
+
+#[test]
 fn valid_reads_attributes_as_the_standard_parses_them() {
     let html = r#"<input id="one-mail" type="email" value="a@b.example,c@d.example">
 <input id="two-mails" type="email" multiple value="a@b.example,c@d.example">
