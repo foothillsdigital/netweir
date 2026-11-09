@@ -290,6 +290,12 @@ def test_jmespath_on_json_in_a_script():
     assert netweir.jmespath("props.items[0]", {"props": {"items": [1, 2]}}) == 1
     with pytest.raises(ValueError, match="isn't JSON"):
         doc.find("body").jmespath("a")
+    many = netweir.parse('<script>{"a":1}</script><script>\n  var   x=1;\n</script>')
+    with pytest.raises(ValueError, match=r"^result 1 isn't JSON \('var x=1;': Expecting value"):
+        many.css("script").jmespath("a")
+    long = netweir.parse("<script>" + "x" * 50 + "</script>")
+    with pytest.raises(ValueError, match=r"^result 0 isn't JSON \('x{30}\.\.\.': "):
+        long.css("script").jmespath("a")
 
 
 def test_jmespath_on_a_json_page():

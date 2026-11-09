@@ -71,6 +71,17 @@ fn serve() -> (String, Reports) {
                     }
                 }
                 let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+                {
+                    // Every request, kept in order, for a failure to show.
+                    let (lock, _) = &*kept;
+                    let mut reports = lock.lock().unwrap();
+                    let seen = reports
+                        .entry("requests".into())
+                        .or_insert(Value::Array(vec![]));
+                    if let Value::Array(seen) = seen {
+                        seen.push(Value::String(path.clone()));
+                    }
+                }
                 if let Some(who) = path.strip_prefix("/report?who=") {
                     let mut body = vec![0; length];
                     let _ = reader.read_exact(&mut body);
@@ -153,6 +164,87 @@ impl Drop for Undriven {
     }
 }
 
+/// What's in each of Firefox's own windows besides the page: its
+/// notification bars and its toolbars' heights.
+async fn windows(browser: &netweir_browser::Browser) -> String {
+    const LOOK: &str = r#"(() => {
+      const out = [];
+      const boxes = [window.gNotificationBox, window.gBrowser?.getNotificationBox?.()];
+      for (const box of boxes) {
+        for (const n of box?.allNotifications ?? []) {
+          out.push(`bar ${n.getAttribute("value")}: ${(n.messageText?.textContent ?? "").trim().slice(0, 100)}`);
+        }
+      }
+      for (const id of ["toolbar-menubar", "TabsToolbar", "nav-bar", "PersonalToolbar", "notifications-toolbar"]) {
+        const e = document.getElementById(id);
+        if (e) out.push(`${id} ${Math.round(e.getBoundingClientRect().height)}`);
+      }
+      out.push(`page ${window.gBrowser?.currentURI?.spec}`);
+      return out.join("; ");
+    })()"#;
+    let tree = match browser
+        .call_for_tests(
+            "browsingContext.getTree",
+            serde_json::json!({"moz:scope": "chrome"}),
+        )
+        .await
+    {
+        Ok(tree) => tree,
+        Err(e) => return format!("unreadable: {e}"),
+    };
+    let mut seen = Vec::new();
+    for context in tree["contexts"].as_array().into_iter().flatten() {
+        let said = browser
+            .call_for_tests(
+                "script.evaluate",
+                serde_json::json!({
+                    "expression": LOOK,
+                    "target": {"context": context["context"]},
+                    "awaitPromise": false,
+                }),
+            )
+            .await;
+        seen.push(match said {
+            Ok(r) => r["result"]["value"].as_str().unwrap_or("?").to_string(),
+            Err(e) => format!("unreadable: {e}"),
+        });
+    }
+    seen.join(" | ")
+}
+
+/// Saves what's on the screen to `$NETWEIR_FAILURE_DIR`, when it's set
+/// (in CI, which keeps the folder of a failed run), as best the system's
+/// own tools can.
+fn screenshot(mode: &str) {
+    let Some(dir) = std::env::var_os("NETWEIR_FAILURE_DIR") else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = Path::new(&dir).join(format!("stealth-firefox-{mode}.png"));
+    let path = path.to_string_lossy().into_owned();
+    let saved = if cfg!(target_os = "macos") {
+        std::process::Command::new("screencapture")
+            .args(["-x", &path])
+            .status()
+    } else if cfg!(windows) {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+             $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; \
+             $i = New-Object System.Drawing.Bitmap $b.Width, $b.Height; \
+             [System.Drawing.Graphics]::FromImage($i).CopyFromScreen($b.Left, $b.Top, 0, 0, $i.Size); \
+             $i.Save('{path}')"
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status()
+    } else {
+        std::process::Command::new("import")
+            .args(["-window", "root", &path])
+            .status()
+    };
+    eprintln!("screenshot {path}: {saved:?}");
+}
+
 /// Whether a headed Firefox can open a window here.
 fn has_display() -> bool {
     !cfg!(target_os = "linux") || std::env::var_os("DISPLAY").is_some()
@@ -171,6 +263,11 @@ async fn compare(headless: bool) {
         return;
     }
     let _turn = common::turns_for(2);
+    // Lets the test read Firefox's own windows when the page differs.
+    // Only this test binary's Firefoxes see it, and no page can.
+    static SYSTEM: std::sync::Once = std::sync::Once::new();
+    // SAFETY: set once, before any Firefox is started, to one value.
+    SYSTEM.call_once(|| unsafe { std::env::set_var("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1") });
     let (base, reports) = serve();
     let mode = if headless { "headless" } else { "headed" };
     let scratch =
@@ -206,8 +303,6 @@ async fn compare(headless: bool) {
     })
     .await
     .unwrap();
-    browser.close().await.unwrap();
-    let _ = std::fs::remove_dir_all(&scratch);
 
     let (theirs, ours) = (theirs.as_object().unwrap(), report.as_object().unwrap());
     // Focus depends on which app the system has in front, which neither
@@ -228,6 +323,19 @@ async fn compare(headless: bool) {
         .collect();
     differences.sort();
     differences.dedup();
+    if !differences.is_empty() {
+        // Shown while Netweir's window is still open: what the page
+        // can't see (a bar above it, say) is on the screen.
+        screenshot(mode);
+        differences.push(format!("Firefox's windows: {}", windows(&browser).await));
+        let requests = reports.0.lock().unwrap().get("requests").cloned();
+        differences.push(format!(
+            "requests, in order: {}",
+            requests.unwrap_or_default()
+        ));
+    }
+    browser.close().await.unwrap();
+    let _ = std::fs::remove_dir_all(&scratch);
     assert!(
         differences.is_empty(),
         "{mode}: a page can tell Netweir's Firefox from an undriven one:\n{}",
