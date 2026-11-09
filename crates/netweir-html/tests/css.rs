@@ -321,6 +321,44 @@ fn lang_matches_the_nearest_language_by_extended_filtering() {
 }
 
 #[test]
+fn dir_follows_the_dir_attribute_and_the_text_for_auto() {
+    let html = r#"<p id="plain">x</p><div id="r" dir="RTL"><span id="in">x</span></div>
+<div id="he" dir="auto">123 שלום abc</div>
+<div id="digits" dir="auto">123</div>
+<div id="script" dir="auto"><script>ש</script>abc</div>
+<div id="nested" dir="auto"><span dir="ltr">abc</span>مرحبا</div>
+<bdi id="bdi">مرحبا</bdi>
+<input id="field" dir="auto" value="שלום"><textarea id="ta" dir="auto">abc</textarea>
+<div id="bad" dir="sideways"><i id="i">x</i></div>"#;
+    assert_eq!(
+        select(html, ":dir(rtl)"),
+        [
+            "div#r",
+            "span#in",
+            "div#he",
+            "div#nested",
+            "bdi#bdi",
+            "input#field"
+        ]
+    );
+    assert_eq!(
+        select(
+            html,
+            "div:dir(ltr), p:dir(ltr), textarea:dir(ltr), i:dir(ltr)"
+        ),
+        [
+            "p#plain",
+            "div#digits",
+            "div#script",
+            "textarea#ta",
+            "div#bad",
+            "i#i"
+        ]
+    );
+    assert!(SelectorList::parse(":dir(up)").is_err());
+}
+
+#[test]
 fn default_and_indeterminate_follow_the_markup() {
     let html = r#"<form id="f">
 <input type="text" name="t"><button id="first" type="button">no</button>
