@@ -136,6 +136,11 @@ enum Pseudo {
     ReadWrite,
     ReadOnly,
     PlaceholderShown,
+    /// `:blank`: a field a user types text into that holds none.
+    Blank,
+    /// `:defined`: everything but an HTML custom element, which a static
+    /// document never defines.
+    Defined,
     Target,
     TargetWithin,
     LocalLink,
@@ -600,6 +605,8 @@ impl<'a> Parser<'a> {
             "read-write" => Pseudo::ReadWrite,
             "read-only" => Pseudo::ReadOnly,
             "placeholder-shown" => Pseudo::PlaceholderShown,
+            "blank" => Pseudo::Blank,
+            "defined" => Pseudo::Defined,
             "target" => Pseudo::Target,
             "target-within" => Pseudo::TargetWithin,
             "local-link" => Pseudo::LocalLink,
@@ -813,6 +820,43 @@ fn input_type_state(typ: Option<&str>) -> &'static str {
     typ.and_then(|t| TYPES.iter().find(|k| k.eq_ignore_ascii_case(t)))
         .copied()
         .unwrap_or("text")
+}
+
+/// The `<input>` types a user types text into: the ones `placeholder`
+/// applies to.
+fn text_entry(typ: &str) -> bool {
+    matches!(
+        typ,
+        "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+    )
+}
+
+/// HTML's valid custom element name: a lowercase ASCII letter, then
+/// PCENChars including a hyphen, and not one of the hyphenated names SVG
+/// and MathML already use.
+fn custom_element_name(name: &str) -> bool {
+    const RESERVED: [&str; 8] = [
+        "annotation-xml",
+        "color-profile",
+        "font-face",
+        "font-face-src",
+        "font-face-uri",
+        "font-face-format",
+        "font-face-name",
+        "missing-glyph",
+    ];
+    let pcen = |c: char| {
+        matches!(c,
+            '-' | '.' | '0'..='9' | '_' | 'a'..='z' | '\u{B7}'
+            | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{37D}'
+            | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{203F}'..='\u{2040}'
+            | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    };
+    name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.contains('-')
+        && name.chars().all(pcen)
+        && !RESERVED.contains(&name)
 }
 
 fn readonly_applies(typ: &str) -> bool {
@@ -2407,6 +2451,24 @@ impl<'a> Cx<'a> {
                 Tag::Textarea => self.attr(el, "placeholder").is_some() && doc.text(el).is_empty(),
                 _ => false,
             },
+            // The current draft's meaning: :placeholder-shown without the
+            // placeholder, on the fields placeholder applies to.
+            Pseudo::Blank => match tag {
+                Tag::Input => {
+                    text_entry(input_type_state(self.attr(el, "type")))
+                        && self.attr(el, "value").is_none_or(str::is_empty)
+                }
+                Tag::Textarea => doc.text(el).is_empty(),
+                _ => false,
+            },
+            // The DOM gives an HTML element made with a custom element's
+            // name, or with is=, the state "undefined" until a definition
+            // upgrades it, and nothing here defines one.
+            Pseudo::Defined => {
+                !(html
+                    && (self.attr(el, "is").is_some()
+                        || doc.lower_name(el).is_some_and(custom_element_name)))
+            }
             Pseudo::Lang(ranges) => self.lang(el).is_some_and(|tag| {
                 let tag = tag.to_ascii_lowercase();
                 ranges.iter().any(|range| lang_matches(range, &tag))
