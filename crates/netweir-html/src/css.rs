@@ -74,6 +74,8 @@ enum Simple {
     Pseudo(Pseudo),
     /// The element a `:has()` argument is relative to.
     Anchor,
+    /// The element is in this namespace: a declared prefix, or the default.
+    Ns(Ns),
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +166,7 @@ struct Parser<'a> {
     depth: u32,
     /// Inside `:has()`, where Selectors 4 doesn't allow another `:has()`.
     in_has: bool,
+    opts: &'a ParseOptions<'a>,
 }
 
 /// Nesting deeper than any real selector, and shallow enough for a
@@ -421,8 +424,13 @@ impl<'a> Parser<'a> {
     fn compound(&mut self) -> Result<Compound, SelectorError> {
         let mut simple = Vec::new();
         let mut universal = false;
+        // Whether the compound has a type selector or `*`, and whether it
+        // had a namespace prefix, which the default doesn't override.
+        let mut explicit = false;
+        let mut prefixed = false;
         // A type selector or universal, with an optional namespace prefix.
         if self.peek() == Some('*') || self.starts_name() || self.peek() == Some('|') {
+            explicit = true;
             let star = self.eat('*');
             universal = star;
             let name = if star || self.peek() == Some('|') {
@@ -432,20 +440,24 @@ impl<'a> Parser<'a> {
             };
             if self.peek() == Some('|') && self.peek_at(1) != Some('=') {
                 self.pos += 1;
-                // Only `*|` (any namespace) and `|` (none) can be used
-                // without @namespace, which a query can't declare.
-                if !(star || name.is_empty()) {
-                    return error(format!("namespace prefix {name:?} isn't declared"));
-                }
-                // `|x` asks for no namespace, which no element in an HTML
-                // document has.
-                let none = !star;
+                prefixed = true;
+                // `*|` is any namespace; `|x` asks for none, which no
+                // element in an HTML document has; any other prefix must
+                // be declared.
+                let ns = match (star, name.is_empty()) {
+                    (true, _) => None,
+                    (false, true) => {
+                        simple.push(Simple::Pseudo(Pseudo::Never));
+                        None
+                    }
+                    (false, false) => Some(self.namespace(&name)?),
+                };
                 if !self.eat('*') {
                     let local = self.ident()?;
                     simple.push(type_selector(local));
                 }
-                if none {
-                    simple.push(Simple::Pseudo(Pseudo::Never));
+                if let Some(ns) = ns {
+                    simple.push(Simple::Ns(ns));
                 }
             } else if !star {
                 simple.push(type_selector(name));
@@ -474,7 +486,15 @@ impl<'a> Parser<'a> {
                 }
                 Some('[') => {
                     self.pos += 1;
-                    simple.push(Simple::Attr(self.attr()?));
+                    let declared = self.declared_attr_prefix();
+                    let attr = self.attr()?;
+                    // Every namespace a prefix can name is an element's;
+                    // no attribute is in one.
+                    simple.push(if declared {
+                        Simple::Pseudo(Pseudo::Never)
+                    } else {
+                        Simple::Attr(attr)
+                    });
                 }
                 Some(':') if self.peek_at(1) == Some(':') => {
                     return error("pseudo-elements can't be selected");
@@ -492,7 +512,43 @@ impl<'a> Parser<'a> {
                 None => "a selector ends early".to_string(),
             });
         }
+        // The default namespace limits a compound without a prefix, but as
+        // Selectors 4 says for :is(), not one inside a functional
+        // pseudo-class that has no type selector or `*`.
+        // shortcut: that exemption covers every compound in the argument,
+        // not just its subject; split them if a selector ever needs it.
+        if let Some(ns) = self.opts.default
+            && !prefixed
+            && (explicit || self.depth == 0)
+        {
+            simple.push(Simple::Ns(ns));
+        }
         Ok(Compound(simple))
+    }
+
+    fn namespace(&self, prefix: &str) -> Result<Ns, SelectorError> {
+        match self.opts.namespaces.iter().find(|(p, _)| *p == prefix) {
+            Some(&(_, ns)) => Ok(ns),
+            None => error(format!("namespace prefix {prefix:?} isn't declared")),
+        }
+    }
+
+    /// Eats a declared `prefix|` at the start of an attribute selector,
+    /// leaving anything else for `attr` to read or refuse.
+    fn declared_attr_prefix(&mut self) -> bool {
+        let start = self.pos;
+        self.skip_space();
+        if self.starts_name()
+            && let Ok(name) = self.ident()
+            && self.peek() == Some('|')
+            && self.peek_at(1) != Some('=')
+            && self.opts.namespaces.iter().any(|(p, _)| *p == name)
+        {
+            self.pos += 1;
+            return true;
+        }
+        self.pos = start;
+        false
     }
 
     fn attr(&mut self) -> Result<AttrSelector, SelectorError> {
@@ -651,7 +707,7 @@ impl<'a> Parser<'a> {
                 };
                 let (a, b) = an_plus_b(anb)?;
                 let of = rest
-                    .map(|rest| SelectorList::parse_at(rest, self.depth, self.in_has))
+                    .map(|rest| SelectorList::parse_at(rest, self.depth, self.in_has, self.opts))
                     .transpose()?;
                 self.pos = close;
                 Pseudo::Nth {
@@ -1163,17 +1219,57 @@ fn nth(a: i32, b: i32, last: bool, of_type: bool) -> Pseudo {
     }
 }
 
+/// What a stylesheet's `@namespace` rules would declare, for
+/// [`SelectorList::parse_with`]. The default declares nothing, as
+/// [`SelectorList::parse`] does.
+///
+/// Namespaces are named by [`Ns`], so only the HTML, SVG and MathML
+/// namespaces can be declared: those are the ones the parser puts elements
+/// in. A custom namespace URI has no `Ns` to name it. Neither does
+/// [`Ns::Xml`], which stands for whatever namespace the host keeps for an
+/// XML element, so declaring it is an error.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOptions<'a> {
+    /// Prefixes and their namespaces: `("svg", Ns::Svg)` makes `svg|rect`
+    /// a `rect` in the SVG namespace. Prefixes compare exactly.
+    pub namespaces: &'a [(&'a str, Ns)],
+    /// The `@namespace` without a prefix: type selectors and `*` without
+    /// a prefix match only elements in it, and so does a compound with
+    /// neither. Attribute selectors aren't affected.
+    pub default: Option<Ns>,
+}
+
 impl SelectorList {
     pub fn parse(selector: &str) -> Result<SelectorList, SelectorError> {
-        SelectorList::parse_at(selector, 0, false)
+        SelectorList::parse_with(selector, &ParseOptions::default())
     }
 
-    fn parse_at(selector: &str, depth: u32, in_has: bool) -> Result<SelectorList, SelectorError> {
+    /// [`SelectorList::parse`] with namespace prefixes declared, as
+    /// `@namespace` rules would.
+    pub fn parse_with(selector: &str, opts: &ParseOptions) -> Result<SelectorList, SelectorError> {
+        let declared = opts
+            .namespaces
+            .iter()
+            .map(|&(_, ns)| ns)
+            .chain(opts.default);
+        if declared.into_iter().any(|ns| ns == Ns::Xml) {
+            return error("Ns::Xml isn't a namespace a selector can declare");
+        }
+        SelectorList::parse_at(selector, 0, false, opts)
+    }
+
+    fn parse_at(
+        selector: &str,
+        depth: u32,
+        in_has: bool,
+        opts: &ParseOptions,
+    ) -> Result<SelectorList, SelectorError> {
         let mut p = Parser {
             s: selector,
             pos: 0,
             depth,
             in_has,
+            opts,
         };
         let list = p.selector_list(false)?;
         p.skip_space();
@@ -1277,7 +1373,7 @@ impl Simple {
             Simple::Id(_) => (1, 0, 0),
             Simple::Class(_) | Simple::Attr(_) => (0, 1, 0),
             Simple::Type { .. } => (0, 0, 1),
-            Simple::Anchor => (0, 0, 0),
+            Simple::Anchor | Simple::Ns(_) => (0, 0, 0),
             Simple::Pseudo(p) => match p {
                 Pseudo::Is(list) | Pseudo::Not(list) | Pseudo::Has(list) => list.specificity(),
                 Pseudo::Where(_) => (0, 0, 0),
@@ -1683,6 +1779,7 @@ impl<'a> Cx<'a> {
             Simple::Attr(a) => self.attr_matches(el, e.ns, a),
             Simple::Pseudo(p) => self.pseudo(p, el, anchor),
             Simple::Anchor => el == anchor,
+            Simple::Ns(ns) => e.ns == *ns,
         })
     }
 

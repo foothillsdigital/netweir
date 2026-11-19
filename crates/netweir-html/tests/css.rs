@@ -1,8 +1,8 @@
 //! CSS selectors: every feature Netweir's own tests use, the rest of what
 //! lexbor offered, and where browsers and lexbor part ways, the browsers.
 
-use netweir_html::css::{MatchOptions, SelectorList};
-use netweir_html::{Document, Kind, NodeId, parse};
+use netweir_html::css::{MatchOptions, ParseOptions, SelectorList};
+use netweir_html::{Document, Kind, NodeId, Ns, parse};
 
 const PAGE: &str = r#"<!DOCTYPE html><html><head><title>Shop</title></head><body>
 <div id="main" class="Wide page">
@@ -114,6 +114,68 @@ fn plain_attribute_names_mean_no_namespace() {
     let svg = "<svg><use xlink:href=#a></use><a href=b></a></svg>";
     assert_eq!(select(svg, "[href]"), ["a"]);
     assert_eq!(select(svg, "[*|href]"), ["use", "a"]);
+}
+
+/// `@namespace` prefixes, declared through `parse_with`. Plain `parse`
+/// keeps refusing a prefix it wasn't given.
+#[test]
+fn declared_namespace_prefixes() {
+    let html = r#"<a id=1></a><svg><a id=2 href=x></a><title id=3></title></svg>
+        <math><mi id=4></mi></math>"#;
+    let doc = parse(html, false);
+    let root = doc.root();
+    let with = |css: &str, opts: &ParseOptions| {
+        let list = SelectorList::parse_with(css, opts).unwrap();
+        names(&doc, &list.select(&doc, root))
+    };
+    let ns = [("s", Ns::Svg), ("m", Ns::MathMl), ("h", Ns::Html)];
+    let prefixes = ParseOptions {
+        namespaces: &ns,
+        default: None,
+    };
+    assert_eq!(with("s|a", &prefixes), ["a#2"]);
+    assert_eq!(with("h|a", &prefixes), ["a#1"]);
+    assert_eq!(with("s|*", &prefixes), ["svg", "a#2", "title#3"]);
+    assert_eq!(with("m|*:not(math)", &prefixes), ["mi#4"]);
+    assert_eq!(with("svg > s|title, *|mi", &prefixes), ["title#3", "mi#4"]);
+    // No attribute is in the SVG namespace; `[*|href]` still finds it.
+    assert_eq!(with("[s|href]", &prefixes), Vec::<String>::new());
+    assert_eq!(with("[*|href]", &prefixes), ["a#2"]);
+    // A prefix adds nothing to specificity.
+    let spec = |css| {
+        SelectorList::parse_with(css, &prefixes)
+            .unwrap()
+            .specificity()
+    };
+    assert_eq!(spec("s|a"), (0, 0, 1));
+    assert_eq!(spec("s|*"), (0, 0, 0));
+    // Prefixes compare exactly, and plain parse declares none.
+    assert!(SelectorList::parse_with("S|a", &prefixes).is_err());
+    assert!(SelectorList::parse("s|a").is_err());
+    assert!(SelectorList::parse("[s|href]").is_err());
+
+    // A default namespace limits type selectors, `*` and compounds with
+    // neither, but not inside :not() without a type selector.
+    let svg = ParseOptions {
+        namespaces: &ns,
+        default: Some(Ns::Svg),
+    };
+    assert_eq!(with("a", &svg), ["a#2"]);
+    assert_eq!(with("[id]", &svg), ["a#2", "title#3"]);
+    assert_eq!(with("h|a, *|mi", &svg), ["a#1", "mi#4"]);
+    assert_eq!(with("svg *:not([href])", &svg), ["title#3"]);
+    assert_eq!(with("*|*:not(a)[id]", &svg), ["a#1", "title#3", "mi#4"]);
+    assert_eq!(
+        with("*|*:not([href])[id]", &svg),
+        ["a#1", "title#3", "mi#4"]
+    );
+
+    let xml = [("x", Ns::Xml)];
+    let refused = ParseOptions {
+        namespaces: &xml,
+        default: None,
+    };
+    assert!(SelectorList::parse_with("x|a", &refused).is_err());
 }
 
 #[test]
