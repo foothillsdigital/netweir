@@ -1,7 +1,7 @@
 //! The tree-construction tests from web-platform-tests (formerly
 //! html5lib-tests), in their `.dat` format.
 
-use netweir_html::{AttrNs, Document, Kind, NodeId, Ns, parse, parse_fragment};
+use netweir_html::{Ns, SerializeOptions, parse, parse_fragment};
 
 mod summary;
 
@@ -95,70 +95,6 @@ fn cases() -> Vec<Case> {
     out
 }
 
-fn serialize(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<String>) {
-    for child in doc.children(node) {
-        let pad = "  ".repeat(depth);
-        match doc.kind(child) {
-            Kind::Doctype {
-                name,
-                public_id,
-                system_id,
-            } => {
-                if public_id.is_empty() && system_id.is_empty() {
-                    out.push(format!("| {pad}<!DOCTYPE {name}>"));
-                } else {
-                    out.push(format!(
-                        "| {pad}<!DOCTYPE {name} \"{public_id}\" \"{system_id}\">"
-                    ));
-                }
-            }
-            Kind::Element { ns, name } => {
-                let prefix = match ns {
-                    Ns::Html => "",
-                    Ns::Svg => "svg ",
-                    Ns::MathMl => "math ",
-                    Ns::Xml => "xml ",
-                };
-                out.push(format!("| {pad}<{prefix}{name}>"));
-                let mut attrs: Vec<String> = doc
-                    .attrs(child)
-                    .zip(doc.attrs_written(child))
-                    .map(|((ns, local, value), (_, written, _))| {
-                        let name = match ns {
-                            AttrNs::None => written.to_string(),
-                            AttrNs::XLink => format!("xlink {local}"),
-                            AttrNs::Xml => format!("xml {local}"),
-                            AttrNs::Xmlns if local == "xmlns" => "xmlns".to_string(),
-                            AttrNs::Xmlns => format!("xmlns {local}"),
-                            AttrNs::Host(_) => local.to_string(),
-                        };
-                        format!("{name}=\"{value}\"")
-                    })
-                    .collect();
-                attrs.sort();
-                for a in attrs {
-                    out.push(format!("| {pad}  {a}"));
-                }
-                if let Some(contents) = doc.template_contents(child) {
-                    out.push(format!("| {pad}  content"));
-                    serialize(doc, contents, depth + 2, out);
-                }
-            }
-            Kind::Text(t) => out.push(format!("| {pad}\"{t}\"")),
-            Kind::Comment(c) => out.push(format!("| {pad}<!-- {c} -->")),
-            Kind::ProcessingInstruction { target, data } => {
-                out.push(format!("| {pad}<?{target} {data}?>"))
-            }
-            Kind::Document | Kind::Fragment | Kind::Cdata(_) => {}
-        }
-        if !matches!(doc.kind(child), Kind::Element { .. })
-            || doc.template_contents(child).is_none()
-        {
-            serialize(doc, child, depth + 1, out);
-        }
-    }
-}
-
 fn run(case: &Case, scripting: bool) -> String {
     let doc = match &case.fragment {
         Some(context) => {
@@ -171,9 +107,13 @@ fn run(case: &Case, scripting: bool) -> String {
         }
         None => parse(&case.data, scripting),
     };
-    let mut out = Vec::new();
-    serialize(&doc, doc.root(), 0, &mut out);
-    out.join("\n")
+    doc.serialize_with(
+        doc.root(),
+        &SerializeOptions {
+            html5test: true,
+            ..SerializeOptions::default()
+        },
+    )
 }
 
 #[test]
@@ -255,4 +195,81 @@ fn tree_construction_tests() {
             shown.join("\n")
         );
     }
+}
+
+/// The tree as the dump shows it, but for whitespace-only text, which
+/// `pretty` drops and adds between blocks.
+fn without_blank_text(doc: &netweir_html::Document) -> String {
+    let dump = doc.serialize_with(
+        doc.root(),
+        &SerializeOptions {
+            html5test: true,
+            ..SerializeOptions::default()
+        },
+    );
+    // A text node's line is a quoted string, maybe over many lines.
+    let mut kept = String::new();
+    for line in dump.split("\n| ") {
+        let body = line.trim_start_matches("| ").trim_start();
+        let blank = body.len() >= 2
+            && body.starts_with('"')
+            && body.ends_with('"')
+            && body[1..body.len() - 1]
+                .bytes()
+                .all(|b| matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r' | b' '));
+        if !blank {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    kept
+}
+
+/// Pretty-printed, every document in the suite whose markup parses back
+/// to the same tree still does, but for whitespace-only text. (Some
+/// don't: after a `plaintext` the parser never leaves, for one.)
+#[test]
+fn pretty_markup_parses_to_the_same_tree() {
+    let pretty = SerializeOptions {
+        pretty: true,
+        ..SerializeOptions::default()
+    };
+    let mut differ = Vec::new();
+    let mut checked = 0;
+    for case in cases() {
+        if case.fragment.is_some() {
+            continue;
+        }
+        for scripting in [false, true] {
+            let doc = parse(&case.data, scripting);
+            let plain = parse(&doc.outer_html(doc.root()), scripting);
+            let tree = without_blank_text(&doc);
+            if without_blank_text(&plain) != tree {
+                continue;
+            }
+            let printed = doc.serialize_with(doc.root(), &pretty);
+            let reparsed = parse(&printed, scripting);
+            checked += 1;
+            if without_blank_text(&reparsed) != tree {
+                differ.push(format!(
+                    "{}\n--- input\n{}\n--- pretty\n{printed}\n",
+                    case.file, case.data
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "pretty round trip: {checked} checked, {} differ",
+        differ.len()
+    );
+    assert!(
+        differ.is_empty(),
+        "{}",
+        differ
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

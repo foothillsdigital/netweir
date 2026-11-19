@@ -3055,7 +3055,9 @@ fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Doc
     if html.len() > crate::MAX_INPUT {
         return Err(ParseError::TooLarge { len: html.len() });
     }
-    let start = std::time::Instant::now();
+    // Only with a budget: wasm32-unknown-unknown has no clock, and reading
+    // one there panics.
+    let start = options.budget.map(|_| std::time::Instant::now());
     let mut builder = TreeBuilder::new(html.len(), options.scripting);
     builder.doc.scripting = options.scripting;
     builder.max_depth = options.max_depth;
@@ -3069,7 +3071,11 @@ fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Doc
         tokenizer.set_text_mode(mode);
     }
     // A budget past what the clock can count is no limit at all.
-    if let Some(deadline) = options.budget.and_then(|b| start.checked_add(b)) {
+    if let Some(deadline) = options
+        .budget
+        .zip(start)
+        .and_then(|(b, s)| s.checked_add(b))
+    {
         tokenizer.set_deadline(deadline);
     }
     tokenizer.run(&mut builder);

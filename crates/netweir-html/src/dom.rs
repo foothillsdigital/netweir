@@ -137,6 +137,10 @@ pub struct Document {
     /// Whether it was parsed with scripting on, which decides how a
     /// noscript element's text serializes.
     pub(crate) scripting: bool,
+    /// Each template's contents, mapped to the template: no link leads
+    /// back from the contents, and an edit's cycle check has to climb out
+    /// of them. Edits build it the first time they need it.
+    pub(crate) hosts: Option<std::collections::HashMap<NodeId, NodeId>>,
 }
 
 /// What a node is, as [`Document::kind`] reports it.
@@ -181,6 +185,7 @@ impl Document {
             attrs: Vec::with_capacity(capacity / 32 + 16),
             quirks: Quirks::No,
             scripting: false,
+            hosts: None,
         }
     }
 
