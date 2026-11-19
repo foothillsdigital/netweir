@@ -243,6 +243,7 @@ impl Document {
     /// in any namespace (`xlink:href`), as `setAttribute` does. HTML
     /// elements' attribute names are lowercased; SVG's and MathML's keep the
     /// case they're given.
+    /// A node taken out with [`Document::remove`] is left alone.
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
         if self.is_removed(id) {
             return;
@@ -273,6 +274,7 @@ impl Document {
     /// Adds an attribute as given, after the others, without replacing one
     /// of the same name: for building XML, where the caller has already
     /// checked names.
+    /// A node taken out with [`Document::remove`] is left alone.
     pub fn add_attr(&mut self, id: NodeId, ns: AttrNs, name: &str, value: &str) {
         if self.is_removed(id) {
             return;
@@ -298,6 +300,7 @@ impl Document {
     }
 
     /// Replaces all of the element's attributes at once.
+    /// A node taken out with [`Document::remove`] is left alone.
     pub fn set_attrs(&mut self, id: NodeId, attrs: &[(AttrNs, &str, &str)]) {
         if self.is_removed(id) {
             return;
@@ -322,6 +325,7 @@ impl Document {
     /// does. A template renamed to anything else gives its contents up as
     /// ordinary children, ahead of any it has, so its markup stays the same
     /// and nothing in them is lost.
+    /// A node taken out with [`Document::remove`] is left alone.
     pub fn rename(&mut self, id: NodeId, name: &str) {
         if self.is_removed(id) {
             return;
@@ -395,6 +399,7 @@ impl Document {
     }
 
     /// Renames the element's `index`th attribute, and sets its namespace.
+    /// A node taken out with [`Document::remove`] is left alone.
     pub fn rename_attr(&mut self, id: NodeId, index: usize, ns: AttrNs, name: &str) {
         if self.is_removed(id) {
             return;
@@ -411,6 +416,8 @@ impl Document {
     }
 
     /// Removes the element's `index`th attribute; false if there's none.
+    /// A node taken out with [`Document::remove`] is left alone, and gives
+    /// false.
     pub fn remove_attr_at(&mut self, id: NodeId, index: usize) -> bool {
         if self.is_removed(id) {
             return false;
@@ -426,6 +433,8 @@ impl Document {
     }
 
     /// Removes an attribute by name; false if there wasn't one.
+    /// A node taken out with [`Document::remove`] is left alone, and gives
+    /// false.
     pub fn remove_attr(&mut self, id: NodeId, name: &str) -> bool {
         if self.is_removed(id) {
             return false;
