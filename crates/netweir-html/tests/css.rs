@@ -2,7 +2,7 @@
 //! lexbor offered, and where browsers and lexbor part ways, the browsers.
 
 use netweir_html::css::{MatchOptions, MatchTimeout, ParseOptions, SelectorList};
-use netweir_html::{Document, Kind, NodeId, Ns, parse};
+use netweir_html::{AttrNs, Document, Kind, NodeId, Ns, parse};
 
 const PAGE: &str = r#"<!DOCTYPE html><html><head><title>Shop</title></head><body>
 <div id="main" class="Wide page">
@@ -131,7 +131,7 @@ fn declared_namespace_prefixes() {
     let ns = [("s", Ns::Svg), ("m", Ns::MathMl), ("h", Ns::Html)];
     let prefixes = ParseOptions {
         namespaces: &ns,
-        default: None,
+        ..ParseOptions::default()
     };
     assert_eq!(with("s|a", &prefixes), ["a#2"]);
     assert_eq!(with("h|a", &prefixes), ["a#1"]);
@@ -159,6 +159,7 @@ fn declared_namespace_prefixes() {
     let svg = ParseOptions {
         namespaces: &ns,
         default: Some(Ns::Svg),
+        ..ParseOptions::default()
     };
     assert_eq!(with("a", &svg), ["a#2"]);
     assert_eq!(with("[id]", &svg), ["a#2", "title#3"]);
@@ -173,7 +174,7 @@ fn declared_namespace_prefixes() {
     let xml = [("x", Ns::Xml)];
     let refused = ParseOptions {
         namespaces: &xml,
-        default: None,
+        ..ParseOptions::default()
     };
     assert!(SelectorList::parse_with("x|a", &refused).is_err());
 
@@ -182,7 +183,7 @@ fn declared_namespace_prefixes() {
     let col = [("col", Ns::Html)];
     let col = ParseOptions {
         namespaces: &col,
-        default: None,
+        ..ParseOptions::default()
     };
     let spec = |css| SelectorList::parse_with(css, &col).unwrap().specificity();
     assert_eq!(spec("col|td"), (0, 0, 1));
@@ -285,6 +286,47 @@ fn hostile_tables_lay_out_in_linear_time() {
             "{css} took {took:?}"
         );
     }
+}
+
+/// Attribute prefixes, declared apart from element ones: `[xlink|href]`
+/// is SVG's `xlink:href` and not a plain `href`, and `xml:lang` is in the
+/// XML namespace only on a foreign element.
+#[test]
+fn declared_attribute_namespace_prefixes() {
+    let html = r##"<svg><use id=1 xlink:href="#a"></use><a id=2 href="#a"></a>
+        <text id=3 xml:lang=fr></text></svg><p id=4 xml:lang=en></p>"##;
+    let doc = parse(html, false);
+    let attrs = [
+        ("xl", AttrNs::XLink),
+        ("xml", AttrNs::Xml),
+        ("s", AttrNs::XLink),
+    ];
+    let elements = [("s", Ns::Svg)];
+    let opts = ParseOptions {
+        namespaces: &elements,
+        attr_namespaces: &attrs,
+        ..ParseOptions::default()
+    };
+    let with = |css: &str| {
+        let list = SelectorList::parse_with(css, &opts).unwrap();
+        names(&doc, &list.select(&doc, doc.root()))
+    };
+    assert_eq!(with("[xl|href]"), ["use#1"]);
+    assert_eq!(with("[xl|href='#a'], [href^='#']"), ["use#1", "a#2"]);
+    assert_eq!(with("[xml|lang]"), ["text#3"]);
+    assert_eq!(with("[xml|lang|=fr]"), ["text#3"]);
+    assert_eq!(with("p[xml\\:lang]"), ["p#4"]);
+    // A prefix in both lists names an element namespace for elements and
+    // an attribute namespace for attributes.
+    assert_eq!(with("s|use[s|href]"), ["use#1"]);
+    assert!(SelectorList::parse_with("[xlink|href]", &opts).is_err());
+
+    let host = [("h", AttrNs::Host(0))];
+    let refused = ParseOptions {
+        attr_namespaces: &host,
+        ..ParseOptions::default()
+    };
+    assert!(SelectorList::parse_with("[h|x]", &refused).is_err());
 }
 
 #[test]

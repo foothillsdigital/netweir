@@ -90,6 +90,9 @@ struct AttrSelector {
     exact: String,
     /// `[*|name]`: in any namespace, or none.
     any_ns: bool,
+    /// `[prefix|name]` with the prefix declared for attributes: only in
+    /// that namespace.
+    in_ns: Option<AttrNs>,
     op: AttrOp,
     value: String,
     case: Case,
@@ -543,13 +546,15 @@ impl<'a> Parser<'a> {
                 Some('[') => {
                     self.pos += 1;
                     let declared = self.declared_attr_prefix();
-                    let attr = self.attr()?;
-                    // Every namespace a prefix can name is an element's;
-                    // no attribute is in one.
-                    simple.push(if declared {
-                        Simple::Pseudo(Pseudo::Never)
-                    } else {
-                        Simple::Attr(attr)
+                    let mut attr = self.attr()?;
+                    simple.push(match declared {
+                        // An element namespace: no attribute is in one.
+                        Some(None) => Simple::Pseudo(Pseudo::Never),
+                        Some(Some(ns)) => {
+                            attr.in_ns = Some(ns);
+                            Simple::Attr(attr)
+                        }
+                        None => Simple::Attr(attr),
                     });
                 }
                 Some(':') if self.peek_at(1) == Some(':') => {
@@ -611,21 +616,28 @@ impl<'a> Parser<'a> {
     }
 
     /// Eats a declared `prefix|` at the start of an attribute selector,
-    /// leaving anything else for `attr` to read or refuse.
-    fn declared_attr_prefix(&mut self) -> bool {
+    /// giving its attribute namespace, or None for a prefix declared only
+    /// for elements. Anything else is left for `attr` to read or refuse.
+    fn declared_attr_prefix(&mut self) -> Option<Option<AttrNs>> {
         let start = self.pos;
         self.skip_space();
         if self.starts_name()
             && let Ok(name) = self.ident()
             && self.peek() == Some('|')
             && self.peek_at(1) != Some('=')
-            && self.opts.namespaces.iter().any(|(p, _)| *p == name)
         {
-            self.pos += 1;
-            return true;
+            let attr = self.opts.attr_namespaces.iter().find(|(p, _)| *p == name);
+            if let Some(&(_, ns)) = attr {
+                self.pos += 1;
+                return Some(Some(ns));
+            }
+            if self.opts.namespaces.iter().any(|(p, _)| *p == name) {
+                self.pos += 1;
+                return Some(None);
+            }
         }
         self.pos = start;
-        false
+        None
     }
 
     fn attr(&mut self) -> Result<AttrSelector, SelectorError> {
@@ -651,6 +663,7 @@ impl<'a> Parser<'a> {
                     lower: name.to_ascii_lowercase(),
                     exact: name,
                     any_ns,
+                    in_ns: None,
                     op: AttrOp::Exists,
                     value: String::new(),
                     case: Case::Default,
@@ -700,6 +713,7 @@ impl<'a> Parser<'a> {
             lower: name.to_ascii_lowercase(),
             exact: name,
             any_ns,
+            in_ns: None,
             op,
             value,
             case,
@@ -1445,16 +1459,22 @@ fn nth(a: i32, b: i32, last: bool, of_type: bool) -> Pseudo {
 /// [`SelectorList::parse_with`]. The default declares nothing, as
 /// [`SelectorList::parse`] does.
 ///
-/// Namespaces are named by [`Ns`], so only the HTML, SVG and MathML
-/// namespaces can be declared: those are the ones the parser puts elements
-/// in. A custom namespace URI has no `Ns` to name it. Neither does
-/// [`Ns::Xml`], which stands for whatever namespace the host keeps for an
-/// XML element, so declaring it is an error.
+/// Namespaces are named by [`Ns`] for elements and [`AttrNs`] for
+/// attributes, so only the ones the parser puts nodes in can be declared:
+/// HTML, SVG and MathML, and XLink, XML and XMLNS. A custom namespace URI
+/// has nothing to name it. Neither do [`Ns::Xml`] and [`AttrNs::Host`],
+/// which stand for whatever namespace the host keeps for an XML node, so
+/// declaring either is an error.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ParseOptions<'a> {
     /// Prefixes and their namespaces: `("svg", Ns::Svg)` makes `svg|rect`
     /// a `rect` in the SVG namespace. Prefixes compare exactly.
     pub namespaces: &'a [(&'a str, Ns)],
+    /// Prefixes for attribute selectors: `("xlink", AttrNs::XLink)` makes
+    /// `[xlink|href]` SVG's `xlink:href`. A prefix only in `namespaces`
+    /// names an element namespace, which no attribute is in, so it matches
+    /// nothing in an attribute selector.
+    pub attr_namespaces: &'a [(&'a str, AttrNs)],
     /// The `@namespace` without a prefix: type selectors and `*` without
     /// a prefix match only elements in it, and so does a compound with
     /// neither. Attribute selectors aren't affected.
@@ -1476,6 +1496,13 @@ impl SelectorList {
             .chain(opts.default);
         if declared.into_iter().any(|ns| ns == Ns::Xml) {
             return error("Ns::Xml isn't a namespace a selector can declare");
+        }
+        if opts
+            .attr_namespaces
+            .iter()
+            .any(|(_, ns)| matches!(ns, AttrNs::Host(_)))
+        {
+            return error("AttrNs::Host isn't a namespace a selector can declare");
         }
         SelectorList::parse_at(selector, 0, false, opts)
     }
@@ -3120,7 +3147,11 @@ impl<'a> Cx<'a> {
                 AttrNs::None => name,
                 _ => name.split_once(':').map_or(name, |(_, local)| local),
             };
-            (attr.ns == AttrNs::None || a.any_ns)
+            let in_ns = match a.in_ns {
+                Some(ns) => attr.ns == ns,
+                None => attr.ns == AttrNs::None || a.any_ns,
+            };
+            in_ns
                 && name == want.as_str()
                 && (a.op == AttrOp::Exists
                     || value_matches(a.op, doc.str(attr.value), &a.value, insensitive))
