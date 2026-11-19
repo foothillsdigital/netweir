@@ -62,3 +62,12 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The unreleased wreq and btls commits pinned in Cargo.toml's [patch.crates-io].
 allow-git = ["https://github.com/0x676e67/wreq", "https://github.com/0x676e67/btls"]
+
+[advisories]
+ignore = [
+    # chrono is unmaintained, every version. Only parquet pulls it in, for
+    # netweir-py, and no parquet release does without it. Drop this once
+    # parquet moves off chrono or onto a maintained fork; check with
+    # `cargo tree -i chrono`. Other unmaintained notices still fail.
+    { id = "RUSTSEC-2026-0543", reason = "only via parquet, which has no release without chrono yet" },
+]
