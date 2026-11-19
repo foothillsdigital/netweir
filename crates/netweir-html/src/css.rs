@@ -7,7 +7,8 @@
 //! in a quirks-mode document.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::rc::Rc;
 
 use crate::dom::{AttrNs, Data, Document, NodeId, Ns, Quirks};
@@ -1491,8 +1492,121 @@ struct Cx<'a> {
 #[derive(Default)]
 struct Columns {
     cells: HashMap<NodeId, (u32, u32)>,
+    /// In column order, side by side.
     cols: Vec<(NodeId, u32, u32)>,
     width: u32,
+}
+
+/// The columns cells from earlier rows of a row group still cover, kept
+/// as runs rather than slots, so time and memory follow the cells and not
+/// the table's width, and a row with nothing reaching into it costs
+/// nothing.
+#[derive(Default)]
+struct Cover {
+    /// The row being laid out, counted from the group's first.
+    row: u32,
+    /// Disjoint runs: first column -> (column after the last, first row
+    /// no longer covered), u32::MAX for rowspan=0.
+    runs: BTreeMap<u32, (u32, u32)>,
+    /// The runs' union as maximal contiguous blocks, first column ->
+    /// column after the last, so finding a free column is one lookup
+    /// however many runs sit side by side.
+    blocks: BTreeMap<u32, u32>,
+    /// Each run's last row, soonest first; an entry whose run has since
+    /// been split or replaced is skipped.
+    ends: BinaryHeap<Reverse<(u32, u32)>>,
+}
+
+impl Cover {
+    /// Drops the runs that stop before `row`.
+    fn advance(&mut self, row: u32) {
+        while let Some(&Reverse((until, start))) = self.ends.peek() {
+            if until > row {
+                break;
+            }
+            self.ends.pop();
+            if let Some(&(end, u)) = self.runs.get(&start)
+                && u == until
+            {
+                self.runs.remove(&start);
+                let (&bs, &be) = self
+                    .blocks
+                    .range(..=start)
+                    .next_back()
+                    .expect("a run's block");
+                self.blocks.remove(&bs);
+                if bs < start {
+                    self.blocks.insert(bs, start);
+                }
+                if end < be {
+                    self.blocks.insert(end, be);
+                }
+            }
+        }
+    }
+
+    /// The first column from `x` that nothing covers.
+    fn free(&self, x: u32) -> u32 {
+        match self.blocks.range(..=x).next_back() {
+            Some((_, &end)) if end > x => end,
+            _ => x,
+        }
+    }
+
+    /// Covers `[start, end)` until row `until`. Where a run already covers
+    /// part of it, a table model error, that part keeps the later row.
+    fn add(&mut self, start: u32, end: u32, until: u32) {
+        let mut over: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some((&rs, &(re, ru))) = self.runs.range(..start).next_back()
+            && re > start
+        {
+            over.push((rs, re, ru));
+        }
+        over.extend(
+            self.runs
+                .range(start..end)
+                .map(|(&rs, &(re, ru))| (rs, re, ru)),
+        );
+        let mut pieces = Vec::new();
+        let mut at = start;
+        for &(rs, re, ru) in &over {
+            self.runs.remove(&rs);
+            if rs < start {
+                pieces.push((rs, start, ru));
+            }
+            let (os, oe) = (rs.max(start), re.min(end));
+            if at < os {
+                pieces.push((at, os, until));
+            }
+            pieces.push((os, oe, ru.max(until)));
+            if re > end {
+                pieces.push((end, re, ru));
+            }
+            at = oe;
+        }
+        if at < end {
+            pieces.push((at, end, until));
+        }
+        for (ps, pe, pu) in pieces {
+            self.runs.insert(ps, (pe, pu));
+            self.ends.push(Reverse((pu, ps)));
+        }
+        // The union grows by [start, end): merge it with the blocks it
+        // touches.
+        let (mut bs, mut be) = (start, end);
+        if let Some((&s, &e)) = self.blocks.range(..=start).next_back()
+            && e >= start
+        {
+            bs = s;
+            be = be.max(e);
+            self.blocks.remove(&s);
+        }
+        while let Some((&s, &e)) = self.blocks.range(bs..=be).next() {
+            self.blocks.remove(&s);
+            be = be.max(e);
+        }
+        self.blocks.insert(bs, be);
+    }
 }
 
 /// An element's position among its parent's element children, counting
@@ -1638,9 +1752,7 @@ impl<'a> Cx<'a> {
         let mut out = Columns::default();
         let mut col_x = 0;
         let mut rows_started = false;
-        // Per column, how many more rows, this one included, a cell from
-        // above still covers; u32::MAX for rowspan=0, to the group's end.
-        let mut down: Vec<u32> = Vec::new();
+        let mut cover = Cover::default();
         for child in doc.children(table) {
             match self.html_tag_of(child) {
                 Some(Tag::Colgroup) if !rows_started => {
@@ -1659,18 +1771,18 @@ impl<'a> Cx<'a> {
                 }
                 Some(Tag::Tr) => {
                     rows_started = true;
-                    self.lay_out_row(child, &mut down, &mut out);
+                    self.lay_out_row(child, &mut cover, &mut out);
                 }
                 Some(Tag::Thead | Tag::Tbody | Tag::Tfoot) => {
                     rows_started = true;
                     // Cells don't reach from one row group into another.
-                    down.clear();
+                    cover = Cover::default();
                     for r in doc.children(child) {
                         if self.html_tag_of(r) == Some(Tag::Tr) {
-                            self.lay_out_row(r, &mut down, &mut out);
+                            self.lay_out_row(r, &mut cover, &mut out);
                         }
                     }
-                    down.clear();
+                    cover = Cover::default();
                 }
                 _ => {}
             }
@@ -1679,34 +1791,26 @@ impl<'a> Cx<'a> {
         out
     }
 
-    fn lay_out_row(&self, tr: NodeId, down: &mut Vec<u32>, out: &mut Columns) {
+    fn lay_out_row(&self, tr: NodeId, cover: &mut Cover, out: &mut Columns) {
+        let row = cover.row;
+        cover.advance(row);
         let mut x = 0;
         for cell in self.doc.children(tr) {
             if !matches!(self.html_tag_of(cell), Some(Tag::Td | Tag::Th)) {
                 continue;
             }
-            while down.get(x).is_some_and(|&d| d > 0) {
-                x += 1;
-            }
-            let span = self.span(cell, "colspan", 1000) as usize;
-            let rows = match self.attr(cell, "rowspan").and_then(parse_non_negative) {
+            x = cover.free(x);
+            let span = self.span(cell, "colspan", 1000);
+            let until = match self.attr(cell, "rowspan").and_then(parse_non_negative) {
                 Some(0) => u32::MAX,
-                Some(n) => n.min(65534),
-                None => 1,
+                n => row.saturating_add(n.map_or(1, |n| n.min(65534))),
             };
-            if down.len() < x + span {
-                down.resize(x + span, 0);
-            }
-            for d in &mut down[x..x + span] {
-                *d = (*d).max(rows);
-            }
-            out.cells.insert(cell, (x as u32, span as u32));
+            cover.add(x, x + span, until);
+            out.cells.insert(cell, (x, span));
             x += span;
+            out.width = out.width.max(x);
         }
-        out.width = out.width.max(down.len() as u32);
-        for d in down.iter_mut().filter(|d| **d != u32::MAX) {
-            *d = d.saturating_sub(1);
-        }
+        cover.row += 1;
     }
 
     /// `el`'s place among its siblings, or None if it has no parent.
@@ -1821,10 +1925,14 @@ impl<'a> Cx<'a> {
                 }
                 false
             }
+            // The cols are in column order, so only those from the first
+            // that reaches the cell to the last that starts inside it.
             Combinator::Column => self.cell_columns(el).is_some_and(|(t, x, n)| {
-                t.cols.iter().any(|&(col, cx, cn)| {
-                    cx < x + n && x < cx + cn && self.complex(c, i + 1, col, anchor)
-                })
+                let first = t.cols.partition_point(|&(_, cx, cn)| cx + cn <= x);
+                t.cols[first..]
+                    .iter()
+                    .take_while(|&&(_, cx, _)| cx < x + n)
+                    .any(|&(col, ..)| self.complex(c, i + 1, col, anchor))
             }),
         }
     }
@@ -2590,11 +2698,15 @@ impl<'a> Cx<'a> {
             }),
             Pseudo::Dir(rtl) => self.is_rtl(el) == *rtl,
             Pseudo::Never => false,
+            // A cell's columns are a run of positions, so one sum says
+            // whether any of them fits, however many it spans.
             Pseudo::NthCol { a, b, last } => self.cell_columns(el).is_some_and(|(t, x, n)| {
-                (x..x + n).any(|k| {
-                    let index = if *last { t.width - k } else { k + 1 };
-                    nth_matches(*a as i64, *b as i64, index as i64)
-                })
+                let (lo, hi) = if *last {
+                    (t.width - (x + n) + 1, t.width - x)
+                } else {
+                    (x + 1, x + n)
+                };
+                nth_in_range(*a as i64, *b as i64, lo as i64, hi as i64)
             }),
         }
     }
@@ -2759,6 +2871,23 @@ fn nth_matches(a: i64, b: i64, index: i64) -> bool {
     diff % a == 0 && diff / a >= 0
 }
 
+/// Whether some position from `lo` to `hi` is `a`n+`b` for an n >= 0.
+fn nth_in_range(a: i64, b: i64, lo: i64, hi: i64) -> bool {
+    match a.cmp(&0) {
+        std::cmp::Ordering::Equal => (lo..=hi).contains(&b),
+        // The first matching position at or after lo, if it's by hi.
+        std::cmp::Ordering::Greater => {
+            let from = lo.max(b);
+            from + (b - from).rem_euclid(a) <= hi
+        }
+        // The last matching position at or before hi, if it's from lo.
+        std::cmp::Ordering::Less => {
+            let to = hi.min(b);
+            to - (to - b).rem_euclid(-a) >= lo
+        }
+    }
+}
+
 fn value_matches(op: AttrOp, value: &str, want: &str, insensitive: bool) -> bool {
     let eq = |x: &str, y: &str| {
         if insensitive {
@@ -2803,6 +2932,27 @@ fn value_matches(op: AttrOp, value: &str, want: &str, insensitive: bool) -> bool
                 } else {
                     value.contains(want)
                 }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nth_range_tests {
+    #[test]
+    fn nth_in_range_agrees_with_each_position() {
+        for a in -4..=4 {
+            for b in -6..=8 {
+                for lo in 1..=7 {
+                    for hi in lo..=9 {
+                        let each = (lo..=hi).any(|i| super::nth_matches(a, b, i));
+                        assert_eq!(
+                            super::nth_in_range(a, b, lo, hi),
+                            each,
+                            "{a}n+{b} in {lo}..={hi}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

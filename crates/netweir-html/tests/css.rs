@@ -144,6 +144,13 @@ fn table_columns() {
         select(html, ":nth-col(n+6), col:nth-col(1)"),
         Vec::<String>::new()
     );
+    // A cell running into a column a cell from above still covers, a
+    // table model error: the column stays covered until the later row,
+    // so u can't take it.
+    let clash = "<table><tr><td id=p><td id=q rowspan=3>\
+                 <tr><td id=r colspan=2><td id=s><tr><td id=t><td id=u></table>";
+    assert_eq!(select(clash, ":nth-col(2)"), ["td#q", "td#r"]);
+    assert_eq!(select(clash, ":nth-col(3)"), ["td#s", "td#u"]);
     // A single bar is still a namespace prefix.
     assert_eq!(select(html, "|td"), Vec::<String>::new());
     assert!(SelectorList::parse("col|td").is_err());
@@ -153,6 +160,49 @@ fn table_columns() {
             .specificity(),
         (0, 1, 2)
     );
+}
+
+/// Hostile tables: laying one out and matching `||` follow the cells, not
+/// the table's width or cells times cols. Each of these took minutes, or
+/// hundreds of megabytes, when every column had a slot.
+#[test]
+fn hostile_tables_lay_out_in_linear_time() {
+    let wide = format!(
+        "<table><tr>{}{}</table>",
+        "<td colspan=1000>".repeat(1_000),
+        "<tr><td>".repeat(50_000)
+    );
+    let mega = format!("<table><tr>{}</table>", "<td colspan=1000>".repeat(55_000));
+    let cols = format!(
+        "<table><colgroup>{}</colgroup><tr>{}</table>",
+        "<col>".repeat(30_000),
+        "<td>".repeat(30_000)
+    );
+    // Cells side by side reaching down different distances, then rows
+    // that each have to find the first free column past all of them.
+    let stack = format!(
+        "<table><tr>{}{}</table>",
+        (0..20_000)
+            .map(|i| format!("<td rowspan={}>", 60_000 - i))
+            .collect::<String>(),
+        "<tr><td>".repeat(50_000)
+    );
+    for (html, css, n) in [
+        (&wide, ":nth-col(1)", 50_001),
+        (&mega, ":nth-last-col(1)", 1),
+        (&cols, "col || td", 30_000),
+        (&stack, ":nth-col(20001)", 40_000),
+    ] {
+        let doc = parse(html, false);
+        let list = SelectorList::parse(css).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(list.select(&doc, doc.root()).len(), n, "{css}");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "{css} took {took:?}"
+        );
+    }
 }
 
 #[test]
