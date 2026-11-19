@@ -417,7 +417,7 @@ fn a_removed_subtree_is_its_own_tree() {
         .find(|&n| tree.lower_name(n) == Some("div"))
         .unwrap();
     let p = tree.first_child(div).unwrap();
-    tree.remove(div);
+    tree.detach(div);
     let index = Index::build(&tree, &[tree.root(), div]);
     let doc = Doc::html(&tree, &index);
     let count = |q: &str| match XPath::new(q)
