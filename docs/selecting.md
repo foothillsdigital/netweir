@@ -40,6 +40,11 @@ doc.css("a::attr(title), .price::text").getall()
   flag, so `\d` and `\w` are ASCII. One that doesn't compile counts as
   none, as does one using `\p{...}`, which needs Unicode tables Netweir
   doesn't carry.
+- `:blank` is the current Selectors draft's: an `<input>` a user types
+  text into (text, search, url, tel, email, password or number) with no
+  `value`, or a `<textarea>` with no text. `:defined` matches everything
+  but an HTML element with a custom element's name or an `is` attribute,
+  since a parsed page defines no custom elements.
 
 ## XPath
 

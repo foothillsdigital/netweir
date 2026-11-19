@@ -3,10 +3,14 @@
 //! says. Only that much of JavaScript is here: no flags but `v`, so
 //! matching is case-sensitive, `.` stops at line terminators, and `^` and
 //! `$` mean the ends of the value. A pattern that doesn't compile under the
-//! `v` flag is None, which the standard treats as no pattern.
+//! `v` flag is None, which the standard treats as no pattern. `\p{...}`
+//! reads the Unicode tables in `unicode.rs`, which only a pattern that uses
+//! it touches.
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
+
+use crate::unicode;
 
 /// Steps a match may take before it gives up, so a pattern built to
 /// backtrack hard can't hang a query. A match that runs out doesn't match.
@@ -233,6 +237,76 @@ fn is_line_terminator(c: u32) -> bool {
 
 fn is_word(c: u32) -> bool {
     matches!(c, 0x30..=0x39 | 0x41..=0x5A | 0x5F | 0x61..=0x7A)
+}
+
+/// What `\p{name}` matches, or None for a name ECMAScript doesn't list.
+/// Names match exactly, case and all, as JavaScript requires.
+fn property(name: &str) -> Option<Set> {
+    match name.split_once('=') {
+        Some(("General_Category" | "gc", value)) => category(value),
+        Some(("Script" | "sc", value)) => script(value, false),
+        Some(("Script_Extensions" | "scx", value)) => script(value, true),
+        Some(_) => None,
+        // shortcut: properties of strings such as RGI_Emoji and Basic_Emoji aren't in the tables, so they don't compile and the pattern counts as none; add emoji-sequences.txt and emoji-zwj-sequences.txt to scripts/gen-unicode.py if pages use them.
+        None => category(name).or_else(|| binary(name)),
+    }
+}
+
+/// A generated table's flat lo, hi, lo, hi as ranges.
+fn table(flat: &[u32]) -> Vec<(u32, u32)> {
+    flat.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[lo, hi]| (lo, hi))
+        .collect()
+}
+
+/// A General_Category value by any of its names.
+fn category(value: &str) -> Option<Set> {
+    let short = unicode::GENERAL_CATEGORY_NAMES
+        .iter()
+        .find(|names| names.contains(&value))?[0];
+    let mut ranges = Vec::new();
+    for (name, flat) in unicode::GENERAL_CATEGORY {
+        // A one-letter value is the group of two-letter ones it starts.
+        if name.starts_with(short) || (short == "LC" && matches!(*name, "Lu" | "Ll" | "Lt")) {
+            ranges.extend(table(flat));
+        }
+    }
+    Some(Set::of(&ranges))
+}
+
+fn script(value: &str, extensions: bool) -> Option<Set> {
+    let (_, base, flat, added) = unicode::SCRIPTS.iter().find(|s| s.0.contains(&value))?;
+    let set = based(base, flat)?;
+    if !extensions {
+        return Some(set);
+    }
+    // A listed code point has the scripts listed for it instead of its own.
+    let listed = Set::of(&table(unicode::SCRIPT_EXTENSIONS_LISTED));
+    Some(set.subtract(listed).union(Set::of(&table(added))))
+}
+
+fn binary(name: &str) -> Option<Set> {
+    let (_, _, base, flat) = unicode::BINARY
+        .iter()
+        .find(|p| p.0 == name || p.1 == name)?;
+    based(base, flat)
+}
+
+/// A table stored as its difference from `base`, which is a
+/// General_Category value or a binary property, or empty for none.
+fn based(base: &str, flat: &[u32]) -> Option<Set> {
+    let diff = Set::of(&table(flat));
+    if base.is_empty() {
+        return Some(diff);
+    }
+    let base = category(base).or_else(|| binary(base))?;
+    Some(
+        base.clone()
+            .subtract(diff.clone())
+            .union(diff.subtract(base)),
+    )
 }
 
 /// Counts the capturing groups and collects their names before parsing,
@@ -506,22 +580,37 @@ impl Parser<'_> {
         }
     }
 
-    /// `\d`, `\D`, `\w`, `\W`, `\s` or `\S`; None inside for anything
-    /// else, and an outer None for `\p{}`, which needs Unicode tables.
+    /// `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\p{...}` or `\P{...}`; None
+    /// inside for anything else, and an outer None for a property that
+    /// doesn't exist.
     fn class_escape(&mut self) -> Option<Option<Set>> {
-        let set = match char::from_u32(self.peek()?)? {
+        let c = char::from_u32(self.peek()?)?;
+        self.pos += 1;
+        Some(Some(match c {
             'd' => digit_set(),
             'D' => digit_set().complement()?,
             'w' => word_set(),
             'W' => word_set().complement()?,
             's' => space_set(),
             'S' => space_set().complement()?,
-            // shortcut: no Unicode property tables, so \p{...} and \P{...} don't compile and the pattern counts as none; add tables if anyone needs them.
-            'p' | 'P' => return None,
-            _ => return Some(None),
-        };
-        self.pos += 1;
-        Some(Some(set))
+            'p' | 'P' => {
+                if !self.eat('{') {
+                    return None;
+                }
+                let end = self.pos + self.src[self.pos..].iter().position(|&c| c == 0x7D)?;
+                let name: String = self.src[self.pos..end]
+                    .iter()
+                    .map(|&c| char::from_u32(c))
+                    .collect::<Option<_>>()?;
+                self.pos = end + 1;
+                let set = property(&name)?;
+                if c == 'P' { set.complement()? } else { set }
+            }
+            _ => {
+                self.pos -= 1;
+                return Some(None);
+            }
+        }))
     }
 
     /// The character an escape stands for. In a class, `\b` is a
@@ -1090,8 +1179,8 @@ mod tests {
             "]",
             "*a",
             "a**",
-            r"\p{L}",
-            r"\P{L}",
+            r"\p{Latin}",
+            r"\P{RGI_Emoji}",
             r"\q{a}",
             r"\e",
             "[a-]",
@@ -1107,6 +1196,251 @@ mod tests {
             "a{3,1}",
             "(?i:a)",
             "[a--]",
+        ] {
+            assert!(Pattern::compile(bad).is_none(), "{bad} compiled");
+        }
+    }
+
+    /// What each `\p{name}` holds, from test262's
+    /// built-ins/RegExp/property-escapes/generated, Unicode 17.0.0.
+    #[test]
+    fn property_escapes_hold_what_test262_says() {
+        let lt = [
+            (0x1c5, 0x1c5),
+            (0x1c8, 0x1c8),
+            (0x1cb, 0x1cb),
+            (0x1f2, 0x1f2),
+            (0x1f88, 0x1f8f),
+            (0x1f98, 0x1f9f),
+            (0x1fa8, 0x1faf),
+            (0x1fbc, 0x1fbc),
+            (0x1fcc, 0x1fcc),
+            (0x1ffc, 0x1ffc),
+        ];
+        let zs = [
+            (0x20, 0x20),
+            (0xa0, 0xa0),
+            (0x1680, 0x1680),
+            (0x2000, 0x200a),
+            (0x202f, 0x202f),
+            (0x205f, 0x205f),
+            (0x3000, 0x3000),
+        ];
+        let white_space = [
+            (0x9, 0xd),
+            (0x20, 0x20),
+            (0x85, 0x85),
+            (0xa0, 0xa0),
+            (0x1680, 0x1680),
+            (0x2000, 0x200a),
+            (0x2028, 0x2029),
+            (0x202f, 0x202f),
+            (0x205f, 0x205f),
+            (0x3000, 0x3000),
+        ];
+        let hex = [
+            (0x30, 0x39),
+            (0x41, 0x46),
+            (0x61, 0x66),
+            (0xff10, 0xff19),
+            (0xff21, 0xff26),
+            (0xff41, 0xff46),
+        ];
+        let hira = [
+            (0x3041, 0x3096),
+            (0x309d, 0x309f),
+            (0x1b001, 0x1b11f),
+            (0x1b132, 0x1b132),
+            (0x1b150, 0x1b152),
+            (0x1f200, 0x1f200),
+        ];
+        let hira_ext = [
+            (0x3001, 0x3003),
+            (0x3008, 0x3011),
+            (0x3013, 0x301f),
+            (0x3030, 0x3035),
+            (0x3037, 0x3037),
+            (0x303c, 0x303d),
+            (0x3041, 0x3096),
+            (0x3099, 0x30a0),
+            (0x30fb, 0x30fc),
+            (0xfe45, 0xfe46),
+            (0xff61, 0xff65),
+            (0xff70, 0xff70),
+            (0xff9e, 0xff9f),
+            (0x1b001, 0x1b11f),
+            (0x1b132, 0x1b132),
+            (0x1b150, 0x1b152),
+            (0x1f200, 0x1f200),
+        ];
+        let copt_ext = [
+            (0xb7, 0xb7),
+            (0x300, 0x300),
+            (0x304, 0x305),
+            (0x307, 0x307),
+            (0x374, 0x375),
+            (0x3e2, 0x3ef),
+            (0x2c80, 0x2cf3),
+            (0x2cf9, 0x2cff),
+            (0x2e17, 0x2e17),
+            (0x102e0, 0x102fb),
+        ];
+        let holds = |names: &[&str], want: &[(u32, u32)]| {
+            for name in names {
+                let got = super::property(name).unwrap_or_else(|| panic!("{name} is unknown"));
+                assert_eq!(got.ranges, want, "{name}");
+            }
+        };
+        holds(
+            &[
+                "General_Category=Titlecase_Letter",
+                "General_Category=Lt",
+                "gc=Titlecase_Letter",
+                "gc=Lt",
+                "Titlecase_Letter",
+                "Lt",
+            ],
+            &lt,
+        );
+        holds(&["Space_Separator", "gc=Zs"], &zs);
+        holds(&["White_Space", "space"], &white_space);
+        holds(&["ASCII_Hex_Digit", "AHex"], &hex[..3]);
+        holds(&["Hex_Digit", "Hex"], &hex);
+        holds(&["Emoji_Modifier", "EMod"], &[(0x1f3fb, 0x1f3ff)]);
+        holds(
+            &["IDS_Binary_Operator", "IDSB"],
+            &[(0x2ff0, 0x2ff1), (0x2ff4, 0x2ffd), (0x31ef, 0x31ef)],
+        );
+        holds(
+            &["Script=Ogham", "sc=Ogam", "scx=Ogham"],
+            &[(0x1680, 0x169c)],
+        );
+        holds(&["Script=Hiragana", "sc=Hira"], &hira);
+        holds(&["Script_Extensions=Hiragana", "scx=Hira"], &hira_ext);
+        holds(
+            &["Script=Coptic", "sc=Copt", "sc=Qaac"],
+            &[(0x3e2, 0x3ef), (0x2c80, 0x2cf3), (0x2cf9, 0x2cff)],
+        );
+        holds(&["Script_Extensions=Coptic", "scx=Qaac"], &copt_ext);
+        holds(&["Any"], &[(0, 0x10ffff)]);
+    }
+
+    #[test]
+    fn property_escapes_match() {
+        assert!(m(r"\p{L}+", "Zoë"));
+        assert!(m(r"\p{L}+", "Ελένη"));
+        assert!(!m(r"\p{L}+", "Zoë2"));
+        assert!(m(r"\p{Lu}\p{Ll}+", "Łukasz"));
+        assert!(m(r"\p{Letter}\p{LC}\p{Cased_Letter}", "日Ab"));
+        assert!(m(r"\P{L}+", "1 2"));
+        assert!(!m(r"\P{L}", "a"));
+        assert!(m(r"\p{N}+", "٣3Ⅻ"));
+        assert!(m(r"\p{sc=Greek}+", "αβγ"));
+        assert!(!m(r"\p{sc=Greek}", "a"));
+        assert!(
+            m(r"\p{scx=Hira}", "ー"),
+            "U+30FC is Common with Hiragana among its extensions"
+        );
+        assert!(!m(r"\p{sc=Hira}", "ー"));
+        assert!(m(r"\p{sc=Zyyy}", "ー"));
+        assert!(!m(r"\p{scx=Zyyy}", "ー"));
+        assert!(m(r"\p{scx=Zzzz}", "\u{378}"));
+        assert!(m(r"\p{Script=Unknown}", "\u{E000}"));
+        assert!(!m(r"\p{Assigned}", "\u{378}"));
+        assert!(m(r"\p{Assigned}", "a"));
+        assert!(m(r"\p{ASCII}+", "abc~"));
+        assert!(!m(r"\p{ASCII}", "é"));
+        assert!(m(r"\p{Emoji_Presentation}", "😀"));
+        assert!(m(r"\p{Uppercase}", "Ⓐ"), "Other_Uppercase, beyond Lu");
+        assert!(!m(r"\p{Lu}", "Ⓐ"));
+        assert!(m(r"\p{XID_Start}\p{XIDC}*", "x1"));
+        assert!(m(r"\p{ID_Start}", "\u{37A}") && !m(r"\p{XID_Start}", "\u{37A}"));
+        assert!(m(r"\p{Alpha}\p{Grapheme_Base}", "aa"));
+        assert!(!m(r"\p{Gr_Base}", "\u{301}"));
+    }
+
+    #[test]
+    fn property_escapes_in_classes() {
+        // test262's character-class.js.
+        assert!(m(r"[\p{Hex}\P{Hex}]", "\u{1D306}"));
+        assert!(m(r"[\p{L}\d_]+", "名前_2"));
+        assert!(m(r"[^\p{L}]+", "123"));
+        assert!(!m(r"[^\p{L}]", "a"));
+        assert!(m(r"[^\P{L}]", "a"));
+        assert!(m(r"[\p{L}--\p{ASCII}]+", "éλ"));
+        assert!(!m(r"[\p{L}--\p{ASCII}]", "e"));
+        assert!(m(r"[\p{sc=Latn}&&\p{Lu}]", "É"));
+        assert!(!m(r"[\p{sc=Latn}&&\p{Lu}]", "é"));
+        assert!(m(r"[[\p{L}--[a-z]]\p{Nd}]+", "ÉA9"));
+    }
+
+    /// test262's syntax cases: names match exactly, and only the ones
+    /// ECMAScript lists exist.
+    #[test]
+    fn property_escapes_that_dont_compile() {
+        for bad in [
+            r"\p",
+            r"\pL",
+            r"\p{",
+            r"\p}",
+            r"\p{L",
+            r"[\P{}]",
+            r"[\p{invalid}]",
+            r"\p{^General_Category=Letter}",
+            r"\p{=Letter}",
+            r"\p{=}",
+            r"\p{General_Category:Letter}",
+            r"\p{InAdlam}",
+            r"\p{InScript=Adlam}",
+            r"\p{IsScript=Adlam}",
+            r"\p{ASCII=Y}",
+            r"\p{ASCII=Yes}",
+            r"\p{ASCII=F}",
+            r"\p{ General_Category=Uppercase_Letter }",
+            r"\p{ Lowercase }",
+            r"\p{General_Category = Uppercase_Letter}",
+            r"\p{ANY}",
+            r"\p{any}",
+            r"\p{ASSIGNED}",
+            r"\p{Ascii}",
+            r"\p{ascii}",
+            r"\p{lowercase}",
+            r"\p{_-_lOwEr_C-A_S-E_-_}",
+            r"\p{gC=uppercase_letter}",
+            r"\p{gc=uppercaseletter}",
+            r"\p{General_Category}",
+            r"\p{General_Category=}",
+            r"\p{Script}",
+            r"\p{Script=}",
+            r"\p{Script_Extensions}",
+            r"\p{Script_Extensions=}",
+            r"\p{UnknownBinaryProperty}",
+            r"\p{Line_Breakz=WAT}",
+            r"\p{Line_Breakz=Alphabetic}",
+            r"\p{Script=FooBarBazInvalid}",
+            r"\p{Script_Extensions=H_e_h}",
+            r"\p{General_Category=WAT}",
+            r"\p{Composition_Exclusion}",
+            r"\p{Full_Composition_Exclusion}",
+            r"\p{Hyphen}",
+            r"\p{Other_Alphabetic}",
+            r"\p{Other_Lowercase}",
+            r"\p{Prepended_Concatenation_Mark}",
+            r"\p{Grapheme_Link}",
+            r"\p{Block=Adlam}",
+            r"\p{Line_Break}",
+            r"\p{Line_Break=Alphabetic}",
+            r"\p{WSpace}",
+            r"\p{Latin}",
+            r"\p{gc=Latin}",
+            r"\p{sc=Lu}",
+            r"[\p{Hex}--]",
+            r"[--\p{Hex}]",
+            r"[￿-\p{Hex}]",
+            r"[\p{Hex}-￿]",
+            // Properties of strings, which the tables leave out.
+            r"\p{RGI_Emoji}",
+            r"\p{Basic_Emoji}",
         ] {
             assert!(Pattern::compile(bad).is_none(), "{bad} compiled");
         }

@@ -46,14 +46,20 @@ impl Document {
         } else {
             NONE
         };
-        self.add(Data::Element(Element {
+        let id = self.add(Data::Element(Element {
             ns,
             tag,
             name,
             attrs: Span { start: at, end: at },
             contents,
             html_integration: false,
-        }))
+        }));
+        if contents != NONE
+            && let Some(hosts) = &mut self.hosts
+        {
+            hosts.insert(contents, id);
+        }
+        id
     }
 
     pub fn create_text(&mut self, text: &str) -> NodeId {
@@ -75,6 +81,17 @@ impl Document {
         let target = self.push_stable(target);
         let data = self.push_stable(data);
         self.add(Data::ProcessingInstruction { target, data })
+    }
+
+    pub fn create_doctype(&mut self, name: &str, public_id: &str, system_id: &str) -> NodeId {
+        let name = self.push_stable(name);
+        let public_id = self.push_stable(public_id);
+        let system_id = self.push_stable(system_id);
+        self.add(Data::Doctype {
+            name,
+            public_id,
+            system_id,
+        })
     }
 
     /// Moves `child` to be the last child of `parent`.
@@ -108,12 +125,15 @@ impl Document {
         {
             return Err(EditError::NotAChild);
         }
+        // Up through the parents, and out of a template's contents to the
+        // template: serializing goes down into them, so a template put in
+        // its own contents would never end.
         let mut at = Some(parent);
         while let Some(a) = at {
             if a == child {
                 return Err(EditError::Cycle);
             }
-            at = self.parent(a);
+            at = self.parent(a).or_else(|| self.host(a));
         }
         if before == Some(child) {
             return Ok(());
@@ -121,6 +141,27 @@ impl Document {
         self.detach(child);
         self.insert(parent, child, before.unwrap_or(NONE));
         Ok(())
+    }
+
+    /// The template whose contents `fragment` is, if it's any's. The map
+    /// is built once, then kept as edits add and rename templates, so a
+    /// run of inserts into contents stays linear.
+    fn host(&mut self, fragment: NodeId) -> Option<NodeId> {
+        if !matches!(self.nodes[fragment as usize].data, Data::Fragment) {
+            return None;
+        }
+        let nodes = &self.nodes;
+        self.hosts
+            .get_or_insert_with(|| {
+                (0..nodes.len() as NodeId)
+                    .filter_map(|id| match nodes[id as usize].data {
+                        Data::Element(e) if e.contents != NONE => Some((e.contents, id)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .get(&fragment)
+            .copied()
     }
 
     /// Moves every template's contents in under the template element
@@ -228,12 +269,19 @@ impl Document {
         let (tag, new) = self.name_element(e.ns, name);
         let template = e.ns == Ns::Html && tag == Tag::Template;
         let contents = if template && e.contents == NONE {
-            self.add(Data::Fragment)
+            let contents = self.add(Data::Fragment);
+            if let Some(hosts) = &mut self.hosts {
+                hosts.insert(contents, id);
+            }
+            contents
         } else if !template && e.contents != NONE {
             let first = self.first_child(id).unwrap_or(NONE);
             while let Some(child) = self.first_child(e.contents) {
                 self.detach(child);
                 self.insert(id, child, first);
+            }
+            if let Some(hosts) = &mut self.hosts {
+                hosts.remove(&e.contents);
             }
             NONE
         } else {
@@ -636,6 +684,43 @@ mod tests {
         assert_eq!(
             doc.insert_before(span, text, Some(div)),
             Err(EditError::NotAChild)
+        );
+    }
+
+    #[test]
+    fn a_template_cant_go_inside_its_own_contents() {
+        let mut doc = parse_fragment(
+            "<div><template><p></p></template></div>",
+            Ns::Html,
+            "body",
+            false,
+        );
+        let div = doc.first_child(0).unwrap();
+        let template = doc.first_child(div).unwrap();
+        let contents = doc.template_contents(template).unwrap();
+        let p = doc.first_child(contents).unwrap();
+        assert_eq!(doc.append(contents, template), Err(EditError::Cycle));
+        assert_eq!(doc.append(contents, div), Err(EditError::Cycle));
+        assert_eq!(doc.insert_before(p, div, None), Err(EditError::Cycle));
+        // Through a template made after the first check, two deep.
+        let made = doc.create_element(Ns::Html, "template");
+        doc.append(p, made).unwrap();
+        let made_contents = doc.template_contents(made).unwrap();
+        assert_eq!(doc.append(made_contents, div), Err(EditError::Cycle));
+        // And one renamed into a template.
+        let span = doc.create_element(Ns::Html, "span");
+        doc.append(made_contents, span).unwrap();
+        doc.rename(span, "template");
+        let span_contents = doc.template_contents(span).unwrap();
+        assert_eq!(doc.append(span_contents, template), Err(EditError::Cycle));
+        // A template renamed away leaves contents nothing reaches.
+        doc.rename(span, "section");
+        doc.append(span_contents, template).unwrap();
+        assert_eq!(doc.inner_html(0), "<div></div>");
+        doc.append(div, template).unwrap();
+        assert_eq!(
+            doc.inner_html(0),
+            "<div><template><p><template><section></section></template></p></template></div>"
         );
     }
 
