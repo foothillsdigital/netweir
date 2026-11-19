@@ -116,6 +116,45 @@ fn plain_attribute_names_mean_no_namespace() {
     assert_eq!(select(svg, "[*|href]"), ["use", "a"]);
 }
 
+/// `||` and `:nth-col()` by the HTML table model: `colspan`, a `rowspan`
+/// reaching into the next row, `rowspan=0`, a `colgroup` with no `col`s,
+/// and a table inside a cell, whose cells keep their own columns.
+#[test]
+fn table_columns() {
+    let html = r#"<table>
+        <colgroup><col id=c1><col id=c2 span=2></colgroup><colgroup span=2></colgroup>
+        <tr><td id=a><td id=b colspan=2><td id=c rowspan=2><td id=d><table><tr><td id=n></table>
+        <tr><th id=e rowspan=0><td id=f><td id=g><td id=h>
+        <tr><td id=i>
+        </table>"#;
+    // Columns 1-5: a b b c d / e f g c h / e i
+    assert_eq!(select(html, "#c1 || td"), ["td#a"]);
+    assert_eq!(select(html, "#c1 || th"), ["th#e"]);
+    assert_eq!(select(html, "#c2 || *"), ["td#b", "td#f", "td#g", "td#i"]);
+    assert_eq!(
+        select(html, "col||td"),
+        ["td#a", "td#b", "td#f", "td#g", "td#i"]
+    );
+    assert_eq!(select(html, "col:has(|| #f)"), ["col#c2"]);
+    assert_eq!(select(html, ":nth-col(1)"), ["td#a", "td#n", "th#e"]);
+    assert_eq!(select(html, ":nth-col(2)"), ["td#b", "td#f", "td#i"]);
+    assert_eq!(select(html, ":nth-col(4)"), ["td#c"]);
+    assert_eq!(select(html, ":nth-last-col(1)"), ["td#d", "td#n", "td#h"]);
+    assert_eq!(
+        select(html, ":nth-col(n+6), col:nth-col(1)"),
+        Vec::<String>::new()
+    );
+    // A single bar is still a namespace prefix.
+    assert_eq!(select(html, "|td"), Vec::<String>::new());
+    assert!(SelectorList::parse("col|td").is_err());
+    assert_eq!(
+        SelectorList::parse("col || td:nth-col(2)")
+            .unwrap()
+            .specificity(),
+        (0, 1, 2)
+    );
+}
+
 #[test]
 fn child_index_pseudo_classes() {
     assert_eq!(page("li:nth-child(2)"), ["li#27"]);
@@ -235,7 +274,6 @@ fn bad_selectors_are_errors() {
         ":has()",
         ":nope",
         ":lexbor-contains('x')",
-        "a || b",
         "[a=b c]",
         "[a!=b]",
     ] {

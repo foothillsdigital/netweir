@@ -33,6 +33,10 @@ doc.css("a::attr(title), .price::text").getall()
 - `::attr(name)` gives an attribute's value.
 - With neither, `get()` gives the element's HTML, the way Chrome's
   `outerHTML` writes it.
+- Table columns work as the HTML table model lays them out, `colspan`
+  and `rowspan` included: `col.total || td` finds the cells under a
+  `col`, and `td:nth-col(2)` and `:nth-last-col(1)` the cells in a
+  column by position.
 - Form pseudo-classes read the markup as it stands: `:valid` and `:invalid`
   check `required`, `type="email"` and `"url"`, `min`, `max`, `step` and
   `pattern`, but not the limits only typing can break (`maxlength`,

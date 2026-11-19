@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::dom::{AttrNs, Data, Document, NodeId, Ns, Quirks};
 use crate::pattern::Pattern;
@@ -52,6 +53,8 @@ enum Combinator {
     Child,
     NextSibling,
     SubsequentSibling,
+    /// `||`: a table cell in a column the `col` on its left covers.
+    Column,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,6 +154,13 @@ enum Pseudo {
     Invalid,
     /// A state no static page is in: `:hover`, `:focus`, `:visited`...
     Never,
+    /// `:nth-col()` and `:nth-last-col()`: a table cell in a column at
+    /// that position.
+    NthCol {
+        a: i32,
+        b: i32,
+        last: bool,
+    },
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -414,6 +424,10 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Some(Combinator::SubsequentSibling)
             }
+            '|' if self.peek_at(1) == Some('|') => {
+                self.pos += 2;
+                Some(Combinator::Column)
+            }
             _ => None,
         }
     }
@@ -422,7 +436,8 @@ impl<'a> Parser<'a> {
         let mut simple = Vec::new();
         let mut universal = false;
         // A type selector or universal, with an optional namespace prefix.
-        if self.peek() == Some('*') || self.starts_name() || self.peek() == Some('|') {
+        let bar = |p: &Self| p.peek() == Some('|') && p.peek_at(1) != Some('|');
+        if self.peek() == Some('*') || self.starts_name() || bar(self) {
             let star = self.eat('*');
             universal = star;
             let name = if star || self.peek() == Some('|') {
@@ -430,7 +445,7 @@ impl<'a> Parser<'a> {
             } else {
                 self.name()?
             };
-            if self.peek() == Some('|') && self.peek_at(1) != Some('=') {
+            if bar(self) && self.peek_at(1) != Some('=') {
                 self.pos += 1;
                 // Only `*|` (any namespace) and `|` (none) can be used
                 // without @namespace, which a query can't declare.
@@ -660,6 +675,16 @@ impl<'a> Parser<'a> {
                     last,
                     of_type,
                     of,
+                }
+            }
+            "nth-col" | "nth-last-col" => {
+                let close = self.close_paren();
+                let (a, b) = an_plus_b(&self.s[self.pos..close])?;
+                self.pos = close;
+                Pseudo::NthCol {
+                    a,
+                    b,
+                    last: name == "nth-last-col",
                 }
             }
             "lang" => {
@@ -1456,6 +1481,18 @@ struct Cx<'a> {
     /// parent the first time `:nth-*` needs one, so a query over a parent
     /// with n children counts them once rather than n times.
     places: RefCell<HashMap<NodeId, Place>>,
+    /// Each table's columns, worked out the first time `||` or
+    /// `:nth-col()` needs them, so a big table isn't laid out per cell.
+    tables: RefCell<HashMap<NodeId, Rc<Columns>>>,
+}
+
+/// A table's columns by the HTML table model: the first column and how
+/// many each cell and each `col` covers, and how many there are in all.
+#[derive(Default)]
+struct Columns {
+    cells: HashMap<NodeId, (u32, u32)>,
+    cols: Vec<(NodeId, u32, u32)>,
+    width: u32,
 }
 
 /// An element's position among its parent's element children, counting
@@ -1534,6 +1571,141 @@ impl<'a> Cx<'a> {
             page,
             pattern_budget: Cell::new(crate::pattern::SELECT_STEP_LIMIT),
             places: RefCell::new(HashMap::new()),
+            tables: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn html_tag_of(&self, n: NodeId) -> Option<Tag> {
+        self.doc
+            .element(n)
+            .filter(|e| e.ns == Ns::Html)
+            .map(|e| e.tag)
+    }
+
+    /// The table a cell belongs to: its row's, the row in the table or in
+    /// one of its row groups.
+    fn table_of_cell(&self, cell: NodeId) -> Option<NodeId> {
+        if !matches!(self.html_tag_of(cell), Some(Tag::Td | Tag::Th)) {
+            return None;
+        }
+        let tr = self
+            .doc
+            .parent(cell)
+            .filter(|&p| self.html_tag_of(p) == Some(Tag::Tr))?;
+        let p = self.doc.parent(tr)?;
+        match self.html_tag_of(p)? {
+            Tag::Table => Some(p),
+            Tag::Thead | Tag::Tbody | Tag::Tfoot => self
+                .doc
+                .parent(p)
+                .filter(|&t| self.html_tag_of(t) == Some(Tag::Table)),
+            _ => None,
+        }
+    }
+
+    /// A cell's table's columns, and the cell's first column and span.
+    fn cell_columns(&self, cell: NodeId) -> Option<(Rc<Columns>, u32, u32)> {
+        let table = self.table_of_cell(cell)?;
+        let columns = self.columns(table);
+        let &(x, n) = columns.cells.get(&cell)?;
+        Some((columns, x, n))
+    }
+
+    fn columns(&self, table: NodeId) -> Rc<Columns> {
+        if let Some(c) = self.tables.borrow().get(&table) {
+            return c.clone();
+        }
+        let c = Rc::new(self.lay_out(table));
+        self.tables.borrow_mut().insert(table, c.clone());
+        c
+    }
+
+    /// A `span`, `colspan` or `rowspan` as the HTML Standard reads it:
+    /// missing, unparsable or zero gives 1, and it stops at `max`.
+    fn span(&self, el: NodeId, name: &str, max: u32) -> u32 {
+        self.attr(el, name)
+            .and_then(parse_non_negative)
+            .filter(|&n| n > 0)
+            .map_or(1, |n| n.min(max))
+    }
+
+    /// The HTML Standard's "forming a table", as far as columns go:
+    /// `colgroup`s before the first row give the `col`s their columns,
+    /// and each cell takes the first column its row leaves free, rows
+    /// above reaching down with `rowspan` included.
+    fn lay_out(&self, table: NodeId) -> Columns {
+        let doc = self.doc;
+        let mut out = Columns::default();
+        let mut col_x = 0;
+        let mut rows_started = false;
+        // Per column, how many more rows, this one included, a cell from
+        // above still covers; u32::MAX for rowspan=0, to the group's end.
+        let mut down: Vec<u32> = Vec::new();
+        for child in doc.children(table) {
+            match self.html_tag_of(child) {
+                Some(Tag::Colgroup) if !rows_started => {
+                    let mut has_cols = false;
+                    for c in doc.children(child) {
+                        if self.html_tag_of(c) == Some(Tag::Col) {
+                            has_cols = true;
+                            let n = self.span(c, "span", 1000);
+                            out.cols.push((c, col_x, n));
+                            col_x += n;
+                        }
+                    }
+                    if !has_cols {
+                        col_x += self.span(child, "span", 1000);
+                    }
+                }
+                Some(Tag::Tr) => {
+                    rows_started = true;
+                    self.lay_out_row(child, &mut down, &mut out);
+                }
+                Some(Tag::Thead | Tag::Tbody | Tag::Tfoot) => {
+                    rows_started = true;
+                    // Cells don't reach from one row group into another.
+                    down.clear();
+                    for r in doc.children(child) {
+                        if self.html_tag_of(r) == Some(Tag::Tr) {
+                            self.lay_out_row(r, &mut down, &mut out);
+                        }
+                    }
+                    down.clear();
+                }
+                _ => {}
+            }
+        }
+        out.width = out.width.max(col_x);
+        out
+    }
+
+    fn lay_out_row(&self, tr: NodeId, down: &mut Vec<u32>, out: &mut Columns) {
+        let mut x = 0;
+        for cell in self.doc.children(tr) {
+            if !matches!(self.html_tag_of(cell), Some(Tag::Td | Tag::Th)) {
+                continue;
+            }
+            while down.get(x).is_some_and(|&d| d > 0) {
+                x += 1;
+            }
+            let span = self.span(cell, "colspan", 1000) as usize;
+            let rows = match self.attr(cell, "rowspan").and_then(parse_non_negative) {
+                Some(0) => u32::MAX,
+                Some(n) => n.min(65534),
+                None => 1,
+            };
+            if down.len() < x + span {
+                down.resize(x + span, 0);
+            }
+            for d in &mut down[x..x + span] {
+                *d = (*d).max(rows);
+            }
+            out.cells.insert(cell, (x as u32, span as u32));
+            x += span;
+        }
+        out.width = out.width.max(down.len() as u32);
+        for d in down.iter_mut().filter(|d| **d != u32::MAX) {
+            *d = d.saturating_sub(1);
         }
     }
 
@@ -1649,6 +1821,11 @@ impl<'a> Cx<'a> {
                 }
                 false
             }
+            Combinator::Column => self.cell_columns(el).is_some_and(|(t, x, n)| {
+                t.cols.iter().any(|&(col, cx, cn)| {
+                    cx < x + n && x < cx + cn && self.complex(c, i + 1, col, anchor)
+                })
+            }),
         }
     }
 
@@ -2413,6 +2590,12 @@ impl<'a> Cx<'a> {
             }),
             Pseudo::Dir(rtl) => self.is_rtl(el) == *rtl,
             Pseudo::Never => false,
+            Pseudo::NthCol { a, b, last } => self.cell_columns(el).is_some_and(|(t, x, n)| {
+                (x..x + n).any(|k| {
+                    let index = if *last { t.width - k } else { k + 1 };
+                    nth_matches(*a as i64, *b as i64, index as i64)
+                })
+            }),
         }
     }
 
@@ -2430,6 +2613,15 @@ impl<'a> Cx<'a> {
                 while let Some(s) = at {
                     stack.push(s);
                     at = self.next_element(s);
+                }
+            }
+            // A col's cells are elsewhere in its table.
+            Combinator::Column => {
+                let table = doc.parent(el).and_then(|g| doc.parent(g));
+                if self.html_tag_of(el) == Some(Tag::Col)
+                    && let Some(t) = table.filter(|&t| self.html_tag_of(t) == Some(Tag::Table))
+                {
+                    push_children_reversed(doc, t, &mut stack);
                 }
             }
             _ => push_children_reversed(doc, el, &mut stack),
