@@ -26,6 +26,10 @@ crate = "netweir-html"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
+crate = "netweir-xpath"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 crate = "netweir-core"
 allow = ["AGPL-3.0-only"]
 

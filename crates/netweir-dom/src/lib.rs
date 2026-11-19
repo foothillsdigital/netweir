@@ -14,7 +14,6 @@ pub mod date;
 mod document;
 pub mod extract;
 pub mod gtin;
-mod index;
 pub mod js;
 pub mod markdown;
 pub mod metadata;

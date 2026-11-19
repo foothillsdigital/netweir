@@ -137,10 +137,74 @@ pub struct Document {
     /// Whether it was parsed with scripting on, which decides how a
     /// noscript element's text serializes.
     pub(crate) scripting: bool,
+    /// Where each node and attribute was written, when the parse was
+    /// asked to keep that.
+    pub(crate) positions: Option<Box<Positions>>,
     /// Each template's contents, mapped to the template: no link leads
     /// back from the contents, and an edit's cycle check has to climb out
     /// of them. Edits build it the first time they need it.
     pub(crate) hosts: Option<std::collections::HashMap<NodeId, NodeId>>,
+}
+
+/// A node or attribute with no recorded position.
+const UNKNOWN: [u32; 2] = [u32::MAX; 2];
+
+/// Where nodes and attributes were written, as `[start, end)` offsets
+/// into the preprocessed source; the original input differs only by the
+/// CRs that preprocessing dropped and a dropped byte order mark, so these
+/// two are kept to map back.
+#[derive(Debug, Default)]
+pub(crate) struct Positions {
+    /// By node id: an element's start tag, or the whole of anything else.
+    pub nodes: Vec<[u32; 2]>,
+    /// By node id: an element's end tag.
+    pub ends: Vec<[u32; 2]>,
+    /// By index into [`Document::attrs`].
+    pub attrs: Vec<[u32; 2]>,
+    /// Where the preprocessed source has an LF that was a CRLF, ascending.
+    pub crlf: Vec<u32>,
+    /// Bytes before the source in the original: a byte order mark.
+    pub skipped: u32,
+}
+
+impl Positions {
+    /// The positions of `input`, the original as the tokenizer was going
+    /// to read it before preprocessing, `skipped` bytes into what the
+    /// caller passed.
+    pub(crate) fn new(input: &str, skipped: usize) -> Positions {
+        let mut crlf = Vec::new();
+        for i in memchr::memchr_iter(b'\r', input.as_bytes()) {
+            if input.as_bytes().get(i + 1) == Some(&b'\n') {
+                crlf.push((i - crlf.len()) as u32);
+            }
+        }
+        Positions {
+            crlf,
+            skipped: skipped as u32,
+            ..Positions::default()
+        }
+    }
+
+    pub(crate) fn set(list: &mut Vec<[u32; 2]>, i: usize, at: [u32; 2]) {
+        if list.len() <= i {
+            list.resize(i + 1, UNKNOWN);
+        }
+        list[i] = at;
+    }
+
+    fn get(list: &[[u32; 2]], i: usize) -> Option<[u32; 2]> {
+        list.get(i).copied().filter(|&a| a != UNKNOWN)
+    }
+
+    /// An offset in the preprocessed source, as one in the original.
+    fn original(&self, at: u32) -> usize {
+        let dropped = self.crlf.partition_point(|&lf| lf < at);
+        self.skipped as usize + at as usize + dropped
+    }
+
+    fn range(&self, at: [u32; 2]) -> std::ops::Range<usize> {
+        self.original(at[0])..self.original(at[1])
+    }
 }
 
 /// What a node is, as [`Document::kind`] reports it.
@@ -185,6 +249,7 @@ impl Document {
             attrs: Vec::with_capacity(capacity / 32 + 16),
             quirks: Quirks::No,
             scripting: false,
+            positions: None,
             hosts: None,
         }
     }
@@ -230,7 +295,7 @@ impl Document {
     }
 
     /// Where `s` is in the source, if it's a slice of it.
-    fn source_offset(&self, s: &str) -> Option<usize> {
+    pub(crate) fn source_offset(&self, s: &str) -> Option<usize> {
         let base = self.src.as_ptr() as usize;
         let at = s.as_ptr() as usize;
         (at >= base && at + s.len() <= base + self.src.len()).then(|| at - base)
@@ -268,6 +333,81 @@ impl Document {
             data,
         });
         id
+    }
+
+    /// Where a node was written, as a byte range of the input the parse
+    /// was given: an element's start tag from `<` to `>`, or the whole of
+    /// a text node, comment, doctype or processing instruction. A text
+    /// node made of several runs (text, then a character reference, then
+    /// text again, or text foster-parented out of a table) spans the first
+    /// run's start to the last one's end.
+    ///
+    /// `None` for a node the parser made up rather than read (an implied
+    /// `<html>`, `<head>`, `<body>` or `<tbody>`, a formatting element it
+    /// reopened, a copy the adoption agency made), for one an edit made,
+    /// and for every node unless the document was parsed with
+    /// [`Options::spans`](crate::Options::spans) on.
+    pub fn span(&self, id: NodeId) -> Option<std::ops::Range<usize>> {
+        let p = self.positions.as_deref()?;
+        Positions::get(&p.nodes, id as usize).map(|at| p.range(at))
+    }
+
+    /// Where an element's end tag was written, when it had one: the end
+    /// tag whose handling closed it, `</p>` for a `<p>`, or a `</body>`.
+    pub fn end_span(&self, id: NodeId) -> Option<std::ops::Range<usize>> {
+        let p = self.positions.as_deref()?;
+        Positions::get(&p.ends, id as usize).map(|at| p.range(at))
+    }
+
+    /// Where an element's `i`th attribute, as [`Document::attrs`] lists
+    /// them, was written: from its name's first byte to the end of its
+    /// value, past a closing quote, or to the end of its name when it has
+    /// no value. An attribute an edit set has none; a reopened formatting
+    /// element's are where the original's were written.
+    pub fn attr_span(&self, id: NodeId, i: usize) -> Option<std::ops::Range<usize>> {
+        let p = self.positions.as_deref()?;
+        let e = self.element(id)?;
+        let at = e.attrs.start as usize + i;
+        if at >= e.attrs.end as usize {
+            return None;
+        }
+        Positions::get(&p.attrs, at).map(|at| p.range(at))
+    }
+
+    /// The line and column of a byte offset into the input the parse was
+    /// given, as an editor shows them: both start at 1, a line ends at an
+    /// LF, a CRLF or a lone CR, and the column counts characters (Unicode
+    /// scalar values), not bytes. Worked out from the source each time,
+    /// so it costs a pass over the text before `offset`.
+    pub fn line_col(&self, offset: usize) -> (usize, usize) {
+        // Back into the preprocessed source, where every line ends at an
+        // LF: past the skipped bytes and the CRs that were dropped.
+        let (skipped, crlf) = self
+            .positions
+            .as_deref()
+            .map_or((0, &[][..]), |p| (p.skipped as usize, &p.crlf[..]));
+        let o = offset.saturating_sub(skipped);
+        // The CRLFs wholly before `o`: the `i`th one's CR is at `lf + i`
+        // in the original, where `lf` is its LF's place in the source.
+        let (mut lo, mut hi) = (0, crlf.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if crlf[mid] as usize + mid + 1 < o {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let at = (o - lo.min(o)).min(self.src.len());
+        let bytes = &self.src.as_bytes()[..at];
+        let line = 1 + memchr::memchr_iter(b'\n', bytes).count();
+        let start = memchr::memrchr(b'\n', bytes).map_or(0, |i| i + 1);
+        // Every byte but a UTF-8 continuation byte starts a character.
+        let column = 1 + bytes[start..]
+            .iter()
+            .filter(|&&b| (b as i8) >= -0x40)
+            .count();
+        (line, column)
     }
 
     pub(crate) fn element(&self, id: NodeId) -> Option<&Element> {

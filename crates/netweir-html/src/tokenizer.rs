@@ -44,6 +44,15 @@ pub trait Sink {
     fn cdata_allowed(&self) -> bool {
         false
     }
+    /// Where the token the next call hands over was written: a byte range
+    /// of the tokenizer's (preprocessed) input, from a tag's `<` to past
+    /// its `>`, or the characters a text run was read from (a character
+    /// reference's whole `&...;` for what it stands for). Called just
+    /// before every token, text runs included; a sink that doesn't need
+    /// positions leaves it as this, which costs nothing.
+    fn position(&mut self, start: usize, end: usize) {
+        let _ = (start, end);
+    }
 }
 
 #[derive(Debug)]
@@ -75,6 +84,15 @@ impl<'a> Tag<'a> {
             attrs: self.attrs.iter(),
         }
     }
+
+    /// Where the `i`th attribute [`Tag::attrs`] gives was written, as a
+    /// range of the input from its name's first byte to the end of its
+    /// value (past a closing quote), or of its name when it has none.
+    pub fn attr_span(&self, i: usize) -> Option<std::ops::Range<usize>> {
+        self.attrs
+            .get(i)
+            .map(|a| a.at[0] as usize..a.at[1] as usize)
+    }
 }
 
 /// A string the tokenizer read: a range of the input, or of its buffer.
@@ -96,6 +114,8 @@ impl Text {
 struct Attr {
     name: Text,
     value: Text,
+    /// Where in the input it was written, for [`Tag::attr_span`].
+    at: [u32; 2],
 }
 
 pub struct Attrs<'a> {
@@ -213,6 +233,8 @@ enum State {
 /// `attr_buf`, and whether an earlier one had the same name.
 #[derive(Clone, Copy)]
 struct Current {
+    /// Where it was written, so far.
+    at: [u32; 2],
     name_start: usize,
     name: Option<Text>,
     value_start: usize,
@@ -254,6 +276,11 @@ pub struct Tokenizer<'a> {
     /// test that checks it against the state machine.
     fast: bool,
 
+    /// Where the token being read started (its `<`), and the character
+    /// reference being read (its `&`), for [`Sink::position`].
+    token_start: usize,
+    ref_start: usize,
+
     /// When to give up, checked every few thousand steps.
     deadline: Option<std::time::Instant>,
     timed_out: bool,
@@ -291,6 +318,8 @@ impl<'a> Tokenizer<'a> {
             system_id: None,
             force_quirks: false,
             fast: true,
+            token_start: 0,
+            ref_start: 0,
             deadline: None,
             timed_out: false,
         }
@@ -367,10 +396,12 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn start_attr(&mut self) {
+    /// An attribute whose name starts at `from` in the input.
+    fn start_attr(&mut self, from: usize) {
         self.finish_attr();
         let at = self.attr_buf.len();
         self.current = Some(Current {
+            at: [from as u32; 2],
             name_start: at,
             name: None,
             value_start: at,
@@ -401,10 +432,12 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    /// On leaving the attribute name state: the spec drops an attribute
-    /// whose name the tag already has.
-    fn end_attr_name(&mut self) {
+    /// On leaving the attribute name state, the name ending at `end` in
+    /// the input: the spec drops an attribute whose name the tag already
+    /// has.
+    fn end_attr_name(&mut self, end: usize) {
         let Some(mut c) = self.current else { return };
+        c.at[1] = end as u32;
         let name = match self.attr_name_input.take() {
             Some((s, e)) => Text {
                 start: s as u32,
@@ -436,7 +469,11 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// The value ends at `end`; if it never changed, it's that slice.
-    fn end_value(&mut self, end: usize) {
+    /// As written it ends at `written`, past any closing quote.
+    fn end_value(&mut self, end: usize, written: usize) {
+        if let Some(c) = self.current.as_mut() {
+            c.at[1] = written as u32;
+        }
         if let Some(s) = self.value_from.take()
             && let Some(c) = self.current.as_mut()
         {
@@ -464,7 +501,11 @@ impl<'a> Tokenizer<'a> {
             end: self.attr_buf.len() as u32,
             input: false,
         });
-        self.attrs.push(Attr { name, value });
+        self.attrs.push(Attr {
+            name,
+            value,
+            at: c.at,
+        });
     }
 
     fn emit_tag<S: Sink>(&mut self, sink: &mut S) {
@@ -481,6 +522,7 @@ impl<'a> Tokenizer<'a> {
             buf: &self.attr_buf,
             attrs: &self.attrs,
         };
+        sink.position(self.token_start, self.pos);
         if self.end_tag {
             sink.end_tag(&tag);
             self.state = State::Data;
@@ -552,6 +594,7 @@ impl<'a> Tokenizer<'a> {
                 return self.bail();
             }
             let attr_name = (a, p);
+            let mut written = p;
             let value = match bytes[p] {
                 b'=' => {
                     p += 1;
@@ -562,6 +605,7 @@ impl<'a> Tokenizer<'a> {
                                 Some(i) if bytes[p + i] == q => {
                                     let v = (p, p + i);
                                     p += i + 1;
+                                    written = p;
                                     v
                                 }
                                 _ => return self.bail(),
@@ -578,6 +622,7 @@ impl<'a> Tokenizer<'a> {
                             if p >= len || matches!(bytes[p], b'&' | 0) || p == v {
                                 return self.bail();
                             }
+                            written = p;
                             (v, p)
                         }
                         None => return self.bail(),
@@ -604,6 +649,7 @@ impl<'a> Tokenizer<'a> {
                         end: value.1 as u32,
                         input: true,
                     },
+                    at: [a as u32, written as u32],
                 });
             }
         }
@@ -620,6 +666,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn emit_comment<S: Sink>(&mut self, sink: &mut S) {
+        sink.position(self.token_start, self.pos);
         sink.comment(&self.comment);
         self.state = State::Data;
     }
@@ -640,7 +687,14 @@ impl<'a> Tokenizer<'a> {
         self.force_quirks = false;
     }
 
+    fn emit_pi<S: Sink>(&mut self, sink: &mut S) {
+        sink.position(self.token_start, self.pos);
+        sink.processing_instruction(&self.pi_target, &self.pi_data);
+        self.state = State::Data;
+    }
+
     fn emit_doctype<S: Sink>(&mut self, sink: &mut S) {
+        sink.position(self.token_start, self.pos);
         sink.doctype(&Doctype {
             name: self.doctype_name.as_deref(),
             public_id: self.public_id.as_deref(),
@@ -669,6 +723,8 @@ impl<'a> Tokenizer<'a> {
             && !self.last_start_tag.is_empty()
             && rest[..run].eq_ignore_ascii_case(self.last_start_tag.as_bytes())
         {
+            // `pos` is just past the `</`.
+            self.token_start = self.pos - 2;
             self.new_tag(true);
             self.tag_name.push_str(&self.last_start_tag);
             self.pos += run;
@@ -685,8 +741,14 @@ impl<'a> Tokenizer<'a> {
             }
             return;
         }
-        sink.text("</");
-        sink.text(&self.input[self.pos..self.pos + run]);
+        let input = self.input;
+        emit_text(sink, "</", self.pos - 2, self.pos);
+        emit_text(
+            sink,
+            &input[self.pos..self.pos + run],
+            self.pos,
+            self.pos + run,
+        );
         self.pos += run;
         self.state = text;
     }
@@ -695,12 +757,13 @@ impl<'a> Tokenizer<'a> {
         if in_attr {
             self.attr_buf.push_str(s);
         } else {
-            sink.text(s);
+            emit_text(sink, s, self.ref_start, self.pos);
         }
     }
 
     /// A character reference, with `pos` just past the `&`.
     fn char_ref<S: Sink>(&mut self, sink: &mut S, in_attr: bool) {
+        self.ref_start = self.pos - 1;
         let rest = self.rest();
         match rest.as_bytes().first() {
             Some(b) if b.is_ascii_alphanumeric() => self.named_ref(sink, in_attr, rest),
@@ -800,20 +863,23 @@ impl<'a> Tokenizer<'a> {
                     let rest = &bytes[self.pos..];
                     let Some(i) = memchr3(b'<', b'&', 0, rest) else {
                         if !rest.is_empty() {
-                            sink.text(&input[self.pos..]);
+                            emit_text(sink, &input[self.pos..], self.pos, bytes.len());
                         }
                         self.pos = bytes.len();
                         sink.eof();
                         return;
                     };
                     if i > 0 {
-                        sink.text(&input[self.pos..self.pos + i]);
+                        emit_text(sink, &input[self.pos..self.pos + i], self.pos, self.pos + i);
                     }
                     self.pos += i + 1;
                     match rest[i] {
-                        b'<' => self.state = State::TagOpen,
+                        b'<' => {
+                            self.token_start = self.pos - 1;
+                            self.state = State::TagOpen;
+                        }
                         b'&' => self.char_ref(sink, false),
-                        _ => sink.text("\0"),
+                        _ => emit_text(sink, "\0", self.pos - 1, self.pos),
                     }
                 }
                 State::Rcdata | State::Rawtext | State::ScriptData | State::Plaintext => {
@@ -826,19 +892,19 @@ impl<'a> Tokenizer<'a> {
                     };
                     let Some(i) = found else {
                         if !rest.is_empty() {
-                            sink.text(&input[self.pos..]);
+                            emit_text(sink, &input[self.pos..], self.pos, bytes.len());
                         }
                         self.pos = bytes.len();
                         sink.eof();
                         return;
                     };
                     if i > 0 {
-                        sink.text(&input[self.pos..self.pos + i]);
+                        emit_text(sink, &input[self.pos..self.pos + i], self.pos, self.pos + i);
                     }
                     self.pos += i + 1;
                     match rest[i] {
                         b'&' => self.char_ref(sink, false),
-                        0 => sink.text(REPLACEMENT),
+                        0 => emit_text(sink, REPLACEMENT, self.pos - 1, self.pos),
                         _ => match self.byte() {
                             Some(b'/') => {
                                 self.pos += 1;
@@ -846,10 +912,10 @@ impl<'a> Tokenizer<'a> {
                             }
                             Some(b'!') if state == State::ScriptData => {
                                 self.pos += 1;
-                                sink.text("<!");
+                                emit_text(sink, "<!", self.pos - 2, self.pos);
                                 self.state = State::ScriptDataEscapeStart;
                             }
-                            _ => sink.text("<"),
+                            _ => emit_text(sink, "<", self.pos - 1, self.pos),
                         },
                     }
                 }
@@ -874,12 +940,12 @@ impl<'a> Tokenizer<'a> {
                         self.state = State::ProcessingInstructionOpen;
                     }
                     None => {
-                        sink.text("<");
+                        emit_text(sink, "<", self.pos - 1, self.pos);
                         sink.eof();
                         return;
                     }
                     Some(_) => {
-                        sink.text("<");
+                        emit_text(sink, "<", self.pos - 1, self.pos);
                         self.state = State::Data;
                     }
                 },
@@ -895,7 +961,7 @@ impl<'a> Tokenizer<'a> {
                         self.state = State::Data;
                     }
                     None => {
-                        sink.text("</");
+                        emit_text(sink, "</", self.pos - 2, self.pos);
                         sink.eof();
                         return;
                     }
@@ -938,7 +1004,7 @@ impl<'a> Tokenizer<'a> {
                 State::ScriptDataEscapeStart | State::ScriptDataEscapeStartDash => {
                     if self.byte() == Some(b'-') {
                         self.pos += 1;
-                        sink.text("-");
+                        emit_text(sink, "-", self.pos - 1, self.pos);
                         self.state = if self.state == State::ScriptDataEscapeStart {
                             State::ScriptDataEscapeStartDash
                         } else {
@@ -953,19 +1019,19 @@ impl<'a> Tokenizer<'a> {
                     let rest = &bytes[self.pos..];
                     let Some(i) = memchr3(b'-', b'<', 0, rest) else {
                         if !rest.is_empty() {
-                            sink.text(&input[self.pos..]);
+                            emit_text(sink, &input[self.pos..], self.pos, bytes.len());
                         }
                         self.pos = bytes.len();
                         sink.eof();
                         return;
                     };
                     if i > 0 {
-                        sink.text(&input[self.pos..self.pos + i]);
+                        emit_text(sink, &input[self.pos..self.pos + i], self.pos, self.pos + i);
                     }
                     self.pos += i + 1;
                     match rest[i] {
                         b'-' => {
-                            sink.text("-");
+                            emit_text(sink, "-", self.pos - 1, self.pos);
                             self.state = if double {
                                 State::ScriptDataDoubleEscapedDash
                             } else {
@@ -973,11 +1039,11 @@ impl<'a> Tokenizer<'a> {
                             };
                         }
                         b'<' if double => {
-                            sink.text("<");
+                            emit_text(sink, "<", self.pos - 1, self.pos);
                             self.state = State::ScriptDataDoubleEscapedLessThan;
                         }
                         b'<' => self.state = State::ScriptDataEscapedLessThan,
-                        _ => sink.text(REPLACEMENT),
+                        _ => emit_text(sink, REPLACEMENT, self.pos - 1, self.pos),
                     }
                 }
                 State::ScriptDataEscapedDash
@@ -1012,24 +1078,24 @@ impl<'a> Tokenizer<'a> {
                         }
                         Some(b'-') => {
                             self.pos += 1;
-                            sink.text("-");
+                            emit_text(sink, "-", self.pos - 1, self.pos);
                             self.state = dash2;
                         }
                         Some(b'<') => {
                             self.pos += 1;
                             if double {
-                                sink.text("<");
+                                emit_text(sink, "<", self.pos - 1, self.pos);
                             }
                             self.state = less;
                         }
                         Some(b'>') if dash_dash => {
                             self.pos += 1;
-                            sink.text(">");
+                            emit_text(sink, ">", self.pos - 1, self.pos);
                             self.state = State::ScriptData;
                         }
                         Some(0) => {
                             self.pos += 1;
-                            sink.text(REPLACEMENT);
+                            emit_text(sink, REPLACEMENT, self.pos - 1, self.pos);
                             self.state = body;
                         }
                         Some(_) => self.state = body,
@@ -1041,11 +1107,11 @@ impl<'a> Tokenizer<'a> {
                         self.end_tag_or_text(sink, State::ScriptDataEscaped);
                     }
                     Some(b) if b.is_ascii_alphabetic() => {
-                        sink.text("<");
+                        emit_text(sink, "<", self.pos - 1, self.pos);
                         self.state = State::ScriptDataDoubleEscapeStart;
                     }
                     _ => {
-                        sink.text("<");
+                        emit_text(sink, "<", self.pos - 1, self.pos);
                         self.state = State::ScriptDataEscaped;
                     }
                 },
@@ -1054,14 +1120,19 @@ impl<'a> Tokenizer<'a> {
                     let rest = &bytes[self.pos..];
                     let run = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
                     if run > 0 {
-                        sink.text(&input[self.pos..self.pos + run]);
+                        emit_text(
+                            sink,
+                            &input[self.pos..self.pos + run],
+                            self.pos,
+                            self.pos + run,
+                        );
                     }
                     let script = rest[..run].eq_ignore_ascii_case(b"script");
                     self.pos += run;
                     match rest.get(run) {
                         Some(&b) if is_space(b) || b == b'/' || b == b'>' => {
                             self.pos += 1;
-                            sink.text(&input[self.pos - 1..self.pos]);
+                            emit_text(sink, &input[self.pos - 1..self.pos], self.pos - 1, self.pos);
                             self.state = match (start, script) {
                                 (true, true) | (false, false) => State::ScriptDataDoubleEscaped,
                                 _ => State::ScriptDataEscaped,
@@ -1079,7 +1150,7 @@ impl<'a> Tokenizer<'a> {
                 State::ScriptDataDoubleEscapedLessThan => {
                     if self.byte() == Some(b'/') {
                         self.pos += 1;
-                        sink.text("/");
+                        emit_text(sink, "/", self.pos - 1, self.pos);
                         self.state = State::ScriptDataDoubleEscapeEnd;
                     } else {
                         self.state = State::ScriptDataDoubleEscaped;
@@ -1090,27 +1161,27 @@ impl<'a> Tokenizer<'a> {
                     None | Some(b'/' | b'>') => self.state = State::AfterAttributeName,
                     Some(b'=') => {
                         self.pos += 1;
-                        self.start_attr();
+                        self.start_attr(self.pos - 1);
                         self.attr_buf.push('=');
                         self.state = State::AttributeName;
                     }
                     Some(_) => {
-                        self.start_attr();
+                        self.start_attr(self.pos);
                         self.state = State::AttributeName;
                     }
                 },
                 State::AttributeName => match self.byte() {
                     None => {
-                        self.end_attr_name();
+                        self.end_attr_name(self.pos);
                         self.state = State::AfterAttributeName;
                     }
                     Some(b) if is_space(b) || b == b'/' || b == b'>' => {
-                        self.end_attr_name();
+                        self.end_attr_name(self.pos);
                         self.state = State::AfterAttributeName;
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        self.end_attr_name();
+                        self.end_attr_name(self.pos - 1);
                         self.state = State::BeforeAttributeValue;
                     }
                     Some(0) => {
@@ -1146,7 +1217,7 @@ impl<'a> Tokenizer<'a> {
                         return;
                     }
                     Some(_) => {
-                        self.start_attr();
+                        self.start_attr(self.pos);
                         self.state = State::AttributeName;
                     }
                 },
@@ -1184,11 +1255,10 @@ impl<'a> Tokenizer<'a> {
                     };
                     let at = self.pos + i;
                     if rest[i] == quote {
-                        if self.value_from.is_some() {
-                            self.end_value(at);
-                        } else {
+                        if self.value_from.is_none() {
                             self.attr_buf.push_str(&input[self.pos..at]);
                         }
+                        self.end_value(at, at + 1);
                         self.pos = at + 1;
                         self.state = State::AfterAttributeValueQuoted;
                     } else {
@@ -1211,7 +1281,7 @@ impl<'a> Tokenizer<'a> {
                         return;
                     }
                     Some(b) if is_space(b) => {
-                        self.end_value(self.pos);
+                        self.end_value(self.pos, self.pos);
                         self.pos += 1;
                         self.state = State::BeforeAttributeName;
                     }
@@ -1221,7 +1291,7 @@ impl<'a> Tokenizer<'a> {
                         self.char_ref(sink, true);
                     }
                     Some(b'>') => {
-                        self.end_value(self.pos);
+                        self.end_value(self.pos, self.pos);
                         self.pos += 1;
                         self.emit_tag(sink);
                     }
@@ -1278,7 +1348,7 @@ impl<'a> Tokenizer<'a> {
                         None => {
                             self.comment.push_str(&input[self.pos..]);
                             self.pos = bytes.len();
-                            sink.comment(&self.comment);
+                            self.emit_comment(sink);
                             sink.eof();
                             return;
                         }
@@ -1345,15 +1415,13 @@ impl<'a> Tokenizer<'a> {
                     if rest[i] == b'?' {
                         self.state = State::ProcessingInstructionQuestionable;
                     } else {
-                        sink.processing_instruction(&self.pi_target, &self.pi_data);
-                        self.state = State::Data;
+                        self.emit_pi(sink);
                     }
                 }
                 State::ProcessingInstructionQuestionable => match self.byte() {
                     Some(b'>') => {
                         self.pos += 1;
-                        sink.processing_instruction(&self.pi_target, &self.pi_data);
-                        self.state = State::Data;
+                        self.emit_pi(sink);
                     }
                     None => {
                         sink.eof();
@@ -1406,7 +1474,7 @@ impl<'a> Tokenizer<'a> {
                         self.emit_comment(sink);
                     }
                     None => {
-                        sink.comment(&self.comment);
+                        self.emit_comment(sink);
                         sink.eof();
                         return;
                     }
@@ -1420,7 +1488,7 @@ impl<'a> Tokenizer<'a> {
                     let Some(i) = memchr3(b'<', b'-', 0, rest) else {
                         self.comment.push_str(&input[self.pos..]);
                         self.pos = bytes.len();
-                        sink.comment(&self.comment);
+                        self.emit_comment(sink);
                         sink.eof();
                         return;
                     };
@@ -1470,7 +1538,7 @@ impl<'a> Tokenizer<'a> {
                         self.state = State::CommentEnd;
                     }
                     None => {
-                        sink.comment(&self.comment);
+                        self.emit_comment(sink);
                         sink.eof();
                         return;
                     }
@@ -1493,7 +1561,7 @@ impl<'a> Tokenizer<'a> {
                         self.comment.push('-');
                     }
                     None => {
-                        sink.comment(&self.comment);
+                        self.emit_comment(sink);
                         sink.eof();
                         return;
                     }
@@ -1513,7 +1581,7 @@ impl<'a> Tokenizer<'a> {
                         self.emit_comment(sink);
                     }
                     None => {
-                        sink.comment(&self.comment);
+                        self.emit_comment(sink);
                         sink.eof();
                         return;
                     }
@@ -1747,7 +1815,7 @@ impl<'a> Tokenizer<'a> {
                     match memchr::memmem::find(rest, b"]]>") {
                         None => {
                             if !rest.is_empty() {
-                                sink.text(&input[self.pos..]);
+                                emit_text(sink, &input[self.pos..], self.pos, bytes.len());
                             }
                             self.pos = bytes.len();
                             sink.eof();
@@ -1755,7 +1823,12 @@ impl<'a> Tokenizer<'a> {
                         }
                         Some(i) => {
                             if i > 0 {
-                                sink.text(&input[self.pos..self.pos + i]);
+                                emit_text(
+                                    sink,
+                                    &input[self.pos..self.pos + i],
+                                    self.pos,
+                                    self.pos + i,
+                                );
                             }
                             self.pos += i + 3;
                             self.state = State::Data;
@@ -1765,6 +1838,12 @@ impl<'a> Tokenizer<'a> {
             }
         }
     }
+}
+
+/// Hands `sink` a run of text read from `start..end` of the input.
+fn emit_text<S: Sink>(sink: &mut S, text: &str, start: usize, end: usize) {
+    sink.position(start, end);
+    sink.text(text);
 }
 
 /// A table of the bytes that end a run: whitespace and `extra`.

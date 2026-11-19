@@ -1,112 +1,36 @@
 //! Evaluating an XPath expression tree against a document.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
-use super::parser::{Axis, Expr, NodeTest, Op, Step};
-use crate::document::{Node, NodeKind};
-use crate::query::Hit;
+use netweir_html::{self as html, NodeId};
 
-/// A value a caller can bind to a `$variable`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum XValue {
-    Str(String),
-    Num(f64),
-    Bool(bool),
-}
+use crate::index::{CDATA, COMMENT, ELEMENT, PI, TEXT};
+use crate::parser::{Axis, Expr, NodeTest, Op, Step};
+use crate::{Doc, Extensions, Item, Value, XML_NS, XValue};
 
-/// A node in XPath's data model: a tree node, or an attribute (which the
-/// tree keeps on its element rather than as a node of its own).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Item<'a> {
-    Node(Node<'a>),
-    Attr {
-        owner: Node<'a>,
-        index: u32,
-        /// As written, with any prefix.
-        name: &'a str,
-        /// The namespace id (see `XmlNames`); 0 for none.
-        ns: u32,
-        value: &'a str,
-    },
-}
-
-impl<'a> Item<'a> {
-    /// Position in document order. An element's attributes come after the
-    /// element and before its children, whose order is higher.
-    fn key(&self) -> (u32, u32) {
-        match self {
-            Item::Node(n) => (n.order(), 0),
-            Item::Attr { owner, index, .. } => (owner.order(), index + 1),
-        }
-    }
-
-    fn string_value(&self) -> Cow<'a, str> {
-        match self {
-            Item::Node(n) => match n.kind() {
-                NodeKind::Text | NodeKind::Comment | NodeKind::ProcessingInstruction => {
-                    Cow::Borrowed(n.data().unwrap_or_default())
-                }
-                _ => Cow::Owned(n.text()),
-            },
-            Item::Attr { value, .. } => Cow::Borrowed(value),
-        }
-    }
-
-    /// The name with its prefix, as `name()` gives it.
-    fn name(&self) -> &'a str {
-        match self {
-            Item::Node(n) => match n.kind() {
-                NodeKind::ProcessingInstruction => n.pi_target().unwrap_or(""),
-                _ => n.qualified_name(),
-            },
-            Item::Attr { name, .. } => name,
-        }
-    }
-
-    /// The name without its prefix, as `local-name()` gives it.
-    fn local_name(&self) -> &'a str {
-        let name = self.name();
-        let doc = match self {
-            Item::Node(n) => n.doc,
-            Item::Attr { owner, .. } => owner.doc,
-        };
-        // In HTML a colon is just part of a name (`fb:like`), as in lxml.
-        match name.split_once(':') {
-            Some((_, local)) if doc.is_xml() => local,
-            _ => name,
-        }
-    }
-
-    fn namespace_uri(&self) -> &'a str {
-        match self {
-            Item::Node(n) => n.namespace().unwrap_or(""),
-            Item::Attr { owner, ns, .. } => owner.doc.xml_names().map_or("", |x| x.uri(*ns)),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Value<'a> {
-    Nodes(Vec<Item<'a>>),
-    Str(Cow<'a, str>),
-    Num(f64),
-    Bool(bool),
-}
-
-fn text<'a>(s: String) -> Value<'a> {
-    Value::Str(Cow::Owned(s))
-}
+/// How much work one run may do before it gives up: nodes looked at on
+/// axes, predicate tests, and nodes read for string-values. Some queries
+/// are quadratic on any engine (`//p[following::p]`), and a hostile page
+/// can make them run for hours. A unit takes one to ten nanoseconds, so
+/// this is seconds of work: over a hundred times what the slowest query
+/// of the benchmark pages needs.
+pub const WORK_LIMIT: u64 = 1 << 30;
 
 struct Context<'a, 'v> {
     item: Item<'a>,
     position: usize,
     size: usize,
-    root: Node<'a>,
+    doc: Doc<'a>,
+    root: NodeId,
     vars: &'v [(String, XValue)],
     namespaces: &'v [(String, String)],
     kept: &'v RefCell<Kept>,
+    ext: &'v dyn Extensions,
+    /// Work done so far, and the most allowed (see [`WORK_LIMIT`]).
+    spent: &'v Cell<u64>,
+    limit: u64,
 }
 
 /// Values of a run's [`Expr::Memo`] expressions, by slot and node key. Only
@@ -121,70 +45,176 @@ enum Scalar {
 
 type Result<T> = std::result::Result<T, String>;
 
+fn text<'a>(s: String) -> Value<'a> {
+    Value::Str(Cow::Owned(s))
+}
+
 /// Evaluates `expr` with `scope` as the context node.
-pub(super) fn run<'a>(
+pub(crate) fn run<'a>(
     expr: &Expr,
-    scope: Node<'a>,
+    doc: Doc<'a>,
+    scope: NodeId,
     vars: &[(String, XValue)],
     namespaces: &[(String, String)],
-) -> Result<Vec<Hit<'a>>> {
+    ext: &dyn Extensions,
+    limit: u64,
+) -> Result<Value<'a>> {
     // `/` is the top of the scope's tree: the document, or for a node
     // removed from it, the top of what was removed (as lxml has it).
     let mut root = scope;
-    while let Some(up) = root.parent() {
+    while let Some(up) = doc.tree.parent(root) {
         root = up;
     }
     let kept = RefCell::default();
+    let spent = Cell::new(0);
     let ctx = Context {
         item: Item::Node(scope),
         position: 1,
         size: 1,
+        doc,
         root,
         vars,
         namespaces,
         kept: &kept,
+        ext,
+        spent: &spent,
+        limit,
     };
-    Ok(into_hits(eval(expr, &ctx)?))
+    eval(expr, &ctx)
 }
 
-fn into_hits(value: Value<'_>) -> Vec<Hit<'_>> {
-    match value {
-        Value::Nodes(items) => items
-            .into_iter()
-            .map(|i| match i {
-                Item::Node(n) => Hit::Node(n),
-                Item::Attr { value, .. } => Hit::Value(value.to_string()),
-            })
-            .collect(),
-        Value::Str(s) => vec![Hit::Value(s.into_owned())],
-        Value::Num(n) => vec![Hit::Value(python_float(n))],
-        // parsel gives "1" and "0" for boolean results.
-        Value::Bool(b) => vec![Hit::Value(if b { "1" } else { "0" }.to_string())],
+impl<'a> Context<'a, '_> {
+    /// Counts `units` of work, failing once the run has done too much.
+    fn spend(&self, units: usize) -> Result<()> {
+        let spent = self.spent.get().saturating_add(units as u64);
+        self.spent.set(spent);
+        if spent > self.limit {
+            return Err(format!(
+                "the query needs more than {} steps on this document, so it was stopped",
+                self.limit
+            ));
+        }
+        Ok(())
     }
-}
 
-/// A number as Python prints a float, which is what Scrapy users see from
-/// lxml: `3.0`, `0.5`, `nan`, `inf`, `1e+16`.
-fn python_float(n: f64) -> String {
-    if n.is_nan() {
-        return "nan".into();
+    fn order(&self, n: NodeId) -> u32 {
+        self.doc.index.order(n)
     }
-    if n.is_infinite() {
-        return if n > 0.0 { "inf" } else { "-inf" }.into();
+
+    /// Position in document order. An element's attributes come after the
+    /// element and before its children, whose order is higher.
+    fn key(&self, item: &Item<'_>) -> (u32, u32) {
+        match item {
+            Item::Node(n) => (self.order(*n), 0),
+            Item::Attr { owner, index, .. } => (self.order(*owner), index + 1),
+        }
     }
-    if n != 0.0 && (n.abs() >= 1e16 || n.abs() < 1e-4) {
-        // Python writes the exponent signed and at least two digits long.
-        let s = format!("{n:e}");
-        let (mantissa, exponent) = s.split_once('e').unwrap_or((&s, "0"));
-        let (sign, digits) = exponent
-            .strip_prefix('-')
-            .map_or(("+", exponent), |d| ("-", d));
-        return format!("{mantissa}e{sign}{digits:0>2}");
+
+    fn kind(&self, n: NodeId) -> u8 {
+        self.doc.index.kind_at(self.order(n))
     }
-    if n.fract() == 0.0 {
-        format!("{n:.1}")
-    } else {
-        format!("{n}")
+
+    /// A text, comment or processing instruction node's own text.
+    fn data(&self, n: NodeId) -> &'a str {
+        match self.doc.tree.kind(n) {
+            html::Kind::Text(t) | html::Kind::Cdata(t) | html::Kind::Comment(t) => t,
+            html::Kind::ProcessingInstruction { data, .. } => data,
+            _ => "",
+        }
+    }
+
+    fn string_value(&self, item: &Item<'a>) -> Cow<'a, str> {
+        let n = match item {
+            Item::Attr { value, .. } => return Cow::Borrowed(value),
+            Item::Node(n) => *n,
+        };
+        let index = self.doc.index;
+        let at = self.order(n);
+        match index.kind_at(at) {
+            TEXT | CDATA | COMMENT | PI => Cow::Borrowed(self.data(n)),
+            _ => {
+                // Every text node below, read off the index's range.
+                let end = index.end_of(at);
+                self.spent
+                    .set(self.spent.get().saturating_add((end - at) as u64));
+                // Borrowed while there is only one piece, as in `<p>x</p>`.
+                let mut out = Cow::Borrowed("");
+                for j in at + 1..end {
+                    if matches!(index.kind_at(j), TEXT | CDATA) {
+                        let piece = self.data(index.node_at(j));
+                        if out.is_empty() {
+                            out = Cow::Borrowed(piece);
+                        } else {
+                            out.to_mut().push_str(piece);
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// An element's name with its prefix, as written; lowercase in HTML.
+    fn qualified_name(&self, n: NodeId) -> &'a str {
+        self.doc.tree.lower_name(n).unwrap_or("")
+    }
+
+    /// An element's name without an XML prefix.
+    fn tag(&self, n: NodeId) -> Option<&'a str> {
+        let name = self.doc.tree.lower_name(n)?;
+        if self.doc.is_xml() {
+            return Some(name.split_once(':').map_or(name, |(_, local)| local));
+        }
+        Some(name)
+    }
+
+    fn ns_id(&self, n: NodeId) -> u32 {
+        self.doc.names.map_or(0, |names| names.ns_of(n))
+    }
+
+    fn pi_target(&self, n: NodeId) -> Option<&'a str> {
+        match self.doc.tree.kind(n) {
+            html::Kind::ProcessingInstruction { target, .. } => Some(target),
+            _ => None,
+        }
+    }
+
+    /// The name with its prefix, as `name()` gives it.
+    fn name(&self, item: &Item<'a>) -> &'a str {
+        match item {
+            Item::Node(n) => match self.pi_target(*n) {
+                Some(target) => target,
+                None => self.qualified_name(*n),
+            },
+            Item::Attr { name, .. } => name,
+        }
+    }
+
+    /// The name without its prefix, as `local-name()` gives it.
+    fn local_name(&self, item: &Item<'a>) -> &'a str {
+        let name = self.name(item);
+        // In HTML a colon is just part of a name (`fb:like`), as in lxml.
+        match name.split_once(':') {
+            Some((_, local)) if self.doc.is_xml() => local,
+            _ => name,
+        }
+    }
+
+    fn namespace_uri(&self, item: &Item<'a>) -> &'a str {
+        let Some(names) = self.doc.names else {
+            return "";
+        };
+        match item {
+            Item::Node(n) => names.uri(names.ns_of(*n)),
+            Item::Attr { ns, .. } => names.uri(*ns),
+        }
+    }
+
+    /// The position of the top of the tree being queried, and one past its
+    /// last node.
+    fn tree_range(&self) -> (u32, u32) {
+        let top = self.order(self.root);
+        (top, self.doc.index.end_of(top))
     }
 }
 
@@ -208,18 +238,18 @@ fn eval_here<'a>(expr: &Expr, ctx: &Context<'a, '_>) -> Result<Value<'a>> {
             Some((_, XValue::Bool(b))) => Value::Bool(*b),
             None => return Err(format!("no value given for ${name}")),
         },
-        Expr::Negate(e) => Value::Num(-number(eval(e, ctx)?)),
+        Expr::Negate(e) => Value::Num(-number(eval(e, ctx)?, ctx)),
         Expr::Binary(op, l, r) => binary(*op, l, r, ctx)?,
         Expr::Union(l, r) => {
             let (Value::Nodes(mut a), Value::Nodes(b)) = (eval(l, ctx)?, eval(r, ctx)?) else {
                 return Err("both sides of | must be node-sets".into());
             };
             a.extend(b);
-            Value::Nodes(in_document_order(a))
+            Value::Nodes(in_document_order(a, ctx))
         }
         Expr::Call(name, args) => call(name, args, ctx)?,
         Expr::Memo(e, slot) => {
-            let key = (*slot, ctx.item.key());
+            let key = (*slot, ctx.key(&ctx.item));
             // Not borrowed while evaluating: slots inside `e` fill too.
             let known = ctx.kept.borrow().get(&key).copied();
             let scalar = match known {
@@ -262,9 +292,9 @@ fn eval_here<'a>(expr: &Expr, ctx: &Context<'a, '_>) -> Result<Value<'a>> {
     })
 }
 
-fn in_document_order(items: Vec<Item<'_>>) -> Vec<Item<'_>> {
+fn in_document_order<'a>(items: Vec<Item<'a>>, ctx: &Context<'a, '_>) -> Vec<Item<'a>> {
     // A key costs an index lookup, so each is read once.
-    let mut keyed: Vec<_> = items.into_iter().map(|i| (i.key(), i)).collect();
+    let mut keyed: Vec<_> = items.into_iter().map(|i| (ctx.key(&i), i)).collect();
     keyed.sort_unstable_by_key(|(k, _)| *k);
     keyed.dedup_by_key(|(k, _)| *k);
     keyed.into_iter().map(|(_, i)| i).collect()
@@ -275,6 +305,7 @@ fn walk<'a>(
     steps: &[Step],
     ctx: &Context<'a, '_>,
 ) -> Result<Vec<Item<'a>>> {
+    let index = ctx.doc.index;
     let mut candidates = Vec::new();
     let mut scanned = Vec::new();
     let mut i = 0;
@@ -297,6 +328,17 @@ fn walk<'a>(
             continue;
         }
         let test = Test::resolve(&step.test, step.axis, ctx)?;
+        // Without predicates, a step's result is a set, whichever context
+        // node each member came from: work it out for the set at once, so
+        // nested or neighbouring context nodes don't each walk the same
+        // nodes again (`//div//div` on nested divs was quadratic).
+        if step.predicates.is_empty()
+            && items.len() > 1
+            && let Some(found) = whole_set(&items, step.axis, &test, ctx)?
+        {
+            items = found;
+            continue;
+        }
         // A leading `[k]` with k a whole number from 1 up.
         let nth = match step.predicates.first() {
             Some(Expr::Number(k)) if *k >= 1.0 && k.fract() == 0.0 && *k < usize::MAX as f64 => {
@@ -318,30 +360,34 @@ fn walk<'a>(
                         Axis::Child | Axis::Descendant | Axis::DescendantOrSelf
                     ) =>
                 {
-                    let index = n.doc.index();
-                    let at = n.order();
+                    let at = ctx.order(*n);
                     let keep = |kind, tag| test.keeps(kind, tag);
                     scanned.clear();
                     match step.axis {
-                        Axis::Child => index.children(n.doc, at, keep, &mut scanned),
-                        axis => index.descendants(
-                            n.doc,
-                            at,
-                            axis == Axis::DescendantOrSelf,
-                            keep,
-                            &mut scanned,
-                        ),
+                        Axis::Child => index.children(at, keep, &mut scanned),
+                        axis => {
+                            ctx.spend((index.end_of(at) - at) as usize)?;
+                            index.descendants(
+                                at,
+                                axis == Axis::DescendantOrSelf,
+                                keep,
+                                &mut scanned,
+                            )
+                        }
                     }
                     candidates.extend(
                         scanned
                             .iter()
                             .copied()
                             .map(Item::Node)
-                            .filter(|i| !test.exact() || test.matches(i)),
+                            .filter(|i| !test.exact() || test.matches(i, ctx)),
                     );
                 }
                 _ => {
-                    let mut on_axis = axis(*item, step.axis).filter(|c| test.matches(c));
+                    let looked = Cell::new(0usize);
+                    let mut on_axis = axis(*item, step.axis, ctx)
+                        .inspect(|_| looked.set(looked.get() + 1))
+                        .filter(|c| test.matches(c, ctx));
                     if nth.is_some() {
                         done = 1;
                     }
@@ -351,8 +397,10 @@ fn walk<'a>(
                         Some(k) => candidates.extend(on_axis.nth(k - 1)),
                         None => candidates.extend(on_axis),
                     }
+                    ctx.spend(looked.get())?;
                 }
             }
+            ctx.spend(candidates.len() + 1)?;
             let mut kept = std::mem::take(&mut candidates);
             for p in &step.predicates[done..] {
                 kept = filter(kept, p, ctx)?;
@@ -365,10 +413,158 @@ fn walk<'a>(
         items = if items.len() == 1 && !step.axis.is_reverse() {
             next
         } else {
-            in_document_order(next)
+            in_document_order(next, ctx)
         };
     }
     Ok(items)
+}
+
+/// A step without predicates from every one of `items` (in document
+/// order) at once, in document order: None for the axes that gain nothing
+/// from it.
+fn whole_set<'a>(
+    items: &[Item<'a>],
+    axis: Axis,
+    test: &Test<'_>,
+    ctx: &Context<'a, '_>,
+) -> Result<Option<Vec<Item<'a>>>> {
+    let index = ctx.doc.index;
+    let (_, tree_end) = ctx.tree_range();
+    let keep = |j: u32| {
+        let item = Item::Node(index.node_at(j));
+        if test.indexable() {
+            test.keeps(index.kind_at(j), index.tag_at(j))
+                && (!test.exact() || test.matches(&item, ctx))
+        } else {
+            test.matches(&item, ctx)
+        }
+    };
+    let mut out = Vec::new();
+    match axis {
+        Axis::Descendant | Axis::DescendantOrSelf => {
+            // A node inside an earlier item's subtree was scanned with it.
+            let mut covered_to = 0;
+            for item in items {
+                match item {
+                    Item::Node(n) => {
+                        let at = ctx.order(*n);
+                        if at < covered_to {
+                            continue;
+                        }
+                        covered_to = index.end_of(at);
+                        let from = if axis == Axis::DescendantOrSelf {
+                            at
+                        } else {
+                            at + 1
+                        };
+                        ctx.spend((covered_to - from) as usize)?;
+                        out.extend(
+                            (from..covered_to)
+                                .filter(|&j| keep(j))
+                                .map(|j| Item::Node(index.node_at(j))),
+                        );
+                    }
+                    // An attribute has no descendants, only itself.
+                    attr if axis == Axis::DescendantOrSelf && test.matches(attr, ctx) => {
+                        out.push(*attr)
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(Some(in_document_order(out, ctx)));
+        }
+        Axis::Following => {
+            // Everything after the subtree that ends first: an attribute's
+            // following nodes start with its element's children.
+            let Some(from) = items
+                .iter()
+                .map(|i| match i {
+                    Item::Node(n) => index.end_of(ctx.order(*n)),
+                    Item::Attr { owner, .. } => ctx.order(*owner) + 1,
+                })
+                .min()
+            else {
+                return Ok(Some(out));
+            };
+            ctx.spend(tree_end.saturating_sub(from) as usize)?;
+            out.extend(
+                (from..tree_end)
+                    .filter(|&j| keep(j))
+                    .map(|j| Item::Node(index.node_at(j))),
+            );
+        }
+        Axis::Preceding => {
+            // The last item's preceding nodes hold every other item's.
+            let Some(last) = items.iter().map(|i| ctx.key(i).0).max() else {
+                return Ok(Some(out));
+            };
+            let (top, _) = ctx.tree_range();
+            ctx.spend(last.saturating_sub(top) as usize)?;
+            // Not its ancestors, whose subtrees reach past it.
+            out.extend(
+                (top..last)
+                    .filter(|&j| index.end_of(j) <= last && keep(j))
+                    .map(|j| Item::Node(index.node_at(j))),
+            );
+        }
+        Axis::Ancestor | Axis::AncestorOrSelf => {
+            // Climb from each item until reaching a node already climbed.
+            let mut seen = HashSet::new();
+            for item in items {
+                let start = match item {
+                    Item::Node(n) if axis == Axis::Ancestor => index.parent_of(ctx.order(*n)),
+                    Item::Node(n) => ctx.order(*n),
+                    Item::Attr { owner, .. } => {
+                        if axis == Axis::AncestorOrSelf && test.matches(item, ctx) {
+                            out.push(*item);
+                        }
+                        ctx.order(*owner)
+                    }
+                };
+                let mut at = start;
+                while at != u32::MAX && seen.insert(at) {
+                    ctx.spend(1)?;
+                    if keep(at) {
+                        out.push(Item::Node(index.node_at(at)));
+                    }
+                    at = index.parent_of(at);
+                }
+            }
+            return Ok(Some(in_document_order(out, ctx)));
+        }
+        Axis::FollowingSibling | Axis::PrecedingSibling => {
+            // Per parent, only the siblings of its first item (following)
+            // or its last (preceding) count. Attributes have no siblings.
+            let tree = ctx.doc.tree;
+            let mut from: HashMap<NodeId, NodeId> = HashMap::new();
+            for item in items {
+                if let Item::Node(n) = item
+                    && let Some(p) = tree.parent(*n)
+                {
+                    if axis == Axis::FollowingSibling {
+                        from.entry(p).or_insert(*n);
+                    } else {
+                        from.insert(p, *n);
+                    }
+                }
+            }
+            for &n in from.values() {
+                let step = |&s: &NodeId| match axis {
+                    Axis::FollowingSibling => tree.next_sibling(s),
+                    _ => tree.prev_sibling(s),
+                };
+                for s in std::iter::successors(step(&n), step) {
+                    ctx.spend(1)?;
+                    if keep(ctx.order(s)) {
+                        out.push(Item::Node(s));
+                    }
+                }
+            }
+            return Ok(Some(in_document_order(out, ctx)));
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(out))
 }
 
 /// `//x[pred]` from each item in `items`: every descendant passing `step`'s
@@ -386,6 +582,7 @@ fn descendants_by_parent<'a>(
     if !test.indexable() {
         return None;
     }
+    let index = ctx.doc.index;
     let mut found = Vec::new();
     // Items come in document order. One inside an earlier item's subtree
     // was scanned with it, and scanning it again would count its
@@ -394,22 +591,24 @@ fn descendants_by_parent<'a>(
     for item in items {
         // An attribute has no children.
         let Item::Node(n) = item else { continue };
-        let index = n.doc.index();
-        let at = n.order();
+        let at = ctx.order(*n);
         if at < covered_to {
             continue;
         }
         covered_to = index.end_of(at);
-        index.descendants(n.doc, at, false, |k, t| test.keeps(k, t), &mut found);
+        if let Err(e) = ctx.spend((covered_to - at) as usize) {
+            return Some(Err(e));
+        }
+        index.descendants(at, false, |k, t| test.keeps(k, t), &mut found);
     }
     if test.exact() {
-        found.retain(|&n| test.matches(&Item::Node(n)));
+        found.retain(|&n| test.matches(&Item::Node(n), ctx));
     }
     // Group by parent, keeping each group in document order.
     let mut groups: Vec<(u32, Vec<Item<'a>>)> = Vec::new();
-    let mut slot: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut slot: HashMap<u32, usize> = HashMap::new();
     for node in found {
-        let parent = node.doc.index().parent_of(node.order());
+        let parent = index.parent_of(ctx.order(node));
         let at = *slot.entry(parent).or_insert_with(|| {
             groups.push((parent, Vec::new()));
             groups.len() - 1
@@ -424,7 +623,7 @@ fn descendants_by_parent<'a>(
             }
             out.extend(group);
         }
-        Ok(in_document_order(out))
+        Ok(in_document_order(out, ctx))
     };
     Some(run())
 }
@@ -432,7 +631,7 @@ fn descendants_by_parent<'a>(
 /// `[@name = 'value']`, `['value' = @name]` and `[@name]`: answered from
 /// the element directly, without building its attribute list. None for any
 /// other predicate.
-fn quick_predicate(pred: &Expr, item: &Item<'_>) -> Option<bool> {
+fn quick_predicate(pred: &Expr, item: &Item<'_>, doc: Doc<'_>) -> Option<bool> {
     let attr_name = |e: &Expr| match e {
         Expr::Path {
             absolute: false,
@@ -444,7 +643,7 @@ fn quick_predicate(pred: &Expr, item: &Item<'_>) -> Option<bool> {
                     test: NodeTest::Name(n),
                     predicates,
                 },
-                // Node::attr folds case when looking an attribute up, but
+                // Doc::attr folds case when looking an attribute up, but
                 // XPath names are case-sensitive and HTML attribute names are
                 // stored lowercase: leave capitals to the general path.
             ] if predicates.is_empty() && !n.bytes().any(|b| b.is_ascii_uppercase()) => {
@@ -463,9 +662,9 @@ fn quick_predicate(pred: &Expr, item: &Item<'_>) -> Option<bool> {
                 }
                 _ => return None,
             };
-            Some(node.attr(&name) == Some(value.as_str()))
+            Some(doc.attr(*node, &name) == Some(value.as_str()))
         }
-        other => attr_name(other).map(|n| node.attr(&n).is_some()),
+        other => attr_name(other).map(|n| doc.attr(*node, &n).is_some()),
     }
 }
 
@@ -473,9 +672,10 @@ fn quick_predicate(pred: &Expr, item: &Item<'_>) -> Option<bool> {
 /// given (axis order inside a step, document order in a filter).
 fn filter<'a>(items: Vec<Item<'a>>, pred: &Expr, ctx: &Context<'a, '_>) -> Result<Vec<Item<'a>>> {
     let size = items.len();
+    ctx.spend(size)?;
     let mut kept = Vec::new();
     for (i, item) in items.into_iter().enumerate() {
-        if let Some(keep) = quick_predicate(pred, &item) {
+        if let Some(keep) = quick_predicate(pred, &item, ctx.doc) {
             if keep {
                 kept.push(item);
             }
@@ -485,10 +685,7 @@ fn filter<'a>(items: Vec<Item<'a>>, pred: &Expr, ctx: &Context<'a, '_>) -> Resul
             item,
             position: i + 1,
             size,
-            root: ctx.root,
-            vars: ctx.vars,
-            namespaces: ctx.namespaces,
-            kept: ctx.kept,
+            ..*ctx
         };
         let keep = match eval(pred, &inner)? {
             Value::Num(n) => n == (i + 1) as f64,
@@ -501,29 +698,15 @@ fn filter<'a>(items: Vec<Item<'a>>, pred: &Expr, ctx: &Context<'a, '_>) -> Resul
     Ok(kept)
 }
 
-/// The EXSLT namespaces parsel binds by default.
-const DEFAULT_NAMESPACES: [(&str, &str); 2] = [
-    ("re", "http://exslt.org/regular-expressions"),
-    ("set", "http://exslt.org/sets"),
-];
-
 /// The URI `prefix` is bound to for this run.
 fn namespace<'c>(prefix: &str, ctx: &'c Context<'_, '_>) -> Result<&'c str> {
     if let Some((_, uri)) = ctx.namespaces.iter().rev().find(|(p, _)| p == prefix) {
         return Ok(uri);
     }
     if prefix == "xml" {
-        return Ok(crate::xml::XML_NS);
+        return Ok(XML_NS);
     }
-    DEFAULT_NAMESPACES
-        .iter()
-        .find(|(p, _)| *p == prefix)
-        .map(|(_, uri)| *uri)
-        .ok_or_else(|| {
-            format!(
-                "undefined namespace prefix {prefix:?}: register it with register_namespace(), or pass it in namespaces="
-            )
-        })
+    Err(format!("undefined namespace prefix {prefix:?}"))
 }
 
 /// A node test made ready for one document: names become tag ids,
@@ -563,8 +746,8 @@ enum Test<'t> {
 impl<'t> Test<'t> {
     fn resolve(test: &'t NodeTest, axis: Axis, ctx: &Context<'_, '_>) -> Result<Test<'t>> {
         let attr = axis == Axis::Attribute;
-        let root = ctx.root;
-        if let Some(names) = root.doc.xml_names() {
+        let index = ctx.doc.index;
+        if let Some(names) = ctx.doc.names {
             // The namespace id a prefix stands for here; None if nothing in
             // the document is in it.
             let ns =
@@ -576,16 +759,16 @@ impl<'t> Test<'t> {
                     None => Test::Never,
                 },
                 NodeTest::AnyIn(p) if attr => ns(p)?.map_or(Test::Never, Test::XmlAttributeIn),
-                NodeTest::Name(local) => match root.tag_id_named(local) {
+                NodeTest::Name(local) => match index.tag_id_named(local) {
                     Some(id) => Test::XmlElement { id, local, ns: 0 },
                     None => Test::Never,
                 },
-                NodeTest::Prefixed(p, local) => match (ns(p)?, root.tag_id_named(local)) {
+                NodeTest::Prefixed(p, local) => match (ns(p)?, index.tag_id_named(local)) {
                     (Some(ns), Some(id)) => Test::XmlElement { id, local, ns },
                     _ => Test::Never,
                 },
                 NodeTest::AnyIn(p) => ns(p)?.map_or(Test::Never, Test::XmlElementIn),
-                other => Test::resolve_html(other, attr, root),
+                other => Test::resolve_html(other, attr, ctx),
             });
         }
         if let NodeTest::Prefixed(p, _) | NodeTest::AnyIn(p) = test {
@@ -594,10 +777,10 @@ impl<'t> Test<'t> {
             namespace(p, ctx)?;
             return Ok(Test::Never);
         }
-        Ok(Test::resolve_html(test, attr, root))
+        Ok(Test::resolve_html(test, attr, ctx))
     }
 
-    fn resolve_html(test: &'t NodeTest, attr: bool, root: Node<'_>) -> Test<'t> {
+    fn resolve_html(test: &'t NodeTest, attr: bool, ctx: &Context<'_, '_>) -> Test<'t> {
         match test {
             NodeTest::Node => Test::Node,
             NodeTest::Text if attr => Test::Never,
@@ -614,7 +797,11 @@ impl<'t> Test<'t> {
             NodeTest::Name(name) if name.bytes().any(|b| b.is_ascii_uppercase()) => {
                 Test::ElementName(name)
             }
-            NodeTest::Name(name) => root.tag_id_named(name).map_or(Test::Never, Test::ElementId),
+            NodeTest::Name(name) => ctx
+                .doc
+                .index
+                .tag_id_named(name)
+                .map_or(Test::Never, Test::ElementId),
             NodeTest::Prefixed(..) | NodeTest::AnyIn(_) => Test::Never,
         }
     }
@@ -642,11 +829,6 @@ impl<'t> Test<'t> {
 
     /// The test, from a node's kind and tag id.
     fn keeps(&self, kind: u8, tag: usize) -> bool {
-        const ELEMENT: u8 = 0x01;
-        const TEXT: u8 = 0x03;
-        const CDATA: u8 = 0x04;
-        const PI: u8 = 0x07;
-        const COMMENT: u8 = 0x08;
         match self {
             Test::Node => true,
             Test::Text => kind == TEXT || kind == CDATA,
@@ -658,31 +840,30 @@ impl<'t> Test<'t> {
         }
     }
 
-    fn matches(&self, item: &Item<'_>) -> bool {
+    fn matches(&self, item: &Item<'_>, ctx: &Context<'_, '_>) -> bool {
+        let kind = |n: &NodeId| ctx.kind(*n);
         match (self, item) {
             (Test::Node, _) => true,
             (Test::Never, _) => false,
             (Test::ElementId(id), Item::Node(n)) => {
-                n.tag_id() == *id && n.kind() == NodeKind::Element
+                let at = ctx.order(*n);
+                ctx.doc.index.tag_at(at) == *id && ctx.doc.index.kind_at(at) == ELEMENT
             }
-            (Test::ElementName(name), Item::Node(n)) => n.tag() == Some(name),
-            (Test::AnyElement, Item::Node(n)) => n.kind() == NodeKind::Element,
-            (Test::Text, Item::Node(n)) => n.kind() == NodeKind::Text,
-            (Test::Comment, Item::Node(n)) => n.kind() == NodeKind::Comment,
+            (Test::ElementName(name), Item::Node(n)) => ctx.tag(*n) == Some(name),
+            (Test::AnyElement, Item::Node(n)) => kind(n) == ELEMENT,
+            (Test::Text, Item::Node(n)) => matches!(kind(n), TEXT | CDATA),
+            (Test::Comment, Item::Node(n)) => kind(n) == COMMENT,
             (Test::Pi(target), Item::Node(n)) => {
-                n.kind() == NodeKind::ProcessingInstruction
-                    && target.is_none_or(|t| n.pi_target() == Some(t))
+                kind(n) == PI && target.is_none_or(|t| ctx.pi_target(*n) == Some(t))
             }
             (Test::AnyAttribute, Item::Attr { .. }) => true,
             (Test::AttributeName(name), Item::Attr { name: a, .. }) => a == name,
             (Test::XmlElement { local, ns, .. }, Item::Node(n)) => {
-                n.kind() == NodeKind::Element && n.tag() == Some(local) && n.ns_id() == *ns
+                kind(n) == ELEMENT && ctx.tag(*n) == Some(local) && ctx.ns_id(*n) == *ns
             }
-            (Test::XmlElementIn(ns), Item::Node(n)) => {
-                n.kind() == NodeKind::Element && n.ns_id() == *ns
-            }
+            (Test::XmlElementIn(ns), Item::Node(n)) => kind(n) == ELEMENT && ctx.ns_id(*n) == *ns,
             (Test::XmlAttribute { local, ns }, i @ Item::Attr { ns: a, .. }) => {
-                a == ns && i.local_name() == *local
+                a == ns && ctx.local_name(i) == *local
             }
             (Test::XmlAttributeIn(ns), Item::Attr { ns: a, .. }) => a == ns,
             _ => false,
@@ -690,74 +871,70 @@ impl<'t> Test<'t> {
     }
 }
 
-fn attributes(n: Node<'_>) -> Vec<Item<'_>> {
-    n.xml_attrs()
-        .into_iter()
+fn attributes<'a>(n: NodeId, doc: Doc<'a>) -> impl Iterator<Item = Item<'a>> + 'a {
+    doc.tree
+        .attrs(n)
         .enumerate()
-        .map(|(i, (name, ns, value))| Item::Attr {
+        .map(move |(i, (ns, name, value))| Item::Attr {
             owner: n,
             index: i as u32,
             name,
-            ns,
+            ns: match ns {
+                html::AttrNs::Host(id) => id,
+                _ => 0,
+            },
             value,
         })
-        .collect()
-}
-
-fn ancestors(n: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    std::iter::successors(n.parent(), |p| p.parent())
-}
-
-/// Everything after `n` in document order that isn't its descendant.
-fn following(n: Node<'_>) -> Vec<Item<'_>> {
-    let mut out = Vec::new();
-    for a in std::iter::once(n).chain(ancestors(n)) {
-        for s in std::iter::successors(a.next_sibling(), |s| s.next_sibling()) {
-            out.push(Item::Node(s));
-            out.extend(s.descendants().map(Item::Node));
-        }
-    }
-    out
-}
-
-/// Everything before `n` that isn't its ancestor, nearest first.
-fn preceding(n: Node<'_>) -> Vec<Item<'_>> {
-    let mut out = Vec::new();
-    for a in std::iter::once(n).chain(ancestors(n)) {
-        for s in std::iter::successors(a.prev_sibling(), |s| s.prev_sibling()) {
-            let mut below: Vec<Item<'_>> = s.descendants().map(Item::Node).collect();
-            below.reverse();
-            out.extend(below);
-            out.push(Item::Node(s));
-        }
-    }
-    out
 }
 
 /// The nodes on `axis` from `item`, in axis order (nearest first for
 /// reverse axes), produced lazily.
-fn axis<'a>(item: Item<'a>, axis: Axis) -> Box<dyn Iterator<Item = Item<'a>> + 'a> {
+fn axis<'a>(
+    item: Item<'a>,
+    axis: Axis,
+    ctx: &Context<'a, '_>,
+) -> Box<dyn Iterator<Item = Item<'a>> + 'a> {
+    let doc = ctx.doc;
+    let (tree, index) = (doc.tree, doc.index);
+    let (top, tree_end) = ctx.tree_range();
+    let node_at = move |j: u32| Item::Node(index.node_at(j));
+    let ancestors =
+        move |n: NodeId| std::iter::successors(tree.parent(n), move |&p| tree.parent(p));
+    // Everything after `n` in document order that isn't its descendant.
+    let following = move |n: NodeId| (index.end_of(index.order(n))..tree_end).map(node_at);
+    // Everything before `n` that isn't its ancestor, nearest first.
+    let preceding = move |n: NodeId| {
+        let at = index.order(n);
+        (top..at)
+            .rev()
+            .filter(move |&j| index.end_of(j) <= at)
+            .map(node_at)
+    };
+    let descendants = move |n: NodeId| {
+        let at = index.order(n);
+        (at + 1..index.end_of(at)).map(node_at)
+    };
     match item {
         Item::Node(n) => match axis {
-            Axis::Child => Box::new(n.children().map(Item::Node)),
-            Axis::Descendant => Box::new(n.descendants().map(Item::Node)),
-            Axis::DescendantOrSelf => {
-                Box::new(std::iter::once(n).chain(n.descendants()).map(Item::Node))
-            }
-            Axis::Parent => Box::new(n.parent().map(Item::Node).into_iter()),
+            Axis::Child => Box::new(tree.children(n).map(Item::Node)),
+            Axis::Descendant => Box::new(descendants(n)),
+            Axis::DescendantOrSelf => Box::new(std::iter::once(item).chain(descendants(n))),
+            Axis::Parent => Box::new(tree.parent(n).map(Item::Node).into_iter()),
             Axis::Ancestor => Box::new(ancestors(n).map(Item::Node)),
             Axis::AncestorOrSelf => {
                 Box::new(std::iter::once(n).chain(ancestors(n)).map(Item::Node))
             }
             Axis::FollowingSibling => Box::new(
-                std::iter::successors(n.next_sibling(), |s| s.next_sibling()).map(Item::Node),
+                std::iter::successors(tree.next_sibling(n), move |&s| tree.next_sibling(s))
+                    .map(Item::Node),
             ),
             Axis::PrecedingSibling => Box::new(
-                std::iter::successors(n.prev_sibling(), |s| s.prev_sibling()).map(Item::Node),
+                std::iter::successors(tree.prev_sibling(n), move |&s| tree.prev_sibling(s))
+                    .map(Item::Node),
             ),
-            Axis::Following => Box::new(following(n).into_iter()),
-            Axis::Preceding => Box::new(preceding(n).into_iter()),
-            Axis::Attribute if n.kind() == NodeKind::Element => Box::new(attributes(n).into_iter()),
+            Axis::Following => Box::new(following(n)),
+            Axis::Preceding => Box::new(preceding(n)),
+            Axis::Attribute if ctx.kind(n) == ELEMENT => Box::new(attributes(n, doc)),
             Axis::Attribute | Axis::Namespace => Box::new(std::iter::empty()),
             Axis::Itself => Box::new(std::iter::once(item)),
         },
@@ -776,10 +953,8 @@ fn axis<'a>(item: Item<'a>, axis: Axis) -> Box<dyn Iterator<Item = Item<'a>> + '
                 ),
             ),
             Axis::Itself | Axis::DescendantOrSelf => Box::new(std::iter::once(item)),
-            Axis::Following => {
-                Box::new(owner.descendants().map(Item::Node).chain(following(owner)))
-            }
-            Axis::Preceding => Box::new(preceding(owner).into_iter()),
+            Axis::Following => Box::new(descendants(owner).chain(following(owner))),
+            Axis::Preceding => Box::new(preceding(owner)),
             _ => Box::new(std::iter::empty()),
         },
     }
@@ -787,14 +962,14 @@ fn axis<'a>(item: Item<'a>, axis: Axis) -> Box<dyn Iterator<Item = Item<'a>> + '
 
 // --- conversions (section 4) ----------------------------------------------
 
-fn string(v: &Value<'_>) -> String {
+fn string<'a>(v: &Value<'a>, ctx: &Context<'a, '_>) -> String {
     match v {
         Value::Str(s) => s.to_string(),
         Value::Num(n) => number_to_string(*n),
         Value::Bool(b) => b.to_string(),
         Value::Nodes(items) => items
             .first()
-            .map(|i| i.string_value().into_owned())
+            .map(|i| ctx.string_value(i).into_owned())
             .unwrap_or_default(),
     }
 }
@@ -813,12 +988,12 @@ fn number_to_string(n: f64) -> String {
     }
 }
 
-fn number(v: Value<'_>) -> f64 {
+fn number<'a>(v: Value<'a>, ctx: &Context<'a, '_>) -> f64 {
     match v {
         Value::Num(n) => n,
         Value::Bool(b) => b as u8 as f64,
         Value::Str(s) => parse_number(&s),
-        nodes @ Value::Nodes(_) => parse_number(&string(&nodes)),
+        nodes @ Value::Nodes(_) => parse_number(&string(&nodes, ctx)),
     }
 }
 
@@ -854,7 +1029,7 @@ fn binary<'a>(op: Op, l: &Expr, r: &Expr, ctx: &Context<'a, '_>) -> Result<Value
         Op::Or => Value::Bool(boolean(&eval(l, ctx)?) || boolean(&eval(r, ctx)?)),
         Op::And => Value::Bool(boolean(&eval(l, ctx)?) && boolean(&eval(r, ctx)?)),
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
-            let (a, b) = (number(eval(l, ctx)?), number(eval(r, ctx)?));
+            let (a, b) = (number(eval(l, ctx)?, ctx), number(eval(r, ctx)?, ctx));
             Value::Num(match op {
                 Op::Add => a + b,
                 Op::Sub => a - b,
@@ -864,22 +1039,30 @@ fn binary<'a>(op: Op, l: &Expr, r: &Expr, ctx: &Context<'a, '_>) -> Result<Value
                 _ => a % b,
             })
         }
-        _ => Value::Bool(compare(op, eval(l, ctx)?, eval(r, ctx)?)),
+        _ => Value::Bool(compare(op, eval(l, ctx)?, eval(r, ctx)?, ctx)),
     })
 }
 
-fn compare_atoms(op: Op, a: &Value<'_>, b: &Value<'_>) -> bool {
+fn compare_atoms<'a>(op: Op, a: &Value<'a>, b: &Value<'a>, ctx: &Context<'a, '_>) -> bool {
     if matches!(op, Op::Eq | Op::Neq) {
         let equal = if matches!(a, Value::Bool(_)) || matches!(b, Value::Bool(_)) {
             boolean(a) == boolean(b)
         } else if matches!(a, Value::Num(_)) || matches!(b, Value::Num(_)) {
-            number(a.clone()) == number(b.clone())
+            number(a.clone(), ctx) == number(b.clone(), ctx)
         } else {
-            string(a) == string(b)
+            // Without copying strings: a node-set compared with a string
+            // compares every member.
+            fn text<'v, 'a>(v: &'v Value<'a>, ctx: &Context<'a, '_>) -> Cow<'v, str> {
+                match v {
+                    Value::Str(s) => Cow::Borrowed(s),
+                    other => Cow::Owned(string(other, ctx)),
+                }
+            }
+            text(a, ctx) == text(b, ctx)
         };
         return equal == (op == Op::Eq);
     }
-    let (x, y) = (number(a.clone()), number(b.clone()));
+    let (x, y) = (number(a.clone(), ctx), number(b.clone(), ctx));
     match op {
         Op::Lt => x < y,
         Op::Le => x <= y,
@@ -889,57 +1072,101 @@ fn compare_atoms(op: Op, a: &Value<'_>, b: &Value<'_>) -> bool {
 }
 
 /// Comparisons involving node-sets are true if any member makes them true.
-fn compare(op: Op, a: Value<'_>, b: Value<'_>) -> bool {
+fn compare<'a>(op: Op, a: Value<'a>, b: Value<'a>, ctx: &Context<'a, '_>) -> bool {
     match (&a, &b) {
         (Value::Nodes(xs), Value::Nodes(ys)) => {
-            let ys: Vec<Value<'_>> = ys.iter().map(|y| Value::Str(y.string_value())).collect();
+            let ys: Vec<Value<'_>> = ys.iter().map(|y| Value::Str(ctx.string_value(y))).collect();
             xs.iter().any(|x| {
-                let x = Value::Str(x.string_value());
-                ys.iter().any(|y| compare_atoms(op, &x, y))
+                let x = Value::Str(ctx.string_value(x));
+                ys.iter().any(|y| compare_atoms(op, &x, y, ctx))
             })
         }
-        (Value::Nodes(_), Value::Bool(_)) | (Value::Bool(_), Value::Nodes(_)) => {
-            compare_atoms(op, &Value::Bool(boolean(&a)), &Value::Bool(boolean(&b)))
-        }
+        (Value::Nodes(_), Value::Bool(_)) | (Value::Bool(_), Value::Nodes(_)) => compare_atoms(
+            op,
+            &Value::Bool(boolean(&a)),
+            &Value::Bool(boolean(&b)),
+            ctx,
+        ),
         (Value::Nodes(xs), other) => xs
             .iter()
-            .any(|x| compare_atoms(op, &atom_like(x, other), other)),
+            .any(|x| compare_atoms(op, &atom_like(x, other, ctx), other, ctx)),
         (other, Value::Nodes(ys)) => ys
             .iter()
-            .any(|y| compare_atoms(op, other, &atom_like(y, other))),
-        _ => compare_atoms(op, &a, &b),
+            .any(|y| compare_atoms(op, other, &atom_like(y, other, ctx), ctx)),
+        _ => compare_atoms(op, &a, &b, ctx),
     }
 }
 
 /// A node's value as the type it is compared with.
-fn atom_like<'a>(item: &Item<'a>, other: &Value<'_>) -> Value<'a> {
+fn atom_like<'a>(item: &Item<'a>, other: &Value<'_>, ctx: &Context<'a, '_>) -> Value<'a> {
     match other {
-        Value::Num(_) => Value::Num(parse_number(&item.string_value())),
-        _ => Value::Str(item.string_value()),
+        Value::Num(_) => Value::Num(parse_number(&ctx.string_value(item))),
+        _ => Value::Str(ctx.string_value(item)),
     }
 }
 
-// --- functions (section 4, plus extensions) -------------------------------
+// --- functions (section 4) -------------------------------------------------
+
+/// The arguments of a call to an extension function, worked out when
+/// asked for, as the core library's are.
+pub struct Args<'c, 'a> {
+    name: &'c str,
+    exprs: &'c [Expr],
+    ctx: &'c Context<'a, 'c>,
+}
+
+impl<'a> Args<'_, 'a> {
+    pub fn len(&self) -> usize {
+        self.exprs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.exprs.is_empty()
+    }
+
+    /// An error unless there are `min` to `max` arguments.
+    pub fn arity(&self, min: usize, max: usize) -> Result<()> {
+        arity(self.name, self.exprs.len(), min, max)
+    }
+
+    /// Argument `i`, evaluated.
+    pub fn value(&self, i: usize) -> Result<Value<'a>> {
+        eval(&self.exprs[i], self.ctx)
+    }
+
+    /// Argument `i`, converted as `string()` converts it.
+    pub fn string(&self, i: usize) -> Result<String> {
+        Ok(string(&self.value(i)?, self.ctx))
+    }
+
+    /// The context node.
+    pub fn context(&self) -> Item<'a> {
+        self.ctx.item
+    }
+
+    pub fn doc(&self) -> Doc<'a> {
+        self.ctx.doc
+    }
+}
+
+fn arity(name: &str, got: usize, min: usize, max: usize) -> Result<()> {
+    if got < min || got > max {
+        let expected = if min == max {
+            format!("{min}")
+        } else if max == usize::MAX {
+            format!("at least {min}")
+        } else {
+            format!("{min} to {max}")
+        };
+        return Err(format!("{name}() takes {expected} arguments, got {got}"));
+    }
+    Ok(())
+}
 
 fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a>> {
-    let arity = |min: usize, max: usize| -> Result<()> {
-        if args.len() < min || args.len() > max {
-            let expected = if min == max {
-                format!("{min}")
-            } else if max == usize::MAX {
-                format!("at least {min}")
-            } else {
-                format!("{min} to {max}")
-            };
-            return Err(format!(
-                "{name}() takes {expected} arguments, got {}",
-                args.len()
-            ));
-        }
-        Ok(())
-    };
+    let arity = |min: usize, max: usize| arity(name, args.len(), min, max);
     let arg = |i: usize| eval(&args[i], ctx);
-    let str_arg = |i: usize| -> Result<String> { Ok(string(&eval(&args[i], ctx)?)) };
+    let str_arg = |i: usize| -> Result<String> { Ok(string(&eval(&args[i], ctx)?, ctx)) };
     let nodes_arg = |i: usize| -> Result<Vec<Item<'a>>> {
         match eval(&args[i], ctx)? {
             Value::Nodes(n) => Ok(n),
@@ -973,31 +1200,31 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
             let wanted: Vec<String> = match arg(0)? {
                 Value::Nodes(items) => items
                     .iter()
-                    .map(|i| i.string_value().into_owned())
+                    .map(|i| ctx.string_value(i).into_owned())
                     .collect(),
-                other => vec![string(&other)],
+                other => vec![string(&other, ctx)],
             };
-            let index = ctx.root.doc.index();
+            let index = ctx.doc.index;
+            let doc = ctx.doc;
+            let (top, end) = ctx.tree_range();
             let found = wanted
                 .iter()
                 .flat_map(|s| s.split_whitespace())
-                .flat_map(|id| index.with_id(ctx.root.doc, id))
-                .filter(|n| {
-                    n.order() >= ctx.root.order() && n.order() < index.end_of(ctx.root.order())
-                })
+                .flat_map(|id| index.with_id(id, |n| doc.attr(n, "id")))
+                .filter(|&n| (top..end).contains(&ctx.order(n)))
                 .map(Item::Node)
                 .collect();
-            Value::Nodes(in_document_order(found))
+            Value::Nodes(in_document_order(found, ctx))
         }
         "local-name" | "name" | "namespace-uri" => {
             arity(0, 1)?;
-            let first = in_document_order(context_or(0)?).into_iter().next();
+            let first = in_document_order(context_or(0)?, ctx).into_iter().next();
             text(
                 first
                     .map(|i| match name {
-                        "name" => i.name(),
-                        "local-name" => i.local_name(),
-                        _ => i.namespace_uri(),
+                        "name" => ctx.name(&i),
+                        "local-name" => ctx.local_name(&i),
+                        _ => ctx.namespace_uri(&i),
                     })
                     .unwrap_or_default()
                     .to_string(),
@@ -1006,7 +1233,7 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
         "string" => {
             arity(0, 1)?;
             text(if args.is_empty() {
-                ctx.item.string_value().into_owned()
+                ctx.string_value(&ctx.item).into_owned()
             } else {
                 str_arg(0)?
             })
@@ -1044,9 +1271,9 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
         "substring" => {
             arity(2, 3)?;
             let s = str_arg(0)?;
-            let start = round(number(arg(1)?));
+            let start = round(number(arg(1)?, ctx));
             let end = if args.len() == 3 {
-                start + round(number(arg(2)?))
+                start + round(number(arg(2)?, ctx))
             } else {
                 f64::INFINITY
             };
@@ -1065,7 +1292,7 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
         "string-length" => {
             arity(0, 1)?;
             let s = if args.is_empty() {
-                ctx.item.string_value().into_owned()
+                ctx.string_value(&ctx.item).into_owned()
             } else {
                 str_arg(0)?
             };
@@ -1074,7 +1301,7 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
         "normalize-space" => {
             arity(0, 1)?;
             let s = if args.is_empty() {
-                ctx.item.string_value().into_owned()
+                ctx.string_value(&ctx.item).into_owned()
             } else {
                 str_arg(0)?
             };
@@ -1122,18 +1349,22 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
                 Item::Node(n) => n,
                 Item::Attr { owner, .. } => owner,
             };
-            let declared = std::iter::once(node)
-                .chain(ancestors(node))
-                .find_map(|n| n.attr("xml:lang").or_else(|| n.attr("lang")))
+            let tree = ctx.doc.tree;
+            let declared = std::iter::successors(Some(node), |&n| tree.parent(n))
+                .find_map(|n| {
+                    ctx.doc
+                        .attr(n, "xml:lang")
+                        .or_else(|| ctx.doc.attr(n, "lang"))
+                })
                 .map(str::to_ascii_lowercase);
             Value::Bool(declared.is_some_and(|l| l == want || l.starts_with(&format!("{want}-"))))
         }
         "number" => {
             arity(0, 1)?;
             Value::Num(if args.is_empty() {
-                parse_number(&ctx.item.string_value())
+                parse_number(&ctx.string_value(&ctx.item))
             } else {
-                number(arg(0)?)
+                number(arg(0)?, ctx)
             })
         }
         "sum" => {
@@ -1142,57 +1373,33 @@ fn call<'a>(name: &str, args: &[Expr], ctx: &Context<'a, '_>) -> Result<Value<'a
             Value::Num(
                 nodes_arg(0)?
                     .iter()
-                    .map(|i| parse_number(&i.string_value()))
+                    .map(|i| parse_number(&ctx.string_value(i)))
                     .fold(0.0, |a, b| a + b),
             )
         }
         "floor" => {
             arity(1, 1)?;
-            Value::Num(number(arg(0)?).floor())
+            Value::Num(number(arg(0)?, ctx).floor())
         }
         "ceiling" => {
             arity(1, 1)?;
-            Value::Num(number(arg(0)?).ceil())
+            Value::Num(number(arg(0)?, ctx).ceil())
         }
         "round" => {
             arity(1, 1)?;
-            Value::Num(round(number(arg(0)?)))
+            Value::Num(round(number(arg(0)?, ctx)))
         }
-        // parsel's extension: the context element has every class given.
-        "has-class" => {
-            arity(1, usize::MAX)?;
-            let classes = match ctx.item {
-                Item::Node(n) => n.attr("class").unwrap_or(""),
-                Item::Attr { .. } => "",
+        _ => {
+            let args = Args {
+                name,
+                exprs: args,
+                ctx,
             };
-            let have: Vec<&str> = classes.split_ascii_whitespace().collect();
-            let mut all = true;
-            for i in 0..args.len() {
-                all &= have.contains(&str_arg(i)?.as_str());
-            }
-            Value::Bool(all)
+            return ctx
+                .ext
+                .call(name, &args)
+                .unwrap_or_else(|| Err(format!("unknown function {name}()")));
         }
-        "re:test" => {
-            arity(2, 3)?;
-            let flags = if args.len() == 3 {
-                str_arg(2)?
-            } else {
-                String::new()
-            };
-            Value::Bool(regex(&str_arg(1)?, &flags)?.is_match(&str_arg(0)?))
-        }
-        "re:replace" => {
-            arity(4, 4)?;
-            let (input, flags, with) = (str_arg(0)?, str_arg(2)?, str_arg(3)?);
-            let re = regex(&str_arg(1)?, &flags)?;
-            let expand = |caps: &regex::Captures<'_>| substitute(caps, &with);
-            text(if flags.contains('g') {
-                re.replace_all(&input, expand).into_owned()
-            } else {
-                re.replace(&input, expand).into_owned()
-            })
-        }
-        _ => return Err(format!("unknown function {name}()")),
     })
 }
 
@@ -1210,92 +1417,9 @@ fn round(x: f64) -> f64 {
     }
 }
 
-/// A replacement written as lxml (and Python's `re`) reads it: `\1` to
-/// `\99` and `\g<name>` are groups, `\\` is a backslash, `\n` and `\t`
-/// are escapes, and `$` is just a dollar sign.
-fn substitute(caps: &regex::Captures<'_>, with: &str) -> String {
-    let group = |out: &mut String, m: Option<regex::Match<'_>>| {
-        if let Some(m) = m {
-            out.push_str(m.as_str());
-        }
-    };
-    let mut out = String::new();
-    let mut chars = with.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some(d @ '0'..='9') => {
-                let mut n = d.to_digit(10).unwrap() as usize;
-                if let Some(e) = chars.peek().and_then(|e| e.to_digit(10)) {
-                    n = n * 10 + e as usize;
-                    chars.next();
-                }
-                group(&mut out, caps.get(n));
-            }
-            Some('g') if chars.peek() == Some(&'<') => {
-                chars.next();
-                let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
-                let m = match name.parse::<usize>() {
-                    Ok(n) => caps.get(n),
-                    Err(_) => caps.name(&name),
-                };
-                group(&mut out, m);
-            }
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
-/// EXSLT flags: `i` ignores case, `g` (replace only) replaces every match.
-fn regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
-    regex::RegexBuilder::new(pattern)
-        .case_insensitive(flags.contains('i'))
-        .build()
-        // The regex crate's message spans several lines with a caret; its
-        // last line says what is wrong.
-        .map_err(|e| {
-            let text = e.to_string();
-            let why = text
-                .lines()
-                .last()
-                .unwrap_or("")
-                .trim_start_matches("error: ")
-                .to_string();
-            format!("bad regular expression {pattern:?}: {why}")
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn python_float_formatting() {
-        for (n, s) in [
-            (3.0, "3.0"),
-            (-2.0, "-2.0"),
-            (0.5, "0.5"),
-            (12.5, "12.5"),
-            (-0.0, "-0.0"),
-            (1e16, "1e+16"),
-            (1.5e-5, "1.5e-05"),
-            (1e100, "1e+100"),
-            (20000.0, "20000.0"),
-        ] {
-            assert_eq!(python_float(n), s, "{n}");
-        }
-    }
 
     #[test]
     fn xpath_number_grammar() {

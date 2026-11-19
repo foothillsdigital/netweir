@@ -33,13 +33,17 @@ doc.css("a::attr(title), .price::text").getall()
 - `::attr(name)` gives an attribute's value.
 - With neither, `get()` gives the element's HTML, the way Chrome's
   `outerHTML` writes it.
+- Table columns work as the HTML table model lays them out, `colspan`
+  and `rowspan` included: `col.total || td` finds the cells under a
+  `col`, and `td:nth-col(2)` and `:nth-last-col(1)` the cells in a
+  column by position.
 - Form pseudo-classes read the markup as it stands: `:valid` and `:invalid`
   check `required`, `type="email"` and `"url"`, `min`, `max`, `step` and
   `pattern`, but not the limits only typing can break (`maxlength`,
   `minlength`). A `pattern` is read as JavaScript reads it, with the `v`
-  flag, so `\d` and `\w` are ASCII. One that doesn't compile counts as
-  none, as does one using `\p{...}`, which needs Unicode tables Netweir
-  doesn't carry.
+  flag, so `\d` and `\w` are ASCII, and `\p{L}` and the other Unicode
+  property escapes work. One that doesn't compile counts as none, and so
+  does one using a property of strings such as `\p{RGI_Emoji}`.
 - `:blank` is the current Selectors draft's: an `<input>` a user types
   text into (text, search, url, tel, email, password or number) with no
   `value`, or a `<textarea>` with no text. `:defined` matches everything

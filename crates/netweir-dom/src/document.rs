@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use netweir_html as html;
+use netweir_xpath::Index;
 
-use crate::index::Index;
 use crate::xml::{self, XmlNames};
 
 /// A parsed HTML document.
@@ -1041,7 +1041,7 @@ impl<'a> Node<'a> {
         }
     }
 
-    /// An element's attributes with what XPath needs of them: the name
+    /// An element's attributes with their namespaces: the name
     /// (as written in XML, as [`Node::attrs`] gives it in HTML), its
     /// namespace id (0 for none, and in HTML) and the value.
     pub(crate) fn xml_attrs(&self) -> Vec<(&'a str, u32, &'a str)> {
@@ -1087,19 +1087,6 @@ impl<'a> Node<'a> {
             html::Kind::ProcessingInstruction { data, .. } => Some(data),
             _ => None,
         }
-    }
-
-    /// An id for this node's name. Two elements share an id exactly when
-    /// their lowercase names (without an XML prefix) are equal.
-    pub(crate) fn tag_id(&self) -> usize {
-        let index = self.doc.index();
-        index.tag_at(index.order(self.id))
-    }
-
-    /// The id elements named `name` (compared lowercased) carry in this
-    /// node's document; `None` if no element has that name.
-    pub(crate) fn tag_id_named(&self, name: &str) -> Option<usize> {
-        self.doc.index().tag_id_named(name)
     }
 
     pub fn next_sibling(&self) -> Option<Node<'a>> {

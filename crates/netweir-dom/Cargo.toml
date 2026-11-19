@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 netweir-html = { path = "../netweir-html" }
+netweir-xpath = { path = "../netweir-xpath" }
 memchr = "2"
 quick-xml = "0.42"
 regex = "1"

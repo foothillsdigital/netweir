@@ -1264,6 +1264,7 @@ version = "0.7.1"
 dependencies = [
  "memchr",
  "netweir-html",
+ "netweir-xpath",
  "quick-xml",
  "regex",
  "serde",
@@ -1311,6 +1312,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "netweir-xpath"
+version = "0.7.1"
+dependencies = [
+ "netweir-html",
+ "stacker",
 ]
 
 [[package]]

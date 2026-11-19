@@ -1,7 +1,7 @@
 //! XPath 1.0 grammar (sections 2 and 3) to an expression tree.
 
-use super::XPathError;
-use super::lexer::Token;
+use crate::XPathError;
+use crate::lexer::Token;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Axis {
@@ -593,11 +593,19 @@ impl Expr {
 /// A node-set compared with the position, as in `[..//x = position()]`, is
 /// still worked out every time: keeping node-sets for every node could
 /// take memory growing as nodes squared.
-pub(crate) fn memoize(expr: &mut Expr) {
-    visit(expr, &mut 0);
+///
+/// `scalar` says which extension functions give only a number or a yes
+/// or no.
+pub(crate) fn memoize(expr: &mut Expr, scalar: &dyn Fn(&str) -> bool) {
+    visit(expr, &mut Slots { next: 0, scalar });
 }
 
-fn visit(expr: &mut Expr, slots: &mut usize) {
+struct Slots<'s> {
+    next: usize,
+    scalar: &'s dyn Fn(&str) -> bool,
+}
+
+fn visit(expr: &mut Expr, slots: &mut Slots<'_>) {
     match expr {
         Expr::Binary(_, a, b) | Expr::Union(a, b) => {
             visit(a, slots);
@@ -625,19 +633,19 @@ fn visit(expr: &mut Expr, slots: &mut usize) {
     }
 }
 
-fn predicate(p: &mut Expr, slots: &mut usize) {
+fn predicate(p: &mut Expr, slots: &mut Slots<'_>) {
     visit(p, slots);
     keep_or_look_inside(p, slots);
 }
 
-fn keep_or_look_inside(e: &mut Expr, slots: &mut usize) {
+fn keep_or_look_inside(e: &mut Expr, slots: &mut Slots<'_>) {
     if !e.walks() {
         return;
     }
     if !e.reads_position() {
         let inner = std::mem::replace(e, Expr::Number(0.0));
-        *e = Expr::Memo(Box::new(inner), *slots);
-        *slots += 1;
+        *e = Expr::Memo(Box::new(inner), slots.next);
+        slots.next += 1;
         return;
     }
     match e {
@@ -654,7 +662,7 @@ fn keep_or_look_inside(e: &mut Expr, slots: &mut usize) {
 
 /// Wraps the calls under `e` that walk without reading the position and
 /// give a number or a yes or no.
-fn scalar_calls(e: &mut Expr, slots: &mut usize) {
+fn scalar_calls(e: &mut Expr, slots: &mut Slots<'_>) {
     match e {
         Expr::Binary(_, a, b) | Expr::Union(a, b) => {
             scalar_calls(a, slots);
@@ -672,11 +680,10 @@ fn scalar_calls(e: &mut Expr, slots: &mut usize) {
                     | "not"
                     | "contains"
                     | "starts-with"
-                    | "re:test"
                     | "floor"
                     | "ceiling"
                     | "round"
-            );
+            ) || (slots.scalar)(name);
             if scalar && e.walks() && !e.reads_position() {
                 keep_or_look_inside(e, slots);
             } else if let Expr::Call(_, args) = e {

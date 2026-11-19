@@ -16,6 +16,8 @@
 //! The tag and ancestor checks run on the document index as integer
 //! comparisons, so only real candidates have their attributes read.
 
+use netweir_xpath::Index;
+
 use crate::document::{Node, NodeKind};
 
 /// The share of attribute features a similar element needs by default.
@@ -68,10 +70,50 @@ impl<'a> Node<'a> {
             return Vec::new();
         }
         let mine = features(*self);
-        let index = self.doc.index();
-        index.same_path(self.doc, self.order(), |n| {
-            jaccard(&features(n), &mine) >= threshold
+        same_path(self.doc.index(), self.order())
+            .into_iter()
+            .map(|raw| Node::from_raw(self.doc, raw))
+            .filter(|&n| jaccard(&features(n), &mine) >= threshold)
+            .collect()
+    }
+}
+
+/// The nodes in `at`'s tree, other than `at`, of its kind and tag and
+/// with the same tags all the way up, in document order. Tags are compared
+/// as ids, so the scan is integer work.
+fn same_path(index: &Index, at: u32) -> Vec<u32> {
+    let mut top = at;
+    while index.parent_of(top) != u32::MAX {
+        top = index.parent_of(top);
+    }
+    (top..index.end_of(top))
+        .filter(|&j| {
+            j != at
+                && index.tag_at(j) == index.tag_at(at)
+                && index.kind_at(j) == index.kind_at(at)
+                && same_ancestors(index, j, at)
         })
+        .map(|j| index.node_at(j))
+        .collect()
+}
+
+/// Whether the ancestors of `x` and `y` have the same tags, level by
+/// level, up to the root of their tree.
+fn same_ancestors(index: &Index, mut x: u32, mut y: u32) -> bool {
+    loop {
+        let (px, py) = (index.parent_of(x), index.parent_of(y));
+        // Siblings and cousins meet at a shared ancestor, and the rest
+        // of the way up is the same for both.
+        if px == py {
+            return true;
+        }
+        if px == u32::MAX || py == u32::MAX {
+            return false;
+        }
+        (x, y) = (px, py);
+        if index.tag_at(x) != index.tag_at(y) || index.kind_at(x) != index.kind_at(y) {
+            return false;
+        }
     }
 }
 

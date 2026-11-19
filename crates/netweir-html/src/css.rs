@@ -7,7 +7,9 @@
 //! in a quirks-mode document.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::dom::{AttrNs, Data, Document, NodeId, Ns, Quirks};
@@ -53,6 +55,8 @@ enum Combinator {
     Child,
     NextSibling,
     SubsequentSibling,
+    /// `||`: a table cell in a column the `col` on its left covers.
+    Column,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,6 +163,13 @@ enum Pseudo {
     Invalid,
     /// A state no static page is in: `:hover`, `:focus`, `:visited`...
     Never,
+    /// `:nth-col()` and `:nth-last-col()`: a table cell in a column at
+    /// that position.
+    NthCol {
+        a: i32,
+        b: i32,
+        last: bool,
+    },
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -423,6 +434,10 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Some(Combinator::SubsequentSibling)
             }
+            '|' if self.peek_at(1) == Some('|') => {
+                self.pos += 2;
+                Some(Combinator::Column)
+            }
             _ => None,
         }
     }
@@ -435,7 +450,8 @@ impl<'a> Parser<'a> {
         let mut explicit = false;
         let mut prefixed = false;
         // A type selector or universal, with an optional namespace prefix.
-        if self.peek() == Some('*') || self.starts_name() || self.peek() == Some('|') {
+        let bar = |p: &Self| p.peek() == Some('|') && p.peek_at(1) != Some('|');
+        if self.peek() == Some('*') || self.starts_name() || bar(self) {
             explicit = true;
             let star = self.eat('*');
             universal = star;
@@ -444,7 +460,7 @@ impl<'a> Parser<'a> {
             } else {
                 self.name()?
             };
-            if self.peek() == Some('|') && self.peek_at(1) != Some('=') {
+            if bar(self) && self.peek_at(1) != Some('=') {
                 self.pos += 1;
                 prefixed = true;
                 // `*|` is any namespace; `|x` asks for none, which no
@@ -724,6 +740,16 @@ impl<'a> Parser<'a> {
                     last,
                     of_type,
                     of,
+                }
+            }
+            "nth-col" | "nth-last-col" => {
+                let close = self.close_paren();
+                let (a, b) = an_plus_b(&self.s[self.pos..close])?;
+                self.pos = close;
+                Pseudo::NthCol {
+                    a,
+                    b,
+                    last: name == "nth-last-col",
                 }
             }
             "lang" => {
@@ -1682,6 +1708,9 @@ struct Cx<'a> {
     /// asks the same question of the elements below or after it, so a
     /// query asks it of each element once.
     has_seen: RefCell<IdMap<(usize, NodeId), bool>>,
+    /// Each table's columns, worked out the first time `||` or
+    /// `:nth-col()` needs them, so a big table isn't laid out per cell.
+    tables: RefCell<IdMap<NodeId, Rc<Columns>>>,
 }
 
 /// A map keyed by node ids and selectors' addresses, numbers the parser
@@ -1734,8 +1763,135 @@ impl Fail {
     fn exhausted(combinator: Combinator) -> Fail {
         match combinator {
             Combinator::NextSibling | Combinator::SubsequentSibling => Fail::Descendant,
+            // Another cell may sit under other cols: the part to the right
+            // may try one.
+            Combinator::Column => Fail::Sibling,
             _ => Fail::Global,
         }
+    }
+}
+
+/// A table's columns by the HTML table model: the first column and how
+/// many each cell and each `col` covers, and how many there are in all.
+#[derive(Default)]
+struct Columns {
+    cells: HashMap<NodeId, (u32, u32)>,
+    /// In column order, side by side.
+    cols: Vec<(NodeId, u32, u32)>,
+    /// Where each col is in `cols`, so `||` steps to the next in O(1).
+    col_index: HashMap<NodeId, usize>,
+    width: u32,
+}
+
+/// The columns cells from earlier rows of a row group still cover, kept
+/// as runs rather than slots, so time and memory follow the cells and not
+/// the table's width, and a row with nothing reaching into it costs
+/// nothing.
+#[derive(Default)]
+struct Cover {
+    /// The row being laid out, counted from the group's first.
+    row: u32,
+    /// Disjoint runs: first column -> (column after the last, first row
+    /// no longer covered), u32::MAX for rowspan=0.
+    runs: BTreeMap<u32, (u32, u32)>,
+    /// The runs' union as maximal contiguous blocks, first column ->
+    /// column after the last, so finding a free column is one lookup
+    /// however many runs sit side by side.
+    blocks: BTreeMap<u32, u32>,
+    /// Each run's last row, soonest first; an entry whose run has since
+    /// been split or replaced is skipped.
+    ends: BinaryHeap<Reverse<(u32, u32)>>,
+}
+
+impl Cover {
+    /// Drops the runs that stop before `row`.
+    fn advance(&mut self, row: u32) {
+        while let Some(&Reverse((until, start))) = self.ends.peek() {
+            if until > row {
+                break;
+            }
+            self.ends.pop();
+            if let Some(&(end, u)) = self.runs.get(&start)
+                && u == until
+            {
+                self.runs.remove(&start);
+                let (&bs, &be) = self
+                    .blocks
+                    .range(..=start)
+                    .next_back()
+                    .expect("a run's block");
+                self.blocks.remove(&bs);
+                if bs < start {
+                    self.blocks.insert(bs, start);
+                }
+                if end < be {
+                    self.blocks.insert(end, be);
+                }
+            }
+        }
+    }
+
+    /// The first column from `x` that nothing covers.
+    fn free(&self, x: u32) -> u32 {
+        match self.blocks.range(..=x).next_back() {
+            Some((_, &end)) if end > x => end,
+            _ => x,
+        }
+    }
+
+    /// Covers `[start, end)` until row `until`. Where a run already covers
+    /// part of it, a table model error, that part keeps the later row.
+    fn add(&mut self, start: u32, end: u32, until: u32) {
+        let mut over: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some((&rs, &(re, ru))) = self.runs.range(..start).next_back()
+            && re > start
+        {
+            over.push((rs, re, ru));
+        }
+        over.extend(
+            self.runs
+                .range(start..end)
+                .map(|(&rs, &(re, ru))| (rs, re, ru)),
+        );
+        let mut pieces = Vec::new();
+        let mut at = start;
+        for &(rs, re, ru) in &over {
+            self.runs.remove(&rs);
+            if rs < start {
+                pieces.push((rs, start, ru));
+            }
+            let (os, oe) = (rs.max(start), re.min(end));
+            if at < os {
+                pieces.push((at, os, until));
+            }
+            pieces.push((os, oe, ru.max(until)));
+            if re > end {
+                pieces.push((end, re, ru));
+            }
+            at = oe;
+        }
+        if at < end {
+            pieces.push((at, end, until));
+        }
+        for (ps, pe, pu) in pieces {
+            self.runs.insert(ps, (pe, pu));
+            self.ends.push(Reverse((pu, ps)));
+        }
+        // The union grows by [start, end): merge it with the blocks it
+        // touches.
+        let (mut bs, mut be) = (start, end);
+        if let Some((&s, &e)) = self.blocks.range(..=start).next_back()
+            && e >= start
+        {
+            bs = s;
+            be = be.max(e);
+            self.blocks.remove(&s);
+        }
+        while let Some((&s, &e)) = self.blocks.range(bs..=be).next() {
+            self.blocks.remove(&s);
+            be = be.max(e);
+        }
+        self.blocks.insert(bs, be);
     }
 }
 
@@ -1820,7 +1976,133 @@ impl<'a> Cx<'a> {
             places: RefCell::default(),
             of_places: RefCell::default(),
             has_seen: RefCell::default(),
+            tables: RefCell::default(),
         }
+    }
+
+    fn html_tag_of(&self, n: NodeId) -> Option<Tag> {
+        self.doc
+            .element(n)
+            .filter(|e| e.ns == Ns::Html)
+            .map(|e| e.tag)
+    }
+
+    /// The table a cell belongs to: its row's, the row in the table or in
+    /// one of its row groups.
+    fn table_of_cell(&self, cell: NodeId) -> Option<NodeId> {
+        if !matches!(self.html_tag_of(cell), Some(Tag::Td | Tag::Th)) {
+            return None;
+        }
+        let tr = self
+            .doc
+            .parent(cell)
+            .filter(|&p| self.html_tag_of(p) == Some(Tag::Tr))?;
+        let p = self.doc.parent(tr)?;
+        match self.html_tag_of(p)? {
+            Tag::Table => Some(p),
+            Tag::Thead | Tag::Tbody | Tag::Tfoot => self
+                .doc
+                .parent(p)
+                .filter(|&t| self.html_tag_of(t) == Some(Tag::Table)),
+            _ => None,
+        }
+    }
+
+    /// A cell's table's columns, and the cell's first column and span.
+    fn cell_columns(&self, cell: NodeId) -> Option<(Rc<Columns>, u32, u32)> {
+        let table = self.table_of_cell(cell)?;
+        let columns = self.columns(table);
+        let &(x, n) = columns.cells.get(&cell)?;
+        Some((columns, x, n))
+    }
+
+    fn columns(&self, table: NodeId) -> Rc<Columns> {
+        if let Some(c) = self.tables.borrow().get(&table) {
+            return c.clone();
+        }
+        let c = Rc::new(self.lay_out(table));
+        self.tables.borrow_mut().insert(table, c.clone());
+        c
+    }
+
+    /// A `span`, `colspan` or `rowspan` as the HTML Standard reads it:
+    /// missing, unparsable or zero gives 1, and it stops at `max`.
+    fn span(&self, el: NodeId, name: &str, max: u32) -> u32 {
+        self.attr(el, name)
+            .and_then(parse_non_negative)
+            .filter(|&n| n > 0)
+            .map_or(1, |n| n.min(max))
+    }
+
+    /// The HTML Standard's "forming a table", as far as columns go:
+    /// `colgroup`s before the first row give the `col`s their columns,
+    /// and each cell takes the first column its row leaves free, rows
+    /// above reaching down with `rowspan` included.
+    fn lay_out(&self, table: NodeId) -> Columns {
+        let doc = self.doc;
+        let mut out = Columns::default();
+        let mut col_x = 0;
+        let mut rows_started = false;
+        let mut cover = Cover::default();
+        for child in doc.children(table) {
+            match self.html_tag_of(child) {
+                Some(Tag::Colgroup) if !rows_started => {
+                    let mut has_cols = false;
+                    for c in doc.children(child) {
+                        if self.html_tag_of(c) == Some(Tag::Col) {
+                            has_cols = true;
+                            let n = self.span(c, "span", 1000);
+                            out.col_index.insert(c, out.cols.len());
+                            out.cols.push((c, col_x, n));
+                            col_x += n;
+                        }
+                    }
+                    if !has_cols {
+                        col_x += self.span(child, "span", 1000);
+                    }
+                }
+                Some(Tag::Tr) => {
+                    rows_started = true;
+                    self.lay_out_row(child, &mut cover, &mut out);
+                }
+                Some(Tag::Thead | Tag::Tbody | Tag::Tfoot) => {
+                    rows_started = true;
+                    // Cells don't reach from one row group into another.
+                    cover = Cover::default();
+                    for r in doc.children(child) {
+                        if self.html_tag_of(r) == Some(Tag::Tr) {
+                            self.lay_out_row(r, &mut cover, &mut out);
+                        }
+                    }
+                    cover = Cover::default();
+                }
+                _ => {}
+            }
+        }
+        out.width = out.width.max(col_x);
+        out
+    }
+
+    fn lay_out_row(&self, tr: NodeId, cover: &mut Cover, out: &mut Columns) {
+        let row = cover.row;
+        cover.advance(row);
+        let mut x = 0;
+        for cell in self.doc.children(tr) {
+            if !matches!(self.html_tag_of(cell), Some(Tag::Td | Tag::Th)) {
+                continue;
+            }
+            x = cover.free(x);
+            let span = self.span(cell, "colspan", 1000);
+            let until = match self.attr(cell, "rowspan").and_then(parse_non_negative) {
+                Some(0) => u32::MAX,
+                n => row.saturating_add(n.map_or(1, |n| n.min(65534))),
+            };
+            cover.add(x, x + span, until);
+            out.cells.insert(cell, (x, span));
+            x += span;
+            out.width = out.width.max(x);
+        }
+        cover.row += 1;
     }
 
     /// `el`'s place among its siblings, or None if it has no parent.
@@ -2000,7 +2282,7 @@ impl<'a> Cx<'a> {
                 if matches!(combinator, Combinator::Child | Combinator::NextSibling) {
                     return false;
                 }
-                at = self.step(*combinator, p);
+                at = self.next_step(*combinator, el, p);
             }
             return false;
         }
@@ -2051,7 +2333,7 @@ impl<'a> Cx<'a> {
                     _ => true,
                 };
                 if retry {
-                    if let Some(next) = self.step(combinator, at) {
+                    if let Some(next) = self.next_step(combinator, matched[i], at) {
                         (i, at) = (i + 1, next);
                         break;
                     }
@@ -2069,8 +2351,33 @@ impl<'a> Cx<'a> {
         match combinator {
             Combinator::Child | Combinator::Descendant => self.doc.parent(el),
             Combinator::NextSibling | Combinator::SubsequentSibling => self.prev_element(el),
+            Combinator::Column => self.col_after(el, None),
             Combinator::None => None,
         }
+    }
+
+    /// The element after `prev` that `combinator` reaches from `origin`:
+    /// the next one up or back from `prev`, or for `||`, the next col
+    /// over `origin`'s columns, which `prev` alone can't say.
+    fn next_step(&self, combinator: Combinator, origin: NodeId, prev: NodeId) -> Option<NodeId> {
+        match combinator {
+            Combinator::Column => self.col_after(origin, Some(prev)),
+            _ => self.step(combinator, prev),
+        }
+    }
+
+    /// The cols over any of a cell's columns, in column order: the first,
+    /// or the one after `prev`.
+    fn col_after(&self, cell: NodeId, prev: Option<NodeId>) -> Option<NodeId> {
+        let (t, x, n) = self.cell_columns(cell)?;
+        let i = match prev {
+            None => t.cols.partition_point(|&(_, cx, cn)| cx + cn <= x),
+            Some(p) => t.col_index.get(&p)? + 1,
+        };
+        t.cols
+            .get(i)
+            .filter(|&&(_, cx, _)| cx < x + n)
+            .map(|&(col, ..)| col)
     }
 
     /// Whether the budget has run out. Once it has, every compound fails,
@@ -2886,6 +3193,16 @@ impl<'a> Cx<'a> {
             }),
             Pseudo::Dir(rtl) => self.is_rtl(el) == *rtl,
             Pseudo::Never => false,
+            // A cell's columns are a run of positions, so one sum says
+            // whether any of them fits, however many it spans.
+            Pseudo::NthCol { a, b, last } => self.cell_columns(el).is_some_and(|(t, x, n)| {
+                let (lo, hi) = if *last {
+                    (t.width - (x + n) + 1, t.width - x)
+                } else {
+                    (x + 1, x + n)
+                };
+                nth_in_range(*a as i64, *b as i64, lo as i64, hi as i64)
+            }),
         }
     }
 
@@ -2899,7 +3216,9 @@ impl<'a> Cx<'a> {
         // One compound, the usual shape: only the elements the combinator
         // reaches can match, and the compound doesn't depend on the
         // anchor, so what lies below or after an element is worth keeping.
-        if let [(compound, _), _] = c.parts.as_slice() {
+        if let [(compound, _), _] = c.parts.as_slice()
+            && first != Combinator::Column
+        {
             let key = std::ptr::from_ref(c) as usize;
             return match first {
                 Combinator::Child => doc
@@ -2919,6 +3238,15 @@ impl<'a> Cx<'a> {
                 while let Some(s) = at {
                     stack.push(s);
                     at = self.next_element(s);
+                }
+            }
+            // A col's cells are elsewhere in its table.
+            Combinator::Column => {
+                let table = doc.parent(el).and_then(|g| doc.parent(g));
+                if self.html_tag_of(el) == Some(Tag::Col)
+                    && let Some(t) = table.filter(|&t| self.html_tag_of(t) == Some(Tag::Table))
+                {
+                    push_children_reversed(doc, t, &mut stack);
                 }
             }
             _ => push_children_reversed(doc, el, &mut stack),
@@ -3123,6 +3451,23 @@ fn nth_matches(a: i64, b: i64, index: i64) -> bool {
     diff % a == 0 && diff / a >= 0
 }
 
+/// Whether some position from `lo` to `hi` is `a`n+`b` for an n >= 0.
+fn nth_in_range(a: i64, b: i64, lo: i64, hi: i64) -> bool {
+    match a.cmp(&0) {
+        std::cmp::Ordering::Equal => (lo..=hi).contains(&b),
+        // The first matching position at or after lo, if it's by hi.
+        std::cmp::Ordering::Greater => {
+            let from = lo.max(b);
+            from + (b - from).rem_euclid(a) <= hi
+        }
+        // The last matching position at or before hi, if it's from lo.
+        std::cmp::Ordering::Less => {
+            let to = hi.min(b);
+            to - (to - b).rem_euclid(-a) >= lo
+        }
+    }
+}
+
 fn value_matches(op: AttrOp, value: &str, want: &str, insensitive: bool) -> bool {
     let eq = |x: &str, y: &str| {
         if insensitive {
@@ -3167,6 +3512,27 @@ fn value_matches(op: AttrOp, value: &str, want: &str, insensitive: bool) -> bool
                 } else {
                     value.contains(want)
                 }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nth_range_tests {
+    #[test]
+    fn nth_in_range_agrees_with_each_position() {
+        for a in -4..=4 {
+            for b in -6..=8 {
+                for lo in 1..=7 {
+                    for hi in lo..=9 {
+                        let each = (lo..=hi).any(|i| super::nth_matches(a, b, i));
+                        assert_eq!(
+                            super::nth_in_range(a, b, lo, hi),
+                            each,
+                            "{a}n+{b} in {lo}..={hi}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

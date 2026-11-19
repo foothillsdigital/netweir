@@ -44,7 +44,7 @@ pub const ENTITY_ALLOWANCE: usize = 1 << 20;
 pub const ENTITY_FACTOR: usize = 8;
 
 /// The namespace the `xml` prefix is always bound to.
-pub const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+pub use netweir_xpath::XML_NS;
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Why a document isn't well-formed XML, and where.
@@ -152,6 +152,20 @@ impl XmlNames {
         self.ns.clear();
         self.decls.clear();
         self.outer.clear();
+    }
+}
+
+impl netweir_xpath::Namespaces for XmlNames {
+    fn ns_of(&self, element: html::NodeId) -> u32 {
+        XmlNames::ns_of(self, element as usize)
+    }
+
+    fn uri(&self, id: u32) -> &str {
+        XmlNames::uri(self, id)
+    }
+
+    fn id_of(&self, uri: &str) -> Option<u32> {
+        XmlNames::id_of(self, uri)
     }
 }
 

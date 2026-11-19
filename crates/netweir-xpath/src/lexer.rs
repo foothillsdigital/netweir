@@ -1,7 +1,7 @@
 //! Tokens of XPath 1.0 (section 3.7), including the rule that decides
 //! whether `*` and `and`/`or`/`mod`/`div` are operators or names.
 
-use super::XPathError;
+use crate::XPathError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Token {

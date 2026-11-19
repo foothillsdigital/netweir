@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use crate::dom::{Attr, AttrNs, Data, Document, Element, NONE, Name, NodeId, Ns, Quirks, Span};
+use crate::dom::{
+    Attr, AttrNs, Data, Document, Element, NONE, Name, NodeId, Ns, Positions, Quirks, Span,
+};
 use crate::tags::Tag;
 use crate::tokenizer::{self, Doctype, Sink, TextMode, Tokenizer};
 
@@ -136,6 +138,17 @@ pub(crate) struct TreeBuilder {
     /// Whether each node is on the stack of open elements, so asking is
     /// one lookup however deep the stack is.
     on_stack: Vec<bool>,
+    /// Whether to record where nodes were written ([`Options::spans`]),
+    /// and where the token being handled was, from [`Sink::position`].
+    spans: bool,
+    at: [u32; 2],
+    /// Where the table text in `pending` was written.
+    pending_at: [u32; 2],
+    /// The name of the end tag being handled, while `spans` is on and
+    /// `closing` says one is: an element of that name it closes ends
+    /// there.
+    closing_name: String,
+    closing: bool,
     /// Each element's [`signature`](Self::signature), 0 until it's
     /// worked out.
     sigs: Vec<u64>,
@@ -566,6 +579,11 @@ impl TreeBuilder {
             counts: [0; 256],
             names: Box::new([0; NAME_SLOTS]),
             on_stack: vec![false; capacity / 24 + 1024],
+            spans: false,
+            at: [0; 2],
+            pending_at: [0; 2],
+            closing_name: String::new(),
+            closing: false,
             sigs: Vec::new(),
         }
     }
@@ -658,6 +676,9 @@ impl TreeBuilder {
     /// Counts `o` as opened (`by` 1) or closed (`by` -1).
     fn count(&mut self, o: Open, by: i32) {
         self.mark(o.id, by > 0);
+        if by < 0 && self.closing {
+            self.closed_by_end_tag(o.id);
+        }
         if o.ns == Ns::Html && o.tag != Tag::Other {
             self.counts[o.tag as usize] = self.counts[o.tag as usize].wrapping_add_signed(by);
             return;
@@ -1073,7 +1094,7 @@ impl TreeBuilder {
         } else {
             NONE
         };
-        self.doc.add(Data::Element(Element {
+        let id = self.doc.add(Data::Element(Element {
             ns,
             tag: s.tag,
             name,
@@ -1083,7 +1104,15 @@ impl TreeBuilder {
             },
             contents,
             html_integration,
-        }))
+        }));
+        // Only an element made from the token itself was written there;
+        // `Start::bare` makes the ones the parser implies.
+        if self.spans
+            && let Some(tag) = s.attrs
+        {
+            self.element_written(id, tag, first as usize);
+        }
+        id
     }
 
     fn element_at(&self, id: NodeId) -> Option<Open> {
@@ -1366,10 +1395,16 @@ impl TreeBuilder {
         };
         if prev != NONE && matches!(self.doc.nodes[prev as usize].data, Data::Text(_)) {
             self.doc.append_text(prev, text);
+            if self.spans {
+                self.text_written(prev, text, true);
+            }
         } else {
             let span = self.doc.intern(text);
             let id = self.doc.add(Data::Text(span));
             self.doc.insert(parent, id, before);
+            if self.spans {
+                self.text_written(id, text, false);
+            }
         }
     }
 
@@ -1378,6 +1413,9 @@ impl TreeBuilder {
         let span = self.doc.intern(text);
         let id = self.doc.add(Data::Comment(span));
         self.doc.insert(place.0, id, place.1);
+        if self.spans {
+            self.written(id);
+        }
     }
 
     fn insert_pi(&mut self, target: &str, data: &str, at: Option<(NodeId, NodeId)>) {
@@ -1386,6 +1424,80 @@ impl TreeBuilder {
         let data = self.doc.intern(data);
         let id = self.doc.add(Data::ProcessingInstruction { target, data });
         self.doc.insert(place.0, id, place.1);
+        if self.spans {
+            self.written(id);
+        }
+    }
+
+    // ---- where nodes were written -----------------------------------------
+    //
+    // Each of these runs only with `spans` on, and none is inlined, so the
+    // parse without them stays as small and fast as it was.
+
+    /// Records that `id` came from the token being handled.
+    #[cold]
+    fn written(&mut self, id: NodeId) {
+        if let Some(p) = self.doc.positions.as_deref_mut() {
+            Positions::set(&mut p.nodes, id as usize, self.at);
+        }
+    }
+
+    /// Records that element `id` was read from start tag `tag`, and so
+    /// were its attributes, which start at `first` in the document's list.
+    #[cold]
+    fn element_written(&mut self, id: NodeId, tag: &tokenizer::Tag<'_>, first: usize) {
+        self.written(id);
+        let Some(p) = self.doc.positions.as_deref_mut() else {
+            return;
+        };
+        for i in 0..tag.attrs().len() {
+            if let Some(at) = tag.attr_span(i) {
+                Positions::set(&mut p.attrs, first + i, [at.start as u32, at.end as u32]);
+            }
+        }
+    }
+
+    /// An element the end tag being handled closed: that's its end tag
+    /// when the names match.
+    #[cold]
+    fn closed_by_end_tag(&mut self, id: NodeId) {
+        if self.doc.lower_name(id) == Some(&self.closing_name) {
+            self.ended(id);
+        }
+    }
+
+    /// Records that `text` went into text node `id`, as all of it or, when
+    /// `more`, after what it already had. Text still a slice of the source
+    /// says exactly where it was, even when the tree builder took only
+    /// part of a run; anything else (decoded, or table text gathered up)
+    /// was written where the token being handled was.
+    #[cold]
+    fn text_written(&mut self, id: NodeId, text: &str, more: bool) {
+        let at = match self.doc.source_offset(text) {
+            Some(o) => [o as u32, (o + text.len()) as u32],
+            None => self.at,
+        };
+        let Some(p) = self.doc.positions.as_deref_mut() else {
+            return;
+        };
+        let at = match p.nodes.get(id as usize) {
+            Some(&[start, end]) if more && start != u32::MAX => [start.min(at[0]), end.max(at[1])],
+            // A copy made for `<selectedcontent>` stays unknown.
+            _ if more => return,
+            _ => at,
+        };
+        Positions::set(&mut p.nodes, id as usize, at);
+    }
+
+    /// Records that the end tag being handled closed element `id`; the
+    /// first one to do so is its end tag.
+    #[cold]
+    fn ended(&mut self, id: NodeId) {
+        if let Some(p) = self.doc.positions.as_deref_mut()
+            && p.ends.get(id as usize).is_none_or(|&a| a[0] == u32::MAX)
+        {
+            Positions::set(&mut p.ends, id as usize, self.at);
+        }
     }
 
     fn rawtext(&mut self, s: &Start<'_>, mode: TextMode) {
@@ -1398,10 +1510,11 @@ impl TreeBuilder {
     /// Adds the token's attributes that `id` doesn't already have, as a
     /// second `<html>` or `<body>` does.
     fn merge_attrs(&mut self, id: NodeId, s: &Start<'_>) {
-        for (n, v) in s.attrs() {
+        for (i, (n, v)) in s.attrs().enumerate() {
             if self.doc.attrs(id).any(|(_, name, _)| name == n) {
                 continue;
             }
+            let written = s.attrs.and_then(|t| t.attr_span(i));
             let name = self.doc.intern(n);
             let value = self.doc.intern(v);
             let attr = Attr {
@@ -1426,6 +1539,21 @@ impl TreeBuilder {
                     .attrs
                     .extend_from_within(old.start as usize..old.end as usize);
                 self.doc.attrs.push(attr);
+                // The old ones moved; where they were written goes along.
+                if let Some(p) = self.doc.positions.as_deref_mut() {
+                    for k in 0..(old.end - old.start) as usize {
+                        let at = p.attrs.get(old.start as usize + k).copied();
+                        if let Some(at) = at {
+                            Positions::set(&mut p.attrs, len as usize + k, at);
+                        }
+                    }
+                }
+            }
+            if let Some(p) = self.doc.positions.as_deref_mut()
+                && let Some(at) = written
+            {
+                let index = self.doc.attrs.len() - 1;
+                Positions::set(&mut p.attrs, index, [at.start as u32, at.end as u32]);
             }
         }
     }
@@ -1521,6 +1649,9 @@ impl TreeBuilder {
                     system_id,
                 });
                 self.doc.insert(0, id, NONE);
+                if self.spans {
+                    self.written(id);
+                }
                 self.doc.quirks = doctype_quirks(d);
                 self.mode = Mode::BeforeHtml;
             }
@@ -2045,6 +2176,10 @@ impl TreeBuilder {
             Body => {
                 if self.in_scope(Body, Scope::Default) {
                     self.mode = Mode::AfterBody;
+                    // It stays open, but this was its end tag.
+                    if let Some(body) = self.open.get(1).filter(|o| o.is(Body)) {
+                        self.ended(body.id);
+                    }
                 }
             }
             Html => {
@@ -2294,6 +2429,7 @@ impl TreeBuilder {
             {
                 self.pending.clear();
                 self.pending_text = false;
+                self.pending_at = self.at;
                 self.original = self.mode;
                 self.reprocess(Mode::InTableText, t);
             }
@@ -2385,8 +2521,12 @@ impl TreeBuilder {
                 }
                 self.pending.push_str(piece);
             }
+            self.pending_at[1] = self.at[1];
             return;
         }
+        // The gathered text was written where its runs were, not where
+        // the token that ends it is.
+        let at = std::mem::replace(&mut self.at, self.pending_at);
         let pending = std::mem::take(&mut self.pending);
         if self.pending_text {
             let foster = self.foster;
@@ -2398,6 +2538,7 @@ impl TreeBuilder {
         }
         self.pending = pending;
         self.pending.clear();
+        self.at = at;
         let original = self.original;
         self.reprocess(original, t);
     }
@@ -2656,6 +2797,8 @@ impl TreeBuilder {
             Tok::End(e) if e.tag == Tag::Html => {
                 if self.context.is_none() {
                     self.mode = Mode::AfterAfterBody;
+                    let html = self.open[0].id;
+                    self.ended(html);
                 }
             }
             Tok::Eof => self.stop(),
@@ -2911,10 +3054,16 @@ impl Sink for TreeBuilder {
 
     fn end_tag(&mut self, tag: &tokenizer::Tag<'_>) {
         self.skip_newline = false;
+        if self.spans {
+            self.closing_name.clear();
+            self.closing_name.push_str(tag.name);
+            self.closing = true;
+        }
         self.process(Tok::End(End {
             tag: Tag::from_name(tag.name),
             name: tag.name,
         }));
+        self.closing = false;
     }
 
     fn comment(&mut self, text: &str) {
@@ -2944,6 +3093,10 @@ impl Sink for TreeBuilder {
     fn cdata_allowed(&self) -> bool {
         self.adjusted_current().is_some_and(|a| a.ns != Ns::Html)
     }
+
+    fn position(&mut self, start: usize, end: usize) {
+        self.at = [start as u32, end as u32];
+    }
 }
 
 /// How to parse.
@@ -2957,6 +3110,11 @@ pub struct Options {
     /// 4,096 tokenizer steps, so a small input finishes even with
     /// `Duration::ZERO`: the budget bounds slow parses, not fast ones.
     pub budget: Option<std::time::Duration>,
+    /// Record where each node and attribute was written, for
+    /// [`Document::span`], [`Document::end_span`],
+    /// [`Document::attr_span`] and [`Document::line_col`]. Off, the parse
+    /// is as fast as ever; on, it keeps a few bytes more per node.
+    pub spans: bool,
     /// Keep the tree at most this deep, as Chromium does at 512: once more
     /// elements are open than this, a node goes beside the current one
     /// instead of inside it. Only the tree gets flatter; the parse goes on
@@ -3048,10 +3206,12 @@ pub fn parse_fragment_with(
 fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Document, ParseError> {
     // Decoding a document drops a byte order mark, so a string that still
     // starts with one gets the same tree. A fragment, as innerHTML, keeps it.
+    let whole = html;
     let html = match fragment {
         None => html.strip_prefix('\u{FEFF}').unwrap_or(html),
         Some(_) => html,
     };
+    let skipped = whole.len() - html.len();
     if html.len() > crate::MAX_INPUT {
         return Err(ParseError::TooLarge { len: html.len() });
     }
@@ -3061,6 +3221,10 @@ fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Doc
     let mut builder = TreeBuilder::new(html.len(), options.scripting);
     builder.doc.scripting = options.scripting;
     builder.max_depth = options.max_depth;
+    if options.spans {
+        builder.spans = true;
+        builder.doc.positions = Some(Box::new(Positions::new(html, skipped)));
+    }
     let input = source(&mut builder, html);
     let mode = match fragment {
         Some((ns, context)) => builder.fragment(ns, context),

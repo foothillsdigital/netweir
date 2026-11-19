@@ -176,6 +176,115 @@ fn declared_namespace_prefixes() {
         default: None,
     };
     assert!(SelectorList::parse_with("x|a", &refused).is_err());
+
+    // A prefix declared under a tag's name leaves `||` the column
+    // combinator: one bar is the prefix, two join two compounds.
+    let col = [("col", Ns::Html)];
+    let col = ParseOptions {
+        namespaces: &col,
+        default: None,
+    };
+    let spec = |css| SelectorList::parse_with(css, &col).unwrap().specificity();
+    assert_eq!(spec("col|td"), (0, 0, 1));
+    assert_eq!(spec("col||td"), (0, 0, 2));
+}
+
+/// `||` and `:nth-col()` by the HTML table model: `colspan`, a `rowspan`
+/// reaching into the next row, `rowspan=0`, a `colgroup` with no `col`s,
+/// and a table inside a cell, whose cells keep their own columns.
+#[test]
+fn table_columns() {
+    let html = r#"<table>
+        <colgroup><col id=c1><col id=c2 span=2></colgroup><colgroup span=2></colgroup>
+        <tr><td id=a><td id=b colspan=2><td id=c rowspan=2><td id=d><table><tr><td id=n></table>
+        <tr><th id=e rowspan=0><td id=f><td id=g><td id=h>
+        <tr><td id=i>
+        </table>"#;
+    // Columns 1-5: a b b c d / e f g c h / e i
+    assert_eq!(select(html, "#c1 || td"), ["td#a"]);
+    assert_eq!(select(html, "#c1 || th"), ["th#e"]);
+    assert_eq!(select(html, "#c2 || *"), ["td#b", "td#f", "td#g", "td#i"]);
+    assert_eq!(
+        select(html, "col||td"),
+        ["td#a", "td#b", "td#f", "td#g", "td#i"]
+    );
+    assert_eq!(select(html, "col:has(|| #f)"), ["col#c2"]);
+    assert_eq!(select(html, ":nth-col(1)"), ["td#a", "td#n", "th#e"]);
+    assert_eq!(select(html, ":nth-col(2)"), ["td#b", "td#f", "td#i"]);
+    assert_eq!(select(html, ":nth-col(4)"), ["td#c"]);
+    assert_eq!(select(html, ":nth-last-col(1)"), ["td#d", "td#n", "td#h"]);
+    assert_eq!(
+        select(html, ":nth-col(n+6), col:nth-col(1)"),
+        Vec::<String>::new()
+    );
+    // A cell running into a column a cell from above still covers, a
+    // table model error: the column stays covered until the later row,
+    // so u can't take it.
+    let clash = "<table><tr><td id=p><td id=q rowspan=3>\
+                 <tr><td id=r colspan=2><td id=s><tr><td id=t><td id=u></table>";
+    assert_eq!(select(clash, ":nth-col(2)"), ["td#q", "td#r"]);
+    assert_eq!(select(clash, ":nth-col(3)"), ["td#s", "td#u"]);
+    // A cell under two cols is tried against the second when the first
+    // doesn't match; a cell under none that matches hands back to the
+    // combinator on its right, which tries an earlier sibling.
+    let four = "<table><col id=x><col id=y><col id=z><col id=w>\
+                <tr><td id=a><td id=b><td id=c><td id=d>\
+                <tr><td id=e colspan=2></table>";
+    assert_eq!(select(four, "#y || td"), ["td#b", "td#e"]);
+    assert_eq!(select(four, "#x || td ~ td"), ["td#b", "td#c", "td#d"]);
+    assert_eq!(select(four, "#y || td + td"), ["td#c"]);
+    // A single bar is still a namespace prefix.
+    assert_eq!(select(html, "|td"), Vec::<String>::new());
+    assert!(SelectorList::parse("col|td").is_err());
+    assert_eq!(
+        SelectorList::parse("col || td:nth-col(2)")
+            .unwrap()
+            .specificity(),
+        (0, 1, 2)
+    );
+}
+
+/// Hostile tables: laying one out and matching `||` follow the cells, not
+/// the table's width or cells times cols. Each of these took minutes, or
+/// hundreds of megabytes, when every column had a slot.
+#[test]
+fn hostile_tables_lay_out_in_linear_time() {
+    let wide = format!(
+        "<table><tr>{}{}</table>",
+        "<td colspan=1000>".repeat(1_000),
+        "<tr><td>".repeat(50_000)
+    );
+    let mega = format!("<table><tr>{}</table>", "<td colspan=1000>".repeat(55_000));
+    let cols = format!(
+        "<table><colgroup>{}</colgroup><tr>{}</table>",
+        "<col>".repeat(30_000),
+        "<td>".repeat(30_000)
+    );
+    // Cells side by side reaching down different distances, then rows
+    // that each have to find the first free column past all of them.
+    let stack = format!(
+        "<table><tr>{}{}</table>",
+        (0..20_000)
+            .map(|i| format!("<td rowspan={}>", 60_000 - i))
+            .collect::<String>(),
+        "<tr><td>".repeat(50_000)
+    );
+    for (html, css, n) in [
+        (&wide, ":nth-col(1)", 50_001),
+        (&mega, ":nth-last-col(1)", 1),
+        (&cols, "col || td", 30_000),
+        (&stack, ":nth-col(20001)", 40_000),
+    ] {
+        let doc = parse(html, false);
+        let list = SelectorList::parse(css).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(list.select(&doc, doc.root()).len(), n, "{css}");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "{css} took {took:?}"
+        );
+    }
 }
 
 #[test]
@@ -327,7 +436,6 @@ fn bad_selectors_are_errors() {
         ":has()",
         ":nope",
         ":lexbor-contains('x')",
-        "a || b",
         "[a=b c]",
         "[a!=b]",
     ] {

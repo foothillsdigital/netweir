@@ -1,0 +1,13 @@
+[package]
+name = "netweir-xpath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "XPath 1.0 over netweir-html's document tree."
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+netweir-html = { path = "../netweir-html" }
+stacker = "0.1"
