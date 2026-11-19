@@ -528,7 +528,7 @@ impl Document {
             }
             let tree = unsafe { self.tree_mut() };
             if tree.parent(n).is_some() {
-                tree.remove(n);
+                tree.detach(n);
                 self.mark_detached(n);
             }
             Ok(())
@@ -582,7 +582,7 @@ impl Document {
                 return invalid("a node can't be replaced with itself");
             }
             unsafe { self.link(parent, Some(n), with)? };
-            unsafe { self.tree_mut() }.remove(n);
+            unsafe { self.tree_mut() }.detach(n);
             self.mark_detached(n);
             Ok(())
         })
@@ -603,7 +603,7 @@ impl Document {
                 tree.insert_before(parent, child, Some(n))
                     .expect("a child moves to beside its parent");
             }
-            tree.remove(n);
+            tree.detach(n);
             self.mark_detached(n);
             Ok(())
         })
@@ -626,7 +626,7 @@ impl Document {
             let tree = unsafe { self.tree_mut() };
             let t = tree.create_text(text);
             while let Some(child) = tree.first_child(n) {
-                tree.remove(child);
+                tree.detach(child);
                 self.mark_detached(child);
             }
             tree.append(n, t).expect("an element takes text");

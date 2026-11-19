@@ -18,6 +18,9 @@ pub enum EditError {
     /// The node is a document or a fragment, such as the root or a
     /// template's contents, which is never anyone's child.
     NotInsertable,
+    /// A node was taken out with [`Document::remove`], so it can't be used
+    /// again. [`Document::detach`] takes one out to move it.
+    Removed,
 }
 
 impl std::fmt::Display for EditError {
@@ -28,6 +31,9 @@ impl std::fmt::Display for EditError {
             EditError::NotAChild => "the node to insert before isn't a child of the parent",
             EditError::NotInsertable => {
                 "a document or a fragment can't be inserted, only its children"
+            }
+            EditError::Removed => {
+                "the node was removed from its document, so it can't be used again"
             }
         })
     }
@@ -106,6 +112,12 @@ impl Document {
         child: NodeId,
         before: Option<NodeId>,
     ) -> Result<(), EditError> {
+        if self.is_removed(parent)
+            || self.is_removed(child)
+            || before.is_some_and(|b| self.is_removed(b))
+        {
+            return Err(EditError::Removed);
+        }
         if !matches!(
             self.nodes[parent as usize].data,
             Data::Element(_) | Data::Document | Data::Fragment
@@ -181,6 +193,9 @@ impl Document {
             if e.ns != Ns::Html || e.tag != Tag::Template || e.contents == NONE {
                 continue;
             }
+            if self.is_removed(id) {
+                continue;
+            }
             while let Some(child) = self.first_child(e.contents) {
                 self.detach(child);
                 self.insert(id, child, NONE);
@@ -188,10 +203,40 @@ impl Document {
         }
     }
 
-    /// Takes `id` out of the tree. It stays usable, and can be inserted
-    /// again.
+    /// Takes `id`, and everything in it, out of the document for good. From
+    /// then on each of their ids reads as nothing (see
+    /// [`Document::is_removed`]), editing one does nothing, and inserting
+    /// one, or anything into one, is [`EditError::Removed`]. A template's
+    /// contents go with it. To move a node, take it out with
+    /// [`Document::detach`] and insert it again. The root, and a template's
+    /// contents on their own, can't be removed: they're never anyone's
+    /// child.
     pub fn remove(&mut self, id: NodeId) {
+        if matches!(
+            self.nodes[id as usize].data,
+            Data::Document | Data::Fragment
+        ) || self.is_removed(id)
+        {
+            return;
+        }
         self.detach(id);
+        // By the links themselves: the readers say nothing of a node once
+        // it's marked.
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            self.mark_removed(n);
+            let node = &self.nodes[n as usize];
+            if let Data::Element(e) = &node.data
+                && e.contents != NONE
+            {
+                stack.push(e.contents);
+            }
+            let mut c = node.first_child;
+            while c != NONE {
+                stack.push(c);
+                c = self.nodes[c as usize].next;
+            }
+        }
     }
 
     /// Sets an attribute, replacing the first one of the same qualified name
@@ -199,6 +244,9 @@ impl Document {
     /// elements' attribute names are lowercased; SVG's and MathML's keep the
     /// case they're given.
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        if self.is_removed(id) {
+            return;
+        }
         let Some(e) = self.element(id) else { return };
         let ns = e.ns;
         let given = name;
@@ -226,6 +274,9 @@ impl Document {
     /// of the same name: for building XML, where the caller has already
     /// checked names.
     pub fn add_attr(&mut self, id: NodeId, ns: AttrNs, name: &str, value: &str) {
+        if self.is_removed(id) {
+            return;
+        }
         let name = self.push_stable(name);
         let value = self.push_stable(value);
         let attr = Attr { ns, name, value };
@@ -248,6 +299,9 @@ impl Document {
 
     /// Replaces all of the element's attributes at once.
     pub fn set_attrs(&mut self, id: NodeId, attrs: &[(AttrNs, &str, &str)]) {
+        if self.is_removed(id) {
+            return;
+        }
         if self.element(id).is_none() {
             return;
         }
@@ -269,6 +323,9 @@ impl Document {
     /// ordinary children, ahead of any it has, so its markup stays the same
     /// and nothing in them is lost.
     pub fn rename(&mut self, id: NodeId, name: &str) {
+        if self.is_removed(id) {
+            return;
+        }
         let Some(e) = self.element(id).copied() else {
             return;
         };
@@ -339,6 +396,9 @@ impl Document {
 
     /// Renames the element's `index`th attribute, and sets its namespace.
     pub fn rename_attr(&mut self, id: NodeId, index: usize, ns: AttrNs, name: &str) {
+        if self.is_removed(id) {
+            return;
+        }
         let name = self.push_stable(name);
         self.rewrite_attrs(id, |_, attrs| match attrs.get_mut(index) {
             Some(a) => {
@@ -352,6 +412,9 @@ impl Document {
 
     /// Removes the element's `index`th attribute; false if there's none.
     pub fn remove_attr_at(&mut self, id: NodeId, index: usize) -> bool {
+        if self.is_removed(id) {
+            return false;
+        }
         self.rewrite_attrs(id, |_, attrs| {
             if index < attrs.len() {
                 attrs.remove(index);
@@ -364,6 +427,9 @@ impl Document {
 
     /// Removes an attribute by name; false if there wasn't one.
     pub fn remove_attr(&mut self, id: NodeId, name: &str) -> bool {
+        if self.is_removed(id) {
+            return false;
+        }
         let Some(e) = self.element(id) else {
             return false;
         };
@@ -447,7 +513,7 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p><em>x &amp; y</em>a</p><p>b</p>");
         doc.append(second, em).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
-        doc.remove(second);
+        doc.detach(second);
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
@@ -480,7 +546,8 @@ mod tests {
                     let before = doc.first_child(a);
                     let _ = doc.insert_before(a, b, before);
                 }
-                2 => doc.remove(b),
+                2 if i % 2 == 0 => doc.remove(b),
+                2 => doc.detach(b),
                 3 => doc.rename(a, if i % 2 == 0 { "template" } else { "span" }),
                 4 => {
                     let t = doc.create_element(Ns::Html, "template");
@@ -810,5 +877,140 @@ mod tests {
             doc.inner_html(0)
                 .contains("<linearGradient gradientUnits=\"u\"></linearGradient>")
         );
+    }
+
+    /// The `<p id=a>` in `<div><p id=a>one <b>two</b></p><p id=b>three</p></div>`,
+    /// its `<b>` and the `<b>`'s text.
+    fn removable() -> (crate::Document, NodeId, NodeId, NodeId) {
+        let doc = parse(
+            "<div><p id=a>one <b>two</b></p><p id=b>three</p></div>",
+            false,
+        );
+        let id = |name: &str| {
+            (0..doc.len() as NodeId)
+                .find(|&n| doc.lower_name(n) == Some(name))
+                .unwrap()
+        };
+        let (p, b) = (id("p"), id("b"));
+        let text = doc.first_child(b).unwrap();
+        (doc, p, b, text)
+    }
+
+    #[test]
+    fn a_removed_node_reads_as_nothing() {
+        let (mut doc, p, _, _) = removable();
+        let div = doc.parent(p).unwrap();
+        doc.remove(p);
+        assert!(doc.is_removed(p));
+        assert_eq!(doc.outer_html(div), "<div><p id=\"b\">three</p></div>");
+        assert_eq!(doc.parent(p), None);
+        assert_eq!(doc.first_child(p), None);
+        assert_eq!(doc.children(p).count(), 0);
+        assert_eq!(doc.attrs(p).count(), 0);
+        assert_eq!(doc.attrs_written(p).count(), 0);
+        assert_eq!(doc.lower_name(p), None);
+        assert_eq!(doc.known_tag(p), None);
+        assert_eq!(doc.outer_html(p), "");
+        assert_eq!(doc.inner_html(p), "");
+        assert_eq!(doc.html_alone(p), "");
+        assert_eq!(doc.text(p), "");
+        // Its kind stays, an element's name with it.
+        assert!(matches!(
+            doc.kind(p),
+            crate::Kind::Element { name: "p", .. }
+        ));
+        // Removing it again, or the root, does nothing.
+        doc.remove(p);
+        doc.remove(doc.root());
+        assert!(!doc.is_removed(doc.root()));
+    }
+
+    #[test]
+    fn a_removed_node_cant_be_edited_or_inserted() {
+        let (mut doc, p, _, _) = removable();
+        let div = doc.parent(p).unwrap();
+        let other = doc.next_sibling(p).unwrap();
+        doc.remove(p);
+        assert_eq!(doc.append(div, p), Err(EditError::Removed));
+        let fresh = doc.create_element(Ns::Html, "span");
+        assert_eq!(doc.append(p, fresh), Err(EditError::Removed));
+        assert_eq!(
+            doc.insert_before(div, fresh, Some(p)),
+            Err(EditError::Removed)
+        );
+        // The setters, which return nothing to fail with, do nothing.
+        doc.set_attr(p, "class", "x");
+        doc.rename(p, "section");
+        assert!(!doc.remove_attr(p, "id"));
+        assert_eq!(doc.attrs(p).count(), 0);
+        assert!(matches!(
+            doc.kind(p),
+            crate::Kind::Element { name: "p", .. }
+        ));
+        // Nothing else was touched.
+        doc.append(div, fresh).unwrap();
+        assert_eq!(
+            doc.outer_html(div),
+            "<div><p id=\"b\">three</p><span></span></div>"
+        );
+        assert_eq!(doc.text(other), "three");
+    }
+
+    #[test]
+    fn removing_a_parent_removes_what_it_holds() {
+        let (mut doc, p, b, text) = removable();
+        doc.remove(p);
+        for n in [b, text] {
+            assert!(doc.is_removed(n), "node {n}");
+            assert_eq!(doc.parent(n), None);
+            assert_eq!(doc.outer_html(n), "");
+        }
+        assert!(matches!(doc.kind(text), crate::Kind::Text("")));
+        assert_eq!(doc.append(doc.root(), b), Err(EditError::Removed));
+    }
+
+    #[test]
+    fn a_detached_node_can_be_inserted_again() {
+        let (mut doc, p, b, _) = removable();
+        let div = doc.parent(p).unwrap();
+        doc.detach(p);
+        assert!(!doc.is_removed(p));
+        assert_eq!(doc.outer_html(div), "<div><p id=\"b\">three</p></div>");
+        assert_eq!(doc.outer_html(p), "<p id=\"a\">one <b>two</b></p>");
+        assert_eq!(doc.parent(b), Some(p));
+        doc.append(div, p).unwrap();
+        assert_eq!(
+            doc.outer_html(div),
+            "<div><p id=\"b\">three</p><p id=\"a\">one <b>two</b></p></div>"
+        );
+    }
+
+    #[test]
+    fn a_removed_templates_contents_go_with_it() {
+        let mut doc = parse("<template><i>x</i></template>", false);
+        let template = (0..doc.len() as NodeId)
+            .find(|&n| doc.lower_name(n) == Some("template"))
+            .unwrap();
+        let contents = doc.template_contents(template).unwrap();
+        let i = doc.first_child(contents).unwrap();
+        doc.remove(template);
+        assert!(doc.is_removed(contents) && doc.is_removed(i));
+        assert_eq!(doc.template_contents(template), None);
+        doc.check_tree();
+    }
+
+    #[test]
+    fn a_removed_node_matches_no_selector() {
+        let (mut doc, p, b, _) = removable();
+        let list = crate::css::SelectorList::parse("p, b, #a").unwrap();
+        assert!(list.matches(&doc, p, None));
+        doc.remove(p);
+        assert!(!list.matches(&doc, p, None));
+        assert!(!list.matches(&doc, b, None));
+        assert_eq!(list.select(&doc, p), Vec::<NodeId>::new());
+        // From the root, only the paragraph that wasn't removed is left.
+        let left = list.select(&doc, doc.root());
+        assert_eq!(left.len(), 1);
+        assert_eq!(doc.outer_html(left[0]), "<p id=\"b\">three</p>");
     }
 }

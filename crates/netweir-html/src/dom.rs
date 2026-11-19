@@ -147,6 +147,9 @@ pub struct Document {
     pub(crate) hosts: Option<std::collections::HashMap<NodeId, NodeId>>,
     /// The parse errors, when the parse was asked to collect them.
     pub(crate) errors: Vec<crate::SyntaxError>,
+    /// A bit per node taken out with [`Document::remove`]. A slot is never
+    /// reused, so a removed id stays removed. Empty until a remove.
+    pub(crate) dead: Vec<u64>,
 }
 
 /// A node or attribute with no recorded position.
@@ -238,6 +241,7 @@ impl Document {
             positions: None,
             hosts: None,
             errors: Vec::new(),
+            dead: Vec::new(),
         }
     }
 
@@ -337,6 +341,9 @@ impl Document {
     /// and for every node unless the document was parsed with
     /// [`Options::spans`](crate::Options::spans) on.
     pub fn span(&self, id: NodeId) -> Option<std::ops::Range<usize>> {
+        if self.is_removed(id) {
+            return None;
+        }
         let p = self.positions.as_deref()?;
         Positions::get(&p.nodes, id as usize).map(|at| p.range(at))
     }
@@ -344,6 +351,9 @@ impl Document {
     /// Where an element's end tag was written, when it had one: the end
     /// tag whose handling closed it, `</p>` for a `<p>`, or a `</body>`.
     pub fn end_span(&self, id: NodeId) -> Option<std::ops::Range<usize>> {
+        if self.is_removed(id) {
+            return None;
+        }
         let p = self.positions.as_deref()?;
         Positions::get(&p.ends, id as usize).map(|at| p.range(at))
     }
@@ -354,6 +364,9 @@ impl Document {
     /// no value. An attribute an edit set has none; a reopened formatting
     /// element's are where the original's were written.
     pub fn attr_span(&self, id: NodeId, i: usize) -> Option<std::ops::Range<usize>> {
+        if self.is_removed(id) {
+            return None;
+        }
         let p = self.positions.as_deref()?;
         let e = self.element(id)?;
         let at = e.attrs.start as usize + i;
@@ -473,7 +486,10 @@ impl Document {
         debug_assert!(self.links_agree(child), "links around node {child}");
     }
 
-    pub(crate) fn detach(&mut self, child: NodeId) {
+    /// Takes `child` out of the tree, still usable: insert it again to move
+    /// it, subtree and all. To be done with a node for good, use
+    /// [`Document::remove`], after which its id reads as nothing.
+    pub fn detach(&mut self, child: NodeId) {
         let Node {
             parent, prev, next, ..
         } = self.nodes[child as usize];
@@ -610,6 +626,11 @@ impl Document {
                 );
             }
             assert!(self.links_agree(id), "links around node {id}");
+            assert!(
+                !self.is_removed(id) || n.parent == NONE || self.is_removed(n.parent),
+                "removed node {id} is under {}, which isn't",
+                n.parent
+            );
             assert_eq!(
                 n.first_child == NONE,
                 n.last_child == NONE,
@@ -757,22 +778,37 @@ impl Document {
     }
 
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        if self.is_removed(id) {
+            return None;
+        }
         Some(self.nodes[id as usize].parent).filter(|&p| p != NONE)
     }
 
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
+        if self.is_removed(id) {
+            return None;
+        }
         Some(self.nodes[id as usize].first_child).filter(|&c| c != NONE)
     }
 
     pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
+        if self.is_removed(id) {
+            return None;
+        }
         Some(self.nodes[id as usize].prev).filter(|&c| c != NONE)
     }
 
     pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
+        if self.is_removed(id) {
+            return None;
+        }
         Some(self.nodes[id as usize].last_child).filter(|&c| c != NONE)
     }
 
     pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
+        if self.is_removed(id) {
+            return None;
+        }
         Some(self.nodes[id as usize].next).filter(|&c| c != NONE)
     }
 
@@ -782,10 +818,51 @@ impl Document {
 
     /// A template element's contents.
     pub fn template_contents(&self, id: NodeId) -> Option<NodeId> {
+        if self.is_removed(id) {
+            return None;
+        }
         self.element(id).map(|e| e.contents).filter(|&c| c != NONE)
     }
 
+    /// Whether `id` was taken out with [`Document::remove`], or was inside
+    /// a node that was. A removed node reads as nothing: the readers that
+    /// return an `Option` give `None`, it has no children, attributes or
+    /// text, it serializes to `""`, it matches no selector, and inserting
+    /// it, or anything into it, is an error.
+    pub fn is_removed(&self, id: NodeId) -> bool {
+        self.dead
+            .get(id as usize / 64)
+            .is_some_and(|w| w >> (id % 64) & 1 == 1)
+    }
+
+    pub(crate) fn mark_removed(&mut self, id: NodeId) {
+        let word = id as usize / 64;
+        if self.dead.len() <= word {
+            self.dead.resize(word + 1, 0);
+        }
+        self.dead[word] |= 1 << (id % 64);
+    }
+
+    /// What `id` is. A removed node keeps its kind and an element its
+    /// name, but its text, a comment's, and a processing instruction's
+    /// data read as empty, as it has no children or attributes.
     pub fn kind(&self, id: NodeId) -> Kind<'_> {
+        let kind = self.kind_of(id);
+        if !self.is_removed(id) {
+            return kind;
+        }
+        match kind {
+            Kind::Text(_) => Kind::Text(""),
+            Kind::Comment(_) => Kind::Comment(""),
+            Kind::Cdata(_) => Kind::Cdata(""),
+            Kind::ProcessingInstruction { target, .. } => {
+                Kind::ProcessingInstruction { target, data: "" }
+            }
+            other => other,
+        }
+    }
+
+    fn kind_of(&self, id: NodeId) -> Kind<'_> {
         match &self.nodes[id as usize].data {
             Data::Document => Kind::Document,
             Data::Fragment => Kind::Fragment,
@@ -815,7 +892,12 @@ impl Document {
     /// An element's attributes, in source order, as (namespace, local name,
     /// value).
     pub fn attrs(&self, id: NodeId) -> impl Iterator<Item = (AttrNs, &str, &str)> + '_ {
-        self.attrs_of(id).iter().map(|a| {
+        let attrs = if self.is_removed(id) {
+            &[][..]
+        } else {
+            self.attrs_of(id)
+        };
+        attrs.iter().map(|a| {
             let name = self.str(a.name);
             let name = match a.ns {
                 AttrNs::XLink | AttrNs::Xml | AttrNs::Xmlns => {
@@ -831,7 +913,12 @@ impl Document {
     /// rather than `href`, and an XML attribute's prefix kept.
     pub fn attrs_written(&self, id: NodeId) -> impl Iterator<Item = (AttrNs, &str, &str)> + '_ {
         let ns = self.element(id).map_or(Ns::Html, |e| e.ns);
-        self.attrs_of(id)
+        let attrs = if self.is_removed(id) {
+            &[][..]
+        } else {
+            self.attrs_of(id)
+        };
+        attrs
             .iter()
             .map(move |a| (a.ns, self.written_name(ns, a), self.str(a.value)))
     }
@@ -860,6 +947,9 @@ impl Document {
     /// and so is a foreign element made under a name in another case
     /// (`LINEARGRADIENT`), which the DOM treats as a different element.
     pub fn lower_name(&self, id: NodeId) -> Option<&str> {
+        if self.is_removed(id) {
+            return None;
+        }
         let e = self.element(id)?;
         Some(match e.name {
             Name::Tag => e.tag.name(),
@@ -873,6 +963,9 @@ impl Document {
     /// elements alike get one, so an SVG `<title>` shares HTML `title`'s;
     /// an XML element never does.
     pub fn known_tag(&self, id: NodeId) -> Option<u8> {
+        if self.is_removed(id) {
+            return None;
+        }
         self.element(id)
             .filter(|e| e.tag != Tag::Other && e.ns != Ns::Xml)
             .map(|e| e.tag as u8)

@@ -335,6 +335,9 @@ impl Document {
 
     fn serialize(&self, id: NodeId, flags: u8, o: &SerializeOptions) -> String {
         let mut out = String::new();
+        if self.is_removed(id) {
+            return out;
+        }
         if flags & INNER != 0
             && !matches!(
                 self.nodes[id as usize].data,
@@ -831,6 +834,9 @@ impl Document {
     /// it gives an empty string.
     pub fn html_alone(&self, id: NodeId) -> String {
         let mut out = String::new();
+        if self.is_removed(id) {
+            return out;
+        }
         match &self.nodes[id as usize].data {
             Data::Element(e) => self.start_tag::<true>(id, e, &DEFAULT, &mut out),
             Data::Document | Data::Fragment => {}
@@ -962,6 +968,9 @@ impl Document {
     /// `textContent` gives it.
     pub fn text(&self, id: NodeId) -> String {
         let mut out = String::new();
+        if self.is_removed(id) {
+            return out;
+        }
         let mut stack = vec![id];
         while let Some(n) = stack.pop() {
             if let Kind::Text(t) = self.kind(n) {

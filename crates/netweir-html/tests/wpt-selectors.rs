@@ -193,7 +193,7 @@ fn contexts() -> Vec<Context> {
     // taken out of its own document.
     let fragment = parse_fragment(&doc.outer_html(root), Ns::Html, "body", false);
     let (mut detached_doc, detached) = content();
-    detached_doc.remove(detached);
+    detached_doc.detach(detached);
 
     vec![
         Context {
