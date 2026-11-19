@@ -1,0 +1,691 @@
+#data
+<div id="host"><template shadowrootmode="open"><slot id="s1" name="slot1"></slot></template><div id="c1" slot="slot1"></div></div>
+#description
+declarative-shadow-dom-basic.html: Basic test
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       id="host"
+|       #shadow-root (open)
+|         <slot>
+|           id="s1"
+|           name="slot1"
+|       <div>
+|         id="c1"
+|         slot="slot1"
+
+#data
+<div id="host"><template shadowrootmode="invalid"></template></div>
+#description
+declarative-shadow-dom-basic.html: Invalid shadowrootmode (setHTMLUnsafe)
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <div>
+|   id="host"
+|   <template>
+|     shadowrootmode="invalid"
+|     content
+
+#data
+<div id="host"><template shadowrootmode="closed"></template></div>
+#description
+declarative-shadow-dom-basic.html: Closed shadow root (setHTMLUnsafe)
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <div>
+|   id="host"
+|   #shadow-root (closed)
+
+#data
+<div id="host"><template shadowrootmode="open"><slot id="s1" name="slot1"></slot></template><div id="c1" slot="slot1"></div></div>
+#description
+declarative-shadow-dom-basic.html: Basic test (setHTMLUnsafe)
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <div>
+|   id="host"
+|   #shadow-root (open)
+|     <slot>
+|       id="s1"
+|       name="slot1"
+|   <div>
+|     id="c1"
+|     slot="slot1"
+
+#data
+<div id="host"><template shadowrootmode="open" shadowrootdelegatesfocus></template></div><div id="host2"><template shadowrootmode="open"></template></div>
+#description
+declarative-shadow-dom-basic.html: delegatesfocus attribute
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <div>
+|   id="host"
+|   #shadow-root (open delegatesfocus)
+| <div>
+|   id="host2"
+|   #shadow-root (open)
+
+#data
+<div id="host"><template shadowrootmode="open" shadowrootclonable></template></div><div id="host2"><template shadowrootmode="open"></template></div>
+#description
+declarative-shadow-dom-basic.html: clonable attribute
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <div>
+|   id="host"
+|   #shadow-root (open clonable)
+| <div>
+|   id="host2"
+|   #shadow-root (open)
+
+#data
+<div id="multi-host" style="display:none">
+  <template shadowrootmode="open">
+    <span>root 1</span>
+  </template>
+  <template shadowrootmode="closed">
+    <span>root 2</span>
+  </template>
+</div>
+#description
+declarative-shadow-dom-basic.html: Multiple roots
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       id="multi-host"
+|       style="display:none"
+|       #shadow-root (open)
+|         "
+    "
+|         <span>
+|           "root 1"
+|         "
+  "
+|       "
+  
+  "
+|       <template>
+|         shadowrootmode="closed"
+|         content
+|           "
+    "
+|           <span>
+|             "root 2"
+|           "
+  "
+|       "
+"
+
+#data
+<template id="template-containing-shadow">
+  <div class="innerdiv">
+    <template shadowrootmode=open shadowrootclonable>Content</template>
+  </div>
+</template>
+#description
+declarative-shadow-dom-basic.html: template containing declarative shadow root
+#document
+| <html>
+|   <head>
+|     <template>
+|       id="template-containing-shadow"
+|       content
+|         "
+  "
+|         <div>
+|           class="innerdiv"
+|           #shadow-root (open clonable)
+|             "Content"
+|           "
+    
+  "
+|         "
+"
+|   <body>
+
+#data
+<template id="template-containing-deep-shadow">
+  <div><div><div><div><div>
+    <div class="innerdiv">
+      <template shadowrootmode=open shadowrootclonable>Content</template>
+    </div>
+  </div></div></div></div></div>
+</template>
+#description
+declarative-shadow-dom-basic.html: template containing (deeply nested) declarative shadow root
+#document
+| <html>
+|   <head>
+|     <template>
+|       id="template-containing-deep-shadow"
+|       content
+|         "
+  "
+|         <div>
+|           <div>
+|             <div>
+|               <div>
+|                 <div>
+|                   "
+    "
+|                   <div>
+|                     class="innerdiv"
+|                     #shadow-root (open clonable)
+|                       "Content"
+|                     "
+      
+    "
+|                   "
+  "
+|         "
+"
+|   <body>
+
+#data
+<template id="template-containing-template">
+  <div>
+    <template id="inner-template">
+      <div class="innerdiv">
+        <template shadowrootmode=open shadowrootclonable>Content</template>
+      </div>
+    </template>
+  </div>
+</template>
+#description
+declarative-shadow-dom-basic.html: template containing a template containing declarative shadow root
+#document
+| <html>
+|   <head>
+|     <template>
+|       id="template-containing-template"
+|       content
+|         "
+  "
+|         <div>
+|           "
+    "
+|           <template>
+|             id="inner-template"
+|             content
+|               "
+      "
+|               <div>
+|                 class="innerdiv"
+|                 #shadow-root (open clonable)
+|                   "Content"
+|                 "
+        
+      "
+|               "
+    "
+|           "
+  "
+|         "
+"
+|   <body>
+
+#data
+<template id="template-containing-ua-shadow">
+  <div class="innerdiv">
+    <template shadowrootmode=open shadowrootclonable>
+      <video></video> <!--Assumed to have UA shadow root-->
+    </template>
+  </div>
+</template>
+#description
+declarative-shadow-dom-basic.html: template containing declarative shadow root and UA shadow root
+#document
+| <html>
+|   <head>
+|     <template>
+|       id="template-containing-ua-shadow"
+|       content
+|         "
+  "
+|         <div>
+|           class="innerdiv"
+|           #shadow-root (open clonable)
+|             "
+      "
+|             <video>
+|             " "
+|             <!-- Assumed to have UA shadow root -->
+|             "
+    "
+|           "
+    
+  "
+|         "
+"
+|   <body>
+
+#data
+<template id="template-containing-ua-shadow-closed">
+  <div class="innerdiv">
+    <template shadowrootmode=closed>
+      <video></video> <!--Assumed to have UA shadow root-->
+    </template>
+  </div>
+</template>
+#description
+declarative-shadow-dom-basic.html: template containing closed declarative shadow root and UA shadow root
+#document
+| <html>
+|   <head>
+|     <template>
+|       id="template-containing-ua-shadow-closed"
+|       content
+|         "
+  "
+|         <div>
+|           class="innerdiv"
+|           #shadow-root (closed)
+|             "
+      "
+|             <video>
+|             " "
+|             <!-- Assumed to have UA shadow root -->
+|             "
+    "
+|           "
+    
+  "
+|         "
+"
+|   <body>
+
+#data
+<template id="root-element-shadow">
+    <template shadowrootmode=open>Content</template>
+</template>
+#description
+declarative-shadow-dom-basic.html: declarative shadow roots are not supported by the template element
+#document
+| <html>
+|   <head>
+|     <template>
+|       id="root-element-shadow"
+|       content
+|         "
+    "
+|         <template>
+|           shadowrootmode="open"
+|           content
+|             "Content"
+|         "
+"
+|   <body>
+
+#data
+<progress id="invalid-element-exception">
+  <template shadowrootmode=open>Content</template>
+</progress>
+#description
+declarative-shadow-dom-basic.html: explicit test that exceptions are not thrown
+#document
+| <html>
+|   <head>
+|   <body>
+|     <progress>
+|       id="invalid-element-exception"
+|       "
+  "
+|       <template>
+|         shadowrootmode="open"
+|         content
+|           "Content"
+|       "
+"
+
+#data
+<progress><template shadowrootmode=open></template></progress>
+#description
+declarative-shadow-dom-basic.html: explicit test that exceptions are not thrown (setHTMLUnsafe)
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <progress>
+|   <template>
+|     shadowrootmode="open"
+|     content
+
+#data
+<div id=multiple1>
+  <template shadowrootmode=open>Open</template>
+  <template shadowrootmode=closed>Closed</template>
+</div>
+
+<div id=multiple2>
+  <template shadowrootmode=closed>Closed</template>
+  <template shadowrootmode=open>Open</template>
+</div>
+
+<div id=open2>
+  <template shadowrootmode=open shadowrootdelegatesfocus shadowrootclonable shadowrootserializable>
+    Open, delegates focus (not the default), clonable (not the default)
+    serializable (not the default), named slot assignment (the default)
+  </template>
+</div>
+#description
+declarative-shadow-dom-repeats.html: repeated declarative shadow roots keep only the first; the flags
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       id="multiple1"
+|       #shadow-root (open)
+|         "Open"
+|       "
+  
+  "
+|       <template>
+|         shadowrootmode="closed"
+|         content
+|           "Closed"
+|       "
+"
+|     "
+
+"
+|     <div>
+|       id="multiple2"
+|       #shadow-root (closed)
+|         "Closed"
+|       "
+  
+  "
+|       <template>
+|         shadowrootmode="open"
+|         content
+|           "Open"
+|       "
+"
+|     "
+
+"
+|     <div>
+|       id="open2"
+|       #shadow-root (open delegatesfocus clonable serializable)
+|         "
+    Open, delegates focus (not the default), clonable (not the default)
+    serializable (not the default), named slot assignment (the default)
+  "
+|       "
+  
+"
+
+#data
+<div id=multiple1>
+  <template shadowrootmode=open>1</template>
+  <template shadowrootmode=open>2</template>
+  <template shadowrootmode=open>3</template>
+</div>
+
+<div id=multiple2>
+  <template shadowrootmode=closed>1</template>
+  <template shadowrootmode=closed>2</template>
+  <template shadowrootmode=open>3</template>
+</div>
+#description
+declarative-shadow-dom-repeats-2.html: Repeated declarative shadow roots keep only the first
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       id="multiple1"
+|       #shadow-root (open)
+|         "1"
+|       "
+  
+  "
+|       <template>
+|         shadowrootmode="open"
+|         content
+|           "2"
+|       "
+  "
+|       <template>
+|         shadowrootmode="open"
+|         content
+|           "3"
+|       "
+"
+|     "
+
+"
+|     <div>
+|       id="multiple2"
+|       #shadow-root (closed)
+|         "1"
+|       "
+  
+  "
+|       <template>
+|         shadowrootmode="closed"
+|         content
+|           "2"
+|       "
+  "
+|       <template>
+|         shadowrootmode="open"
+|         content
+|           "3"
+|       "
+"
+
+#data
+<div id="host"><template shadowrootmode="open" shadowrootslotassignment="manual"></template></div><div id="host"><template shadowrootmode="open" shadowrootslotassignment="named"></template></div><div id="host"><template shadowrootmode="open" shadowrootslotassignment="MANUAL"></template></div><div id="host"><template shadowrootmode="open" shadowrootslotassignment="invalid"></template></div>
+#description
+declarative-shadow-dom-slot-assignment.html: shadowrootslotassignment manual, named, case and invalid
+#document-fragment
+div
+#shadow-roots
+on
+#document
+| <div>
+|   id="host"
+|   #shadow-root (open manual)
+| <div>
+|   id="host"
+|   #shadow-root (open)
+| <div>
+|   id="host"
+|   #shadow-root (open manual)
+| <div>
+|   id="host"
+|   #shadow-root (open)
+
+#data
+<div id=mainpage style="display:none">
+  <div class=wrapper>
+    <div class=host>
+      <template shadowrootmode=open>
+        <span class=content>Content</span>
+      </template>
+    </div>
+  </div>
+</div>
+#description
+declarative-shadow-dom-opt-in.html: Non-fragment parsing needs no opt-in
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       id="mainpage"
+|       style="display:none"
+|       "
+  "
+|       <div>
+|         class="wrapper"
+|         "
+    "
+|         <div>
+|           class="host"
+|           #shadow-root (open)
+|             "
+        "
+|             <span>
+|               class="content"
+|               "Content"
+|             "
+      "
+|           "
+      
+    "
+|         "
+  "
+|       "
+"
+
+#data
+  <html><body>
+  <div class=wrapper>
+    <div class=host>
+      <template shadowrootmode=open>
+        <span class=content>Content</span>
+      </template>
+    </div>
+  </div>
+  </body></html>
+#description
+declarative-shadow-dom-opt-in.html: innerHTML on a <div>
+#document-fragment
+div
+#document
+| "  
+  "
+| <div>
+|   class="wrapper"
+|   "
+    "
+|   <div>
+|     class="host"
+|     "
+      "
+|     <template>
+|       shadowrootmode="open"
+|       content
+|         "
+        "
+|         <span>
+|           class="content"
+|           "Content"
+|         "
+      "
+|     "
+    "
+|   "
+  "
+| "
+  "
+
+#data
+  <html><body>
+  <div class=wrapper>
+    <div class=host>
+      <template shadowrootmode=open>
+        <span class=content>Content</span>
+      </template>
+    </div>
+  </div>
+  </body></html>
+#description
+declarative-shadow-dom-opt-in.html: DOMParser (includeShadowRoots is historical)
+#shadow-roots
+off
+#document
+| <html>
+|   <head>
+|   <body>
+|     "
+  "
+|     <div>
+|       class="wrapper"
+|       "
+    "
+|       <div>
+|         class="host"
+|         "
+      "
+|         <template>
+|           shadowrootmode="open"
+|           content
+|             "
+        "
+|             <span>
+|               class="content"
+|               "Content"
+|             "
+      "
+|         "
+    "
+|       "
+  "
+|     "
+  "
+
+#data
+  <html><body>
+  <div class=wrapper>
+    <div class=host>
+      <template shadowrootmode=open>
+        <span class=content>Content</span>
+      </template>
+    </div>
+  </div>
+  </body></html>
+#description
+declarative-shadow-dom-opt-in.html: insertAdjacentHTML on element - not supported
+#document-fragment
+div
+#document
+| "  
+  "
+| <div>
+|   class="wrapper"
+|   "
+    "
+|   <div>
+|     class="host"
+|     "
+      "
+|     <template>
+|       shadowrootmode="open"
+|       content
+|         "
+        "
+|         <span>
+|           class="content"
+|           "Content"
+|         "
+      "
+|     "
+    "
+|   "
+  "
+| "
+  "

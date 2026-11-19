@@ -1,6 +1,13 @@
 //! Changing a parsed document: new nodes, moves, removals and attributes.
 //! A removed node stays in the document's arena, detached, and can be
 //! inserted again.
+//!
+//! A shadow root is edited as a template's contents are: nodes go in and
+//! out of it like any parent, but it's never anyone's child
+//! ([`EditError::NotInsertable`]), and a host can't go into its own shadow
+//! tree ([`EditError::Cycle`]). A host keeps its shadow root when it's
+//! removed, moved or renamed, as an element keeps it in the DOM; a root
+//! is made with [`Document::attach_shadow`] and never taken away.
 
 use crate::dom::{Attr, AttrNs, Data, Document, Element, NONE, Name, NodeId, Ns, Span};
 use crate::tags::Tag;
@@ -15,12 +22,16 @@ pub enum EditError {
     NotAParent,
     /// `before` isn't a child of the parent.
     NotAChild,
-    /// The node is a document or a fragment, such as the root or a
-    /// template's contents, which is never anyone's child.
+    /// The node is a document, a fragment or a shadow root, such as the
+    /// root or a template's contents, which is never anyone's child.
     NotInsertable,
     /// A node was taken out with [`Document::remove`], so it can't be used
     /// again. [`Document::detach`] takes one out to move it.
     Removed,
+    /// The element can't have a shadow root: it already has one, or it
+    /// isn't an HTML element that may (`div`, `span`, `section`, a
+    /// custom element...).
+    NotAShadowHost,
 }
 
 impl std::fmt::Display for EditError {
@@ -30,11 +41,12 @@ impl std::fmt::Display for EditError {
             EditError::NotAParent => "only an element, a document or a fragment can have children",
             EditError::NotAChild => "the node to insert before isn't a child of the parent",
             EditError::NotInsertable => {
-                "a document or a fragment can't be inserted, only its children"
+                "a document, fragment or shadow root can't be inserted, only its children"
             }
             EditError::Removed => {
                 "the node was removed from its document, so it can't be used again"
             }
+            EditError::NotAShadowHost => "the element can't have a shadow root, or has one",
         })
     }
 }
@@ -120,7 +132,7 @@ impl Document {
         }
         if !matches!(
             self.nodes[parent as usize].data,
-            Data::Element(_) | Data::Document | Data::Fragment
+            Data::Element(_) | Data::Document | Data::Fragment | Data::ShadowRoot { .. }
         ) {
             return Err(EditError::NotAParent);
         }
@@ -128,7 +140,7 @@ impl Document {
         // contents, would otherwise end up under a detached element.
         if matches!(
             self.nodes[child as usize].data,
-            Data::Document | Data::Fragment
+            Data::Document | Data::Fragment | Data::ShadowRoot { .. }
         ) {
             return Err(EditError::NotInsertable);
         }
@@ -138,8 +150,9 @@ impl Document {
             return Err(EditError::NotAChild);
         }
         // Up through the parents, and out of a template's contents to the
-        // template: serializing goes down into them, so a template put in
-        // its own contents would never end.
+        // template and out of a shadow root to its host: serializing goes
+        // down into both, so a template put in its own contents, or a host
+        // in its own shadow tree, would never end.
         let mut at = Some(parent);
         while let Some(a) = at {
             if a == child {
@@ -159,6 +172,9 @@ impl Document {
     /// is built once, then kept as edits add and rename templates, so a
     /// run of inserts into contents stays linear.
     fn host(&mut self, fragment: NodeId) -> Option<NodeId> {
+        if let Data::ShadowRoot { host, .. } = self.nodes[fragment as usize].data {
+            return Some(host);
+        }
         if !matches!(self.nodes[fragment as usize].data, Data::Fragment) {
             return None;
         }
@@ -207,14 +223,14 @@ impl Document {
     /// then on each of their ids reads as nothing (see
     /// [`Document::is_removed`]), editing one does nothing, and inserting
     /// one, or anything into one, is [`EditError::Removed`]. A template's
-    /// contents go with it. To move a node, take it out with
-    /// [`Document::detach`] and insert it again. The root, and a template's
-    /// contents on their own, can't be removed: they're never anyone's
-    /// child.
+    /// contents go with it, and so does a shadow host's shadow tree. To move
+    /// a node, take it out with [`Document::detach`] and insert it again.
+    /// The root, a template's contents or a shadow root on its own can't be
+    /// removed: they're never anyone's child.
     pub fn remove(&mut self, id: NodeId) {
         if matches!(
             self.nodes[id as usize].data,
-            Data::Document | Data::Fragment
+            Data::Document | Data::Fragment | Data::ShadowRoot { .. }
         ) || self.is_removed(id)
         {
             return;
@@ -230,6 +246,11 @@ impl Document {
                 && e.contents != NONE
             {
                 stack.push(e.contents);
+            }
+            // A shadow host's shadow tree goes with it, by the map: the
+            // reader says nothing once the host is marked.
+            if let Some(&shadow) = self.shadow_roots.get(&n) {
+                stack.push(shadow);
             }
             let mut c = node.first_child;
             while c != NONE {
@@ -1021,5 +1042,40 @@ mod tests {
         let left = list.select(&doc, doc.root());
         assert_eq!(left.len(), 1);
         assert_eq!(doc.outer_html(left[0]), "<p id=\"b\">three</p>");
+    }
+
+    #[test]
+    fn a_removed_hosts_shadow_tree_goes_with_it() {
+        let mut doc = parse("<div id=host><span>light</span></div>", false);
+        let host = (0..doc.len() as NodeId)
+            .find(|&n| doc.lower_name(n) == Some("div"))
+            .unwrap();
+        let light = doc.first_child(host).unwrap();
+        let shadow = doc.attach_shadow(host, crate::ShadowRoot::open()).unwrap();
+        let slot = doc.create_element(Ns::Html, "slot");
+        doc.append(shadow, slot).unwrap();
+        assert_eq!(doc.assigned_nodes(slot), [light]);
+        doc.remove(host);
+        for n in [shadow, slot, light] {
+            assert!(doc.is_removed(n), "node {n}");
+        }
+        assert_eq!(doc.shadow_root(host), None);
+        assert_eq!(doc.shadow_host(shadow), None);
+        assert_eq!(doc.assigned_nodes(slot), Vec::<NodeId>::new());
+        assert_eq!(doc.flat_tree(host).count(), 0);
+        assert_eq!(
+            doc.attach_shadow(host, crate::ShadowRoot::open()),
+            Err(EditError::Removed)
+        );
+        // A shadow root on its own isn't removed, like a template's contents.
+        let mut doc = parse("<div></div>", false);
+        let host = (0..doc.len() as NodeId)
+            .find(|&n| doc.lower_name(n) == Some("div"))
+            .unwrap();
+        let shadow = doc.attach_shadow(host, crate::ShadowRoot::open()).unwrap();
+        doc.remove(shadow);
+        assert!(!doc.is_removed(shadow));
+        assert_eq!(doc.shadow_root(host), Some(shadow));
+        doc.check_tree();
     }
 }

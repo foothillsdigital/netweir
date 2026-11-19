@@ -40,8 +40,8 @@ fn skip_reason(name: &str) -> Option<&'static str> {
     let selector = name.rsplit(" | ").next().unwrap_or(name);
     if selector.contains("-*") {
         Some("class prefix selectors (.foo-*) are a tentative proposal in no spec")
-    } else if selector.contains(":host") || selector.contains(":has-slotted") {
-        Some(":host and :has-slotted need shadow trees, which a parser has none of")
+    } else if selector.contains(":has-slotted") {
+        Some(":has-slotted is a tentative proposal, with a grammar no spec defines yet")
     } else if selector.contains(":state(") {
         Some(":state() needs custom element states, which live in JavaScript")
     } else if selector.contains("#no-namespace |") {

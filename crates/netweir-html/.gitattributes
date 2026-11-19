@@ -1,3 +1,5 @@
 # The tree-construction cases are byte for byte what the parser is given,
 # CRs included, so a Windows checkout mustn't turn their LFs into CRLFs.
 tests/tree-construction/*.dat -text
+# So are the declarative shadow DOM cases, and the page they parse.
+tests/shadow-dom/* -text

@@ -14,6 +14,13 @@
 //! A query reads the document through an [`Index`], which its owner
 //! builds once per version of the tree. Functions beyond the core library
 //! come from the caller through [`Extensions`].
+//!
+//! Shadow roots are left out, as `document.evaluate` leaves them out: the
+//! XPath data model has no shadow trees, so the axes follow the node tree
+//! and never cross into a host's shadow root or out of one. A shadow tree
+//! is queried on its own by indexing its root as one of [`Index::build`]'s
+//! roots, where it's a root node as a template's contents are: `/` from
+//! inside it is the shadow root, and its host isn't an ancestor.
 
 mod eval;
 mod index;

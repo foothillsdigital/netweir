@@ -73,6 +73,46 @@ fn names(s: &[&str]) -> Vec<String> {
     s.iter().map(|s| s.to_string()).collect()
 }
 
+/// Queries over the document don't see a shadow tree, nor queries in a
+/// shadow tree the document; one indexed as a root is a tree of its own.
+#[test]
+fn shadow_trees_are_trees_of_their_own() {
+    let tree = html::parse(
+        "<div id=host><template shadowrootmode=open><p id=in>in</p></template><p id=out>out</p></div>",
+        false,
+    );
+    let host = (0..tree.len() as NodeId)
+        .find(|&n| tree.shadow_root(n).is_some())
+        .unwrap();
+    let root = tree.shadow_root(host).unwrap();
+    let index = Index::build(&tree, &[tree.root(), root]);
+    let ids = |context: NodeId, query: &str| -> Vec<String> {
+        let doc = Doc::html(&tree, &index);
+        match XPath::new(query)
+            .unwrap()
+            .evaluate(doc, context, &[], &[], &NoExtensions)
+            .unwrap()
+        {
+            Value::Nodes(items) => items
+                .iter()
+                .map(|i| match i {
+                    Item::Node(n) => tree
+                        .attrs(*n)
+                        .find(|a| a.1 == "id")
+                        .map_or("?".into(), |a| a.2.to_string()),
+                    _ => "?".into(),
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(ids(tree.root(), "//p"), ["out"]);
+    assert_eq!(ids(root, ".//p"), ["in"]);
+    let inner = tree.first_child(root).unwrap();
+    assert_eq!(ids(inner, "ancestor::*"), Vec::<String>::new());
+    assert_eq!(ids(inner, "//p"), ["in"]);
+}
+
 #[test]
 fn every_axis() {
     let p = Page::new(PAGE);

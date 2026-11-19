@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::dom::{AttrNs, Data, Document, NodeId, Ns, Quirks};
+use crate::dom::{AttrNs, Data, Document, NONE, NodeId, Ns, Quirks};
 use crate::pattern::Pattern;
 use crate::tags::Tag;
 
@@ -170,6 +170,15 @@ enum Pseudo {
     /// A pseudo-element, `::before` or `::part(x)`: valid in a selector, as
     /// a browser's querySelector has it, and never an element in the tree.
     Element,
+    /// `:host`, or `:host(<compound>)`: the shadow host, seen from inside
+    /// its shadow tree.
+    Host(Option<Box<Compound>>),
+    /// `:host-context(<compound>)`: the shadow host, when it or a
+    /// shadow-including ancestor matches.
+    HostContext(Box<Compound>),
+    /// `::slotted(<compound>)`, first in its compound: an element assigned
+    /// (after flattening) to a slot that the rest of the selector matches.
+    Slotted(Box<Compound>),
     /// `:heading` (empty) or `:heading(1, 3)`: an h1-h6 of a listed level.
     Heading(Vec<i64>),
     /// `:nth-col()` and `:nth-last-col()`: a table cell in a column at
@@ -192,6 +201,9 @@ struct Parser<'a> {
     depth: u32,
     /// Inside `:has()`, where Selectors 4 doesn't allow another `:has()`.
     in_has: bool,
+    /// Inside `:host()`, `:host-context()` or `::slotted()`, whose argument
+    /// is a compound: no combinator anywhere in it, `:not()`'s included.
+    compound_only: bool,
     opts: &'a ParseOptions<'a>,
 }
 
@@ -415,7 +427,7 @@ impl<'a> Parser<'a> {
             let has_element = compound
                 .0
                 .iter()
-                .any(|s| matches!(s, Simple::Pseudo(Pseudo::Element)));
+                .any(|s| matches!(s, Simple::Pseudo(Pseudo::Element | Pseudo::Slotted(_))));
             if let Some(last) = parts.last_mut() {
                 last.1 = pending;
             }
@@ -426,6 +438,11 @@ impl<'a> Parser<'a> {
             }
             if has_element {
                 return error("a pseudo-element must end the selector");
+            }
+            if self.compound_only && !relative {
+                return error(
+                    "only a compound selector can go in :host(), :host-context() or ::slotted()",
+                );
             }
             pending = match self.combinator() {
                 Some(c) => {
@@ -562,8 +579,17 @@ impl<'a> Parser<'a> {
                         return error("a pseudo-element can't go inside a pseudo-class");
                     }
                     self.pos += 2;
-                    after_element = Some(self.pseudo_element()?);
-                    simple.push(Simple::Pseudo(Pseudo::Element));
+                    match self.pseudo_element()? {
+                        // First, so matching finds it at once.
+                        Some(arg) => {
+                            simple.insert(0, Simple::Pseudo(Pseudo::Slotted(Box::new(arg))));
+                            after_element = Some(true);
+                        }
+                        None => {
+                            simple.push(Simple::Pseudo(Pseudo::Element));
+                            after_element = Some(false);
+                        }
+                    }
                 }
                 Some(':') => {
                     self.pos += 1;
@@ -722,9 +748,9 @@ impl<'a> Parser<'a> {
 
     /// A pseudo-element, after its `::`: the ones CSS defines, with
     /// `::part()`, `::slotted()` and `::highlight()` taking their argument.
-    /// Anything else, `::text` included, is an error. True for `::slotted()`,
-    /// which nothing but another pseudo-element may follow.
-    fn pseudo_element(&mut self) -> Result<bool, SelectorError> {
+    /// Anything else, `::text` included, is an error. `::slotted()` gives
+    /// its argument; nothing but another pseudo-element may follow it.
+    fn pseudo_element(&mut self) -> Result<Option<Compound>, SelectorError> {
         let name = self.ident()?.to_ascii_lowercase();
         if self.eat('(') {
             self.skip_space();
@@ -737,10 +763,12 @@ impl<'a> Parser<'a> {
                 }
                 "slotted" => {
                     // Its compound can't hold a pseudo-element either.
-                    self.depth += 1;
-                    let compound = self.compound();
-                    self.depth -= 1;
-                    compound?;
+                    let compound = self.compound_argument()?;
+                    self.skip_space();
+                    if !self.eat(')') && !self.at_end() {
+                        return error("::slotted() without its )");
+                    }
+                    return Ok(Some(compound));
                 }
                 "highlight" => {
                     self.ident()?;
@@ -751,7 +779,7 @@ impl<'a> Parser<'a> {
             if !self.eat(')') && !self.at_end() {
                 return error(format!("::{name}() without its )"));
             }
-            return Ok(name == "slotted");
+            return Ok(None);
         }
         match name.as_str() {
             "before"
@@ -774,7 +802,7 @@ impl<'a> Parser<'a> {
             | "scroll-marker-group"
             | "scroll-button"
             | "column"
-            | "view-transition" => Ok(false),
+            | "view-transition" => Ok(None),
             _ => error(format!("::{name} isn't a pseudo-element")),
         }
     }
@@ -824,6 +852,7 @@ impl<'a> Parser<'a> {
             | "user-invalid" | "user-valid" => Pseudo::Never,
             // CSS 2's pseudo-elements, still allowed with one colon.
             "before" | "after" | "first-line" | "first-letter" => Pseudo::Element,
+            "host" => Pseudo::Host(None),
             _ => return error(format!(":{name} isn't supported")),
         })
     }
@@ -841,6 +870,8 @@ impl<'a> Parser<'a> {
     fn pseudo_function_body(&mut self, name: &str) -> Result<Pseudo, SelectorError> {
         Ok(match name {
             "not" => Pseudo::Not(self.selector_list(false)?),
+            "host" => Pseudo::Host(Some(Box::new(self.compound_argument()?))),
+            "host-context" => Pseudo::HostContext(Box::new(self.compound_argument()?)),
             "is" | "matches" => Pseudo::Is(self.selector_list(true)?),
             "where" => Pseudo::Where(self.selector_list(true)?),
             "has" => {
@@ -942,6 +973,21 @@ impl<'a> Parser<'a> {
             }
             _ => return error(format!(":{name}() isn't supported")),
         })
+    }
+
+    /// The compound in `:host()`, `:host-context()` or `::slotted()`,
+    /// with no combinator inside it at any depth.
+    fn compound_argument(&mut self) -> Result<Compound, SelectorError> {
+        if self.depth >= MAX_DEPTH {
+            return error(format!("selectors nest more than {MAX_DEPTH} deep"));
+        }
+        self.skip_space();
+        let outer = std::mem::replace(&mut self.compound_only, true);
+        self.depth += 1;
+        let compound = self.compound();
+        self.depth -= 1;
+        self.compound_only = outer;
+        compound
     }
 
     fn has_list(&mut self) -> Result<SelectorList, SelectorError> {
@@ -1082,7 +1128,7 @@ fn text_entry(typ: &str) -> bool {
 /// HTML's valid custom element name: a lowercase ASCII letter, then
 /// PCENChars including a hyphen, and not one of the hyphenated names SVG
 /// and MathML already use.
-fn custom_element_name(name: &str) -> bool {
+pub(crate) fn custom_element_name(name: &str) -> bool {
     const RESERVED: [&str; 8] = [
         "annotation-xml",
         "color-profile",
@@ -1518,6 +1564,7 @@ impl SelectorList {
             pos: 0,
             depth,
             in_has,
+            compound_only: false,
             opts,
         };
         let list = p.selector_list(false)?;
@@ -1546,7 +1593,7 @@ impl SelectorList {
         if doc.is_removed(el) {
             return false;
         }
-        let cx = Cx::new(doc, scope, Page::new(doc, options.url));
+        let cx = Cx::new(doc, scope, scope.unwrap_or(el), Page::new(doc, options.url));
         self.0.iter().any(|c| cx.complex(c, el, el))
     }
 
@@ -1587,7 +1634,7 @@ impl SelectorList {
         if doc.is_removed(el) {
             return Ok(false);
         }
-        let mut cx = Cx::new(doc, scope, Page::new(doc, options.url));
+        let mut cx = Cx::new(doc, scope, scope.unwrap_or(el), Page::new(doc, options.url));
         cx.deadline = deadline(options);
         let found = self.0.iter().any(|c| cx.complex(c, el, el));
         timeout(&cx, options)?;
@@ -1603,7 +1650,7 @@ impl SelectorList {
         Select {
             list: self,
             // One Cx for the whole walk, so its pattern matches share one budget.
-            cx: Cx::new(doc, Some(scope), Page::new(doc, options.url)),
+            cx: Cx::new(doc, Some(scope), scope, Page::new(doc, options.url)),
             scope,
             at: doc.first_child(scope),
         }
@@ -1652,6 +1699,15 @@ impl Complex {
     }
 }
 
+impl Compound {
+    fn specificity(&self) -> (u32, u32, u32) {
+        self.0.iter().fold((0, 0, 0), |(a, b, c), simple| {
+            let (x, y, z) = simple.specificity();
+            (a + x, b + y, c + z)
+        })
+    }
+}
+
 impl Pseudo {
     /// Whether matching reads the tree around the element, which a
     /// pseudo-element has none of.
@@ -1684,6 +1740,14 @@ impl Simple {
                     (a, b + 1, c)
                 }
                 Pseudo::Element => (0, 0, 1),
+                Pseudo::Host(Some(c)) | Pseudo::HostContext(c) => {
+                    let (a, b, c) = c.specificity();
+                    (a, b + 1, c)
+                }
+                Pseudo::Slotted(c) => {
+                    let (a, b, c) = c.specificity();
+                    (a, b, c + 1)
+                }
                 _ => (0, 1, 0),
             },
         }
@@ -1888,6 +1952,12 @@ fn percent_decode(s: &str) -> String {
 struct Cx<'a> {
     doc: &'a Document,
     scope: Option<NodeId>,
+    /// The shadow root whose tree the selector is matched in, and its
+    /// host; [`NONE`] for both in any other tree. There the host stands
+    /// in for the root, as the parent of its top-level nodes, and only
+    /// `:host` and `:host-context()` match it.
+    shadow: NodeId,
+    host: NodeId,
     page: Option<Page>,
     /// Steps left for `pattern` matches in this query, shared by all of them.
     pattern_budget: Cell<u32>,
@@ -2166,10 +2236,21 @@ fn is_space_char(c: char) -> bool {
 }
 
 impl<'a> Cx<'a> {
-    fn new(doc: &'a Document, scope: Option<NodeId>, page: Option<Page>) -> Self {
+    /// A context for matching in `in_tree`'s tree.
+    fn new(doc: &'a Document, scope: Option<NodeId>, in_tree: NodeId, page: Option<Page>) -> Self {
+        // Free when the document has no shadow roots.
+        let (shadow, host) = match doc.shadow_roots.is_empty() {
+            true => (NONE, NONE),
+            false => {
+                let root = doc.tree_root(in_tree);
+                doc.shadow_host(root).map_or((NONE, NONE), |h| (root, h))
+            }
+        };
         Cx {
             doc,
             scope,
+            shadow,
+            host,
             page,
             pattern_budget: Cell::new(crate::pattern::SELECT_STEP_LIMIT),
             deadline: None,
@@ -2464,9 +2545,35 @@ impl<'a> Cx<'a> {
     /// ancestor. Trying every choice instead made `x div div ...` over a
     /// few dozen nested divs take seconds.
     fn complex(&self, c: &Complex, el: NodeId, anchor: NodeId) -> bool {
+        if let Some(Simple::Pseudo(Pseudo::Slotted(arg))) = c.parts[0].0.0.first() {
+            return self.slotted(c, arg, el, anchor);
+        }
         // The subject first, here, so a one-part selector costs no more.
         self.compound(&c.parts[0].0, el, anchor)
             && (c.parts.len() == 1 || self.complex_rest(c, el, anchor))
+    }
+
+    /// `X::slotted(arg)`, `el` the subject: an element `arg` matches,
+    /// assigned after flattening to a slot in this shadow tree, which the
+    /// rest of the selector matches from there.
+    #[cold]
+    fn slotted(&self, c: &Complex, arg: &Compound, el: NodeId, anchor: NodeId) -> bool {
+        if self.shadow == NONE || self.doc.element(el).is_none() {
+            return false;
+        }
+        let mut slot = self.doc.assigned_slot(el);
+        while let Some(s) = slot {
+            if self.doc.tree_root(s) == self.shadow {
+                break;
+            }
+            slot = self.doc.assigned_slot(s);
+        }
+        let Some(slot) = slot else {
+            return false;
+        };
+        self.simples(&arg.0, el, anchor)
+            && self.compound_of(&c.parts[0].0.0[1..], slot, anchor)
+            && (c.parts.len() == 1 || self.complex_rest(c, slot, anchor))
     }
 
     /// The parts after the subject, which `el` matched.
@@ -2550,8 +2657,20 @@ impl<'a> Cx<'a> {
     /// its previous element sibling.
     #[inline]
     fn step(&self, combinator: Combinator, el: NodeId) -> Option<NodeId> {
+        // In a shadow tree the host is the root's stand-in: the parent of
+        // its top-level nodes, with no parent or siblings of its own.
+        if el == self.host {
+            return None;
+        }
         match combinator {
-            Combinator::Child | Combinator::Descendant => self.doc.parent(el),
+            Combinator::Child | Combinator::Descendant => {
+                let parent = self.doc.parent(el);
+                if parent == Some(self.shadow) {
+                    Some(self.host)
+                } else {
+                    parent
+                }
+            }
             Combinator::NextSibling | Combinator::SubsequentSibling => self.prev_element(el),
             Combinator::Column => self.col_after(el, None),
             Combinator::None => None,
@@ -2600,16 +2719,46 @@ impl<'a> Cx<'a> {
     }
 
     fn compound(&self, compound: &Compound, el: NodeId, anchor: NodeId) -> bool {
+        self.compound_of(&compound.0, el, anchor)
+    }
+
+    fn compound_of(&self, simples: &[Simple], el: NodeId, anchor: NodeId) -> bool {
+        // The host is featureless in its shadow tree: only `:host` and
+        // `:host-context()`, alone or in `:is()` or `:where()`, match it,
+        // and a `:has()` inside `:host()` reaching back to it.
+        if el == self.host
+            && !matches!(simples, [Simple::Anchor])
+            && (simples.is_empty()
+                || !simples.iter().all(|s| {
+                    matches!(
+                        s,
+                        Simple::Pseudo(
+                            Pseudo::Host(_)
+                                | Pseudo::HostContext(_)
+                                | Pseudo::Is(_)
+                                | Pseudo::Where(_)
+                        )
+                    )
+                }))
+        {
+            return false;
+        }
+        self.simples(simples, el, anchor)
+    }
+
+    /// Whether `el` matches every one of a compound's simple selectors,
+    /// as anywhere else: the host isn't featureless here.
+    fn simples(&self, simples: &[Simple], el: NodeId, anchor: NodeId) -> bool {
         if self.deadline.is_some() && self.out_of_time() {
             return false;
         }
-        if matches!(compound.0.as_slice(), [Simple::Anchor]) {
+        if matches!(simples, [Simple::Anchor]) {
             return el == anchor;
         }
         let Some(e) = self.doc.element(el) else {
             return false;
         };
-        compound.0.iter().all(|s| match s {
+        simples.iter().all(|s| match s {
             Simple::Type { lower, exact, tag } => {
                 if e.ns == Ns::Html {
                     if *tag != Tag::Other || e.tag != Tag::Other {
@@ -3411,6 +3560,23 @@ impl<'a> Cx<'a> {
                 levels.is_empty() || levels.contains(&level)
             }
             Pseudo::Never | Pseudo::Element => false,
+            Pseudo::Host(arg) => {
+                el == self.host && arg.as_ref().is_none_or(|c| self.simples(&c.0, el, anchor))
+            }
+            Pseudo::HostContext(c) => {
+                el == self.host && {
+                    let mut at = Some(el);
+                    while let Some(n) = at {
+                        if doc.element(n).is_some() && self.simples(&c.0, n, anchor) {
+                            return true;
+                        }
+                        at = doc.shadow_including_parent(n);
+                    }
+                    false
+                }
+            }
+            // Matched in `slotted`, before the compound's other parts.
+            Pseudo::Slotted(_) => false,
             // A cell's columns are a run of positions, so one sum says
             // whether any of them fits, however many it spans.
             Pseudo::NthCol { a, b, last } => self.cell_columns(el).is_some_and(|(t, x, n)| {

@@ -995,7 +995,7 @@ impl<'a> Node<'a> {
             html::Kind::ProcessingInstruction { .. } => NodeKind::ProcessingInstruction,
             html::Kind::Document => NodeKind::Document,
             html::Kind::Doctype { .. } => NodeKind::Doctype,
-            html::Kind::Fragment => NodeKind::Other,
+            html::Kind::Fragment | html::Kind::ShadowRoot(_) => NodeKind::Other,
         }
     }
 

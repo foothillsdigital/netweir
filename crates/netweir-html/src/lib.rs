@@ -7,12 +7,16 @@ mod edit;
 mod entities;
 mod pattern;
 mod serialize;
+mod shadow;
 mod tags;
 pub mod tokenizer;
 mod tree;
 mod unicode;
 
-pub use dom::{AttrNs, Document, Kind, MAX_INPUT, NodeId, Ns, Quirks};
+pub use dom::{
+    AttrNs, Document, Kind, MAX_INPUT, NodeId, Ns, Quirks, ShadowRoot, ShadowRootMode,
+    SlotAssignment,
+};
 pub use edit::EditError;
 pub use serialize::SerializeOptions;
 pub use tree::{

@@ -159,6 +159,12 @@ pub(crate) struct TreeBuilder {
     /// Whether the start tag being handled may close itself, as a void
     /// element or a foreign one can.
     acknowledged: bool,
+    /// The document's "allow declarative shadow roots", from
+    /// [`Options::declarative_shadow_roots`].
+    shadow_roots: bool,
+    /// The templates that made shadow roots, kept off the tree, whose
+    /// contents are those roots while they're parsed.
+    shadow_templates: Vec<NodeId>,
 }
 
 /// How many counters [`TreeBuilder::names`] has.
@@ -605,6 +611,8 @@ impl TreeBuilder {
             errors: false,
             errors_found: Vec::new(),
             acknowledged: false,
+            shadow_roots: false,
+            shadow_templates: Vec::new(),
         }
     }
 
@@ -1393,6 +1401,66 @@ impl TreeBuilder {
         self.truncate_open(0);
     }
 
+    // ---- declarative shadow roots -----------------------------------------
+
+    /// The "in head" steps for a `template` start tag with a valid
+    /// `shadowrootmode`: the adjusted current node becomes a shadow host,
+    /// and the template, put on the stack but not in the tree, has the
+    /// new shadow root as its contents, so what follows is parsed into
+    /// it. False when the token makes an ordinary template instead: no
+    /// valid mode, the html element or the fragment's context as the host
+    /// (which the result doesn't hold), a host that already has a shadow
+    /// root, or one that can't have one.
+    #[inline(never)]
+    fn shadow_template(&mut self, s: &Start<'_>) {
+        if !self.declarative_shadow_root(s) {
+            self.insert_html(s);
+        }
+    }
+
+    fn declarative_shadow_root(&mut self, s: &Start<'_>) -> bool {
+        let Some(init) = crate::shadow::declared(s.attrs()) else {
+            return false;
+        };
+        let Some(host) = self.adjusted_current() else {
+            return false;
+        };
+        if self.open.first().is_some_and(|o| o.id == host.id)
+            || self.context.is_some_and(|c| c.id == host.id)
+            || self.doc.shadow_root(host.id).is_some()
+        {
+            return false;
+        }
+        let Some(e) = self.doc.element(host.id) else {
+            return false;
+        };
+        if !crate::shadow::valid_host(e.ns, e.tag, self.doc.element_name(e)) {
+            return false;
+        }
+        let template = self.create(s, Ns::Html);
+        let root = self.doc.add_shadow_root(host.id, init);
+        if let Data::Element(e) = &mut self.doc.nodes[template as usize].data {
+            e.contents = root;
+        }
+        self.shadow_templates.push(template);
+        self.push_open(Open {
+            id: template,
+            ns: Ns::Html,
+            tag: Tag::Template,
+        });
+        true
+    }
+
+    /// At the end of the parse, the templates that made shadow roots let
+    /// go of them, so nothing but the hosts lead there.
+    fn release_shadow_roots(&mut self) {
+        for t in std::mem::take(&mut self.shadow_templates) {
+            if let Data::Element(e) = &mut self.doc.nodes[t as usize].data {
+                e.contents = NONE;
+            }
+        }
+    }
+
     // ---- <select> and <selectedcontent> -----------------------------------
 
     fn html_element(&self, id: NodeId, tag: Tag) -> bool {
@@ -1965,7 +2033,11 @@ impl TreeBuilder {
                     self.frameset_ok = false;
                     self.mode = Mode::InTemplate;
                     self.template_modes.push(Mode::InTemplate);
-                    self.insert_html(&s);
+                    if self.shadow_roots {
+                        self.shadow_template(&s);
+                    } else {
+                        self.insert_html(&s);
+                    }
                 }
                 Head => self.err("two-heads-are-not-better-than-one"),
                 _ => self.in_head_else(t),
@@ -3615,6 +3687,14 @@ pub struct Options {
     /// instead of inside it. Only the tree gets flatter; the parse goes on
     /// as before, and every element is still there. `None` is no limit.
     pub max_depth: Option<usize>,
+    /// Whether a `<template shadowrootmode>` attaches a shadow root to the
+    /// element it's in, the document's "allow declarative shadow roots".
+    /// `None` is the HTML Standard's default: on for a document, as a
+    /// browser parses a page, and off for a fragment, as `innerHTML`
+    /// parses one; `Some(true)` for a fragment is `setHTMLUnsafe`. Off, the
+    /// template is an ordinary one. In a fragment the context element is
+    /// never the host: it isn't in the result.
+    pub declarative_shadow_roots: Option<bool>,
 }
 
 /// A parse error the HTML Standard defines, from [`Document::errors`].
@@ -3799,6 +3879,9 @@ impl Parser {
         builder.max_depth = options.max_depth;
         builder.spans = options.spans;
         builder.errors = options.errors;
+        builder.shadow_roots = options
+            .declarative_shadow_roots
+            .unwrap_or(fragment.is_none());
         if options.spans || options.errors {
             builder.doc.positions = Some(Box::default());
         }
@@ -3859,6 +3942,7 @@ impl Parser {
         if self.fragment {
             self.builder.finish_fragment();
         }
+        self.builder.release_shadow_roots();
         self.builder.finish_errors();
         let mut doc = self.builder.doc;
         doc.src.shrink_to_fit();

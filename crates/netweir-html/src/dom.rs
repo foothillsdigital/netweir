@@ -90,10 +90,68 @@ pub(crate) struct Element {
     pub html_integration: bool,
 }
 
+/// Whether a shadow root's host lets scripts reach it, from
+/// `shadowrootmode` or `attachShadow`'s `mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowRootMode {
+    Open,
+    Closed,
+}
+
+/// How a shadow root's slots get their nodes: by the `slot` attribute of
+/// the host's children, or only as [`Document::assign`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlotAssignment {
+    #[default]
+    Named,
+    Manual,
+}
+
+/// A shadow root's settings, as `attachShadow` takes them and a
+/// declarative `<template shadowrootmode>` sets them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowRoot {
+    pub mode: ShadowRootMode,
+    pub delegates_focus: bool,
+    pub clonable: bool,
+    pub serializable: bool,
+    pub slot_assignment: SlotAssignment,
+    /// Made by the parser from a `<template shadowrootmode>`.
+    pub declarative: bool,
+}
+
+impl ShadowRoot {
+    /// An open root, with every flag off and named slot assignment.
+    pub fn open() -> ShadowRoot {
+        ShadowRoot {
+            mode: ShadowRootMode::Open,
+            delegates_focus: false,
+            clonable: false,
+            serializable: false,
+            slot_assignment: SlotAssignment::Named,
+            declarative: false,
+        }
+    }
+
+    /// A closed root, otherwise as [`ShadowRoot::open`].
+    pub fn closed() -> ShadowRoot {
+        ShadowRoot {
+            mode: ShadowRootMode::Closed,
+            ..ShadowRoot::open()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Data {
     Document,
     Fragment,
+    /// A shadow root: like a fragment, nobody's child, with a link back to
+    /// its host, which [`Document::shadow_root`] gives from the host.
+    ShadowRoot {
+        host: NodeId,
+        init: ShadowRoot,
+    },
     Doctype {
         name: Span,
         public_id: Span,
@@ -145,6 +203,12 @@ pub struct Document {
     /// back from the contents, and an edit's cycle check has to climb out
     /// of them. Edits build it the first time they need it.
     pub(crate) hosts: Option<std::collections::HashMap<NodeId, NodeId>>,
+    /// Each shadow host's shadow root. Empty, and so free, for a page
+    /// without any.
+    pub(crate) shadow_roots: std::collections::HashMap<NodeId, NodeId>,
+    /// Each slot's manually assigned nodes, for a shadow root with
+    /// [`SlotAssignment::Manual`].
+    pub(crate) manual_slots: std::collections::HashMap<NodeId, Vec<NodeId>>,
     /// The parse errors, when the parse was asked to collect them.
     pub(crate) errors: Vec<crate::SyntaxError>,
     /// A bit per node taken out with [`Document::remove`]. A slot is never
@@ -201,6 +265,8 @@ impl Positions {
 pub enum Kind<'a> {
     Document,
     Fragment,
+    /// A shadow root: [`Document::shadow_host`] is its host.
+    ShadowRoot(ShadowRoot),
     Doctype {
         name: &'a str,
         public_id: &'a str,
@@ -240,6 +306,8 @@ impl Document {
             scripting: false,
             positions: None,
             hosts: None,
+            shadow_roots: std::collections::HashMap::new(),
+            manual_slots: std::collections::HashMap::new(),
             errors: Vec::new(),
             dead: Vec::new(),
         }
@@ -440,16 +508,16 @@ impl Document {
         debug_assert!(
             matches!(
                 self.nodes[parent as usize].data,
-                Data::Element(_) | Data::Document | Data::Fragment
+                Data::Element(_) | Data::Document | Data::Fragment | Data::ShadowRoot { .. }
             ),
             "node {parent} can't have children"
         );
         debug_assert!(
             !matches!(
                 self.nodes[child as usize].data,
-                Data::Document | Data::Fragment
+                Data::Document | Data::Fragment | Data::ShadowRoot { .. }
             ),
-            "node {child} is a document or a fragment, never a child"
+            "node {child} is a document, fragment or shadow root, never a child"
         );
         debug_assert!(
             self.nodes[child as usize].parent == NONE
@@ -648,7 +716,13 @@ impl Document {
                     "node {id}'s last child"
                 );
                 assert!(
-                    matches!(n.data, Data::Element(_) | Data::Document | Data::Fragment),
+                    matches!(
+                        n.data,
+                        Data::Element(_)
+                            | Data::Document
+                            | Data::Fragment
+                            | Data::ShadowRoot { .. }
+                    ),
                     "node {id} can't have children"
                 );
             }
@@ -658,6 +732,18 @@ impl Document {
                         n.parent == NONE,
                         "node {id}, a document or fragment, has a parent"
                     )
+                }
+                Data::ShadowRoot { host, .. } => {
+                    assert!(n.parent == NONE, "shadow root {id} has a parent");
+                    assert!(
+                        self.element(host).is_some(),
+                        "shadow root {id}'s host isn't an element"
+                    );
+                    assert_eq!(
+                        self.shadow_roots.get(&host),
+                        Some(&id),
+                        "shadow root {id} isn't its host's"
+                    );
                 }
                 Data::Element(e) => {
                     let name_ok = match e.name {
@@ -706,6 +792,22 @@ impl Document {
                 "attribute {i}'s strings"
             );
         }
+        for (&host, &root) in &self.shadow_roots {
+            assert!(
+                matches!(self.nodes.get(root as usize).map(|n| n.data), Some(Data::ShadowRoot { host: h, .. }) if h == host),
+                "host {host}'s shadow root {root} doesn't name it"
+            );
+        }
+        for (&slot, nodes) in &self.manual_slots {
+            assert!(
+                self.element(slot).is_some(),
+                "manual slot {slot} isn't an element"
+            );
+            assert!(
+                nodes.iter().all(|&n| (n as usize) < len),
+                "manual slot {slot}'s nodes"
+            );
+        }
         if let Some(hosts) = &self.hosts {
             for (&contents, &host) in hosts {
                 assert_eq!(
@@ -743,6 +845,9 @@ impl Document {
                 && e.contents != NONE
             {
                 stack.push(e.contents);
+            }
+            if let Some(&root) = self.shadow_roots.get(&id) {
+                stack.push(root);
             }
         }
         if let Some(p) = self.positions.as_deref() {
@@ -866,6 +971,7 @@ impl Document {
         match &self.nodes[id as usize].data {
             Data::Document => Kind::Document,
             Data::Fragment => Kind::Fragment,
+            Data::ShadowRoot { init, .. } => Kind::ShadowRoot(*init),
             Data::Doctype {
                 name,
                 public_id,

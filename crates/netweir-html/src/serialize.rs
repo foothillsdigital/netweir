@@ -3,7 +3,9 @@
 //! html5lib's serializer options, an indented pretty-printer, and the
 //! html5lib-tests tree dump.
 
-use crate::dom::{AttrNs, Data, Document, Element, Kind, NodeId, Ns};
+use crate::dom::{
+    AttrNs, Data, Document, Element, Kind, NodeId, Ns, ShadowRootMode, SlotAssignment,
+};
 use crate::tags::Tag;
 
 /// How [`Document::serialize_with`] writes a node. The default is the
@@ -36,7 +38,11 @@ pub struct SerializeOptions {
     /// The tree dump of html5lib-tests' tree-construction `.dat` files:
     /// `| <html>`, `|   <head>`, each child two spaces in, attributes
     /// sorted, foreign elements and namespaced attributes prefixed,
-    /// template contents under `content`. Every other option is ignored.
+    /// template contents under `content`. A shadow root, which the suite
+    /// has no line for, goes first under its host as `#shadow-root (open)`
+    /// or `(closed)`, with `delegatesfocus`, `clonable`, `serializable` and
+    /// `manual` after the mode when they're set. Every other option is
+    /// ignored.
     pub html5test: bool,
     /// `"` or `'` around attribute values; anything else is taken as
     /// `"`. The one chosen is escaped inside: `&quot;` or `&#39;`.
@@ -72,6 +78,13 @@ pub struct SerializeOptions {
     /// `<!DOCTYPE html PUBLIC "..." "...">`; the HTML Standard writes the
     /// name alone.
     pub full_doctype: bool,
+    /// Write each shadow root marked serializable as the declarative
+    /// `<template shadowrootmode>` that makes it again, first inside its
+    /// host, as `getHTML({serializableShadowRoots: true})` does.
+    pub serializable_shadow_roots: bool,
+    /// Write these shadow roots that way too, serializable or not, as
+    /// `getHTML({shadowRoots})` does.
+    pub shadow_roots: Vec<NodeId>,
 }
 
 const DEFAULT: SerializeOptions = SerializeOptions {
@@ -87,6 +100,8 @@ const DEFAULT: SerializeOptions = SerializeOptions {
     strip_whitespace: false,
     inject_meta_charset: None,
     full_doctype: false,
+    serializable_shadow_roots: false,
+    shadow_roots: Vec::new(),
 };
 
 impl Default for SerializeOptions {
@@ -114,6 +129,8 @@ const INLINE: u8 = 4;
 const KEEP_SPACE: u8 = 8;
 /// The node's children only, as `innerHTML`.
 const INNER: u8 = 16;
+/// A shadow root written as the `<template shadowrootmode>` that makes it.
+const SHADOW: u8 = 32;
 
 /// Elements with no end tag and no contents when serialized.
 fn void(e: &Element) -> bool {
@@ -341,7 +358,7 @@ impl Document {
         if flags & INNER != 0
             && !matches!(
                 self.nodes[id as usize].data,
-                Data::Element(_) | Data::Document | Data::Fragment
+                Data::Element(_) | Data::Document | Data::Fragment | Data::ShadowRoot { .. }
             )
         {
             return out;
@@ -496,6 +513,8 @@ impl Document {
                     out.push_str("</");
                     out.push_str(self.element_name(e));
                     out.push('>');
+                } else if !PLAIN && matches!(data, Data::ShadowRoot { .. }) {
+                    out.push_str("</template>");
                 }
                 continue;
             }
@@ -540,6 +559,14 @@ impl Document {
                         });
                     }
                     let line = self.push_children(id, children, inside, &mut stack);
+                    // The shadow root goes first, so on the stack last.
+                    if !PLAIN && let Some(root) = self.written_shadow_root(id, o) {
+                        stack.push(Item {
+                            id: root,
+                            depth: inside,
+                            flags: children | SHADOW,
+                        });
+                    }
                     let empty = stack.len() == end + 1;
                     if !inner && children & LINE != 0 && (line || (empty && meta.is_some())) {
                         stack[end].flags |= LINE;
@@ -602,8 +629,67 @@ impl Document {
                     };
                     self.push_children(id, children, depth, &mut stack);
                 }
+                Data::ShadowRoot { init, .. } => {
+                    let children = if PLAIN {
+                        0
+                    } else {
+                        self.child_flags(id, flags, o)
+                    };
+                    if flags & SHADOW == 0 {
+                        self.push_children(id, children, depth, &mut stack);
+                        continue;
+                    }
+                    out.push_str("<template shadowrootmode=\"");
+                    out.push_str(match init.mode {
+                        ShadowRootMode::Open => "open",
+                        ShadowRootMode::Closed => "closed",
+                    });
+                    out.push('"');
+                    // In the standard's order; named assignment, the
+                    // default, goes unsaid.
+                    for (on, name) in [
+                        (init.delegates_focus, " shadowrootdelegatesfocus=\"\""),
+                        (init.serializable, " shadowrootserializable=\"\""),
+                        (
+                            init.slot_assignment == SlotAssignment::Manual,
+                            " shadowrootslotassignment=\"manual\"",
+                        ),
+                        (init.clonable, " shadowrootclonable=\"\""),
+                    ] {
+                        if on {
+                            out.push_str(name);
+                        }
+                    }
+                    out.push('>');
+                    let end = stack.len();
+                    stack.push(Item {
+                        id,
+                        depth,
+                        flags: END,
+                    });
+                    let inside = depth.saturating_add(1);
+                    if self.push_children(id, children, inside, &mut stack) && children & LINE != 0
+                    {
+                        stack[end].flags |= LINE;
+                    }
+                }
             }
         }
+    }
+
+    /// The shadow root of `host` that `o` asks to be written: one marked
+    /// serializable, with `serializable_shadow_roots`, or one listed in
+    /// `shadow_roots`.
+    fn written_shadow_root(&self, host: NodeId, o: &SerializeOptions) -> Option<NodeId> {
+        if !o.serializable_shadow_roots && o.shadow_roots.is_empty() {
+            return None;
+        }
+        let root = self.shadow_root(host)?;
+        let Data::ShadowRoot { init, .. } = self.nodes[root as usize].data else {
+            return None;
+        };
+        ((o.serializable_shadow_roots && init.serializable) || o.shadow_roots.contains(&root))
+            .then_some(root)
     }
 
     fn start_tag<const PLAIN: bool>(
@@ -839,7 +925,7 @@ impl Document {
         }
         match &self.nodes[id as usize].data {
             Data::Element(e) => self.start_tag::<true>(id, e, &DEFAULT, &mut out),
-            Data::Document | Data::Fragment => {}
+            Data::Document | Data::Fragment | Data::ShadowRoot { .. } => {}
             _ => out = self.outer_html(id),
         }
         out
@@ -879,14 +965,36 @@ impl Document {
             };
             if contents {
                 line(out);
-                out.push_str("content");
+                match self.kind(id) {
+                    Kind::ShadowRoot(init) => {
+                        out.push_str("#shadow-root (");
+                        out.push_str(match init.mode {
+                            ShadowRootMode::Open => "open",
+                            ShadowRootMode::Closed => "closed",
+                        });
+                        for (on, flag) in [
+                            (init.delegates_focus, " delegatesfocus"),
+                            (init.clonable, " clonable"),
+                            (init.serializable, " serializable"),
+                            (init.slot_assignment == SlotAssignment::Manual, " manual"),
+                        ] {
+                            if on {
+                                out.push_str(flag);
+                            }
+                        }
+                        out.push(')');
+                    }
+                    _ => out.push_str("content"),
+                }
                 let at = stack.len();
                 stack.extend(self.children(id).map(|c| (c, depth + 1, false)));
                 stack[at..].reverse();
                 continue;
             }
             match self.kind(id) {
-                Kind::Document | Kind::Fragment => self.push_dump(id, depth, &mut stack),
+                Kind::Document | Kind::Fragment | Kind::ShadowRoot(_) => {
+                    self.push_dump(id, depth, &mut stack)
+                }
                 Kind::Doctype {
                     name,
                     public_id,
@@ -954,11 +1062,15 @@ impl Document {
     }
 
     /// `id`'s children onto the dump's stack, the first on top: a
-    /// template's `content` first, then any children it has.
+    /// template's `content` or a host's `#shadow-root` first, then any
+    /// children it has.
     fn push_dump(&self, id: NodeId, depth: usize, stack: &mut Vec<(NodeId, usize, bool)>) {
         let at = stack.len();
         if let Some(contents) = self.template_contents(id) {
             stack.push((contents, depth, true));
+        }
+        if let Some(root) = self.shadow_root(id) {
+            stack.push((root, depth, true));
         }
         stack.extend(self.children(id).map(|c| (c, depth, false)));
         stack[at..].reverse();
